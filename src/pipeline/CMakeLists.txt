@@ -22,7 +22,9 @@ add_library(fdv_audio_pipeline STATIC
     TapStep.cpp
     ToneInterfererStep.cpp
     #TxRxThread.cpp
-    #rade_text.c
+    rade_text.cpp
+    ldpc_encode.cpp
+    ldpc_decode.cpp
 )
 
 target_compile_options(fdv_audio_pipeline PRIVATE ${WARNINGS_AS_ERRORS_FLAGS})
@@ -54,7 +56,7 @@ DefineUnitTest(ResampleTest)
 target_link_libraries(ResampleTest PRIVATE ${FREEDV_LINK_LIBS})
 DefineUnitTest(TapTest)
 
-if(LINUX)
+#if(LINUX)
 # TBD - won't execute on macOS just yet.
 DefineUnitTest(RadeTextTest)
 target_link_libraries(RadeTextTest PRIVATE ${FREEDV_LINK_LIBS} rade opus r8brain) 
@@ -63,6 +65,11 @@ if(BOOTSTRAP_WXWIDGETS)
     target_compile_definitions(RadeTextTest PRIVATE ${WXBUILD_BUILD_DEFS})
     target_include_directories(RadeTextTest PRIVATE ${WXBUILD_INCLUDES})
 endif(BOOTSTRAP_WXWIDGETS)
-endif(LINUX)
+#endif(LINUX)
+
+add_executable(test_decode test_decode.cpp)
+target_link_libraries(test_decode PRIVATE fdv_audio_pipeline)
+add_executable(test_encode test_encode.cpp)
+target_link_libraries(test_encode PRIVATE fdv_audio_pipeline)
 
 endif(UNITTEST)

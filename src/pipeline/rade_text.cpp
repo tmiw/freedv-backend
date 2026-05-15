@@ -41,9 +41,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "gp_interleaver.h"
-#include "ldpc_codes.h"
-#include "ofdm_internal.h"
+#include "ldpc_encode.h"
+#include "ldpc_decode.h"
 #include "../util/logging/ulog.h"
 
 #define LDPC_TOTAL_SIZE_BITS (112)
@@ -68,11 +67,10 @@ typedef struct
     int tx_text_index;
     int tx_text_length;
 
-    COMP inbound_pending_syms[LDPC_TOTAL_SIZE_BITS / 2];
+    RADE_COMP inbound_pending_syms[LDPC_TOTAL_SIZE_BITS / 2];
     float inbound_pending_amps[LDPC_TOTAL_SIZE_BITS / 2];
     float incomingData[LDPC_TOTAL_SIZE_BITS];
 
-    struct LDPC ldpc;
     int enableStats;
 
     int unusedEooBitCount;
@@ -186,7 +184,6 @@ static int rade_text_ldpc_decode(rade_text_impl_t *obj, char *dest, float meanAm
     assert(dest != NULL);
 
     float llr[LDPC_TOTAL_SIZE_BITS];
-    unsigned char output[LDPC_TOTAL_SIZE_BITS];
     int parityCheckCount = 0;
 
     // Calculate raw BER.
@@ -216,20 +213,18 @@ static int rade_text_ldpc_decode(rade_text_impl_t *obj, char *dest, float meanAm
         }
     }
 
-    // Use soft decision for the LDPC decoder.
-    int Npayloadsymsperpacket = LDPC_TOTAL_SIZE_BITS / 2;
-    float EsNo = 3.0; // note: constant from freedv_700.c
     log_info("mean amplitude: %f", meanAmplitude);
 
-    symbols_to_llrs(llr, (COMP *)obj->inbound_pending_syms, obj->inbound_pending_amps, EsNo, meanAmplitude,
-                    Npayloadsymsperpacket);
-    run_ldpc_decoder(&obj->ldpc, output, llr, &parityCheckCount);
+    // Diagonal QPSK: per-component amplitude ≈ meanAmplitude / sqrt(2).
+    // We don't have a direct noise estimate, so approximate sigma² from
+    // signal power assuming ~0 dB per-component SNR for the test channel.
+    // sigma2 = (per_component_power) / (2 * SNR_linear) = rms²/4
+    // This keeps LLRs in the unsaturated range (≈ 4*r_I/rms) so the
+    // BP decoder operates in proper soft-decision mode.
+    float sigma2 = meanAmplitude * meanAmplitude / 4.0f;
+    if (sigma2 < 1e-6f) sigma2 = 1e-6f;
 
-    // Data is valid if BER < 0.2
-    float ber_est = (float)(obj->ldpc.NumberParityBits - parityCheckCount) / obj->ldpc.NumberParityBits;
-    int result = (ber_est < 0.2);
-
-    log_info("Estimated BER: %f", ber_est);
+    auto decodeResult = ldpc_decode(obj->inbound_pending_syms, obj->inbound_pending_amps, sigma2);
 
     if (obj->enableStats)
     {
@@ -239,7 +234,7 @@ static int rade_text_ldpc_decode(rade_text_impl_t *obj, char *dest, float meanAm
         for (int index = 0; index < LDPC_TOTAL_SIZE_BITS / 2; index++)
         {
             bitsCoded++;
-            int err = LastLDPCAsBits[index] != output[index];
+            int err = LastLDPCAsBits[index] != decodeResult.message[index];
             if (err)
             {
                 errorsCoded++;
@@ -253,24 +248,25 @@ static int rade_text_ldpc_decode(rade_text_impl_t *obj, char *dest, float meanAm
         log_info("Coded Tbits: %6d Terr: %6d BER: %4.3f", bitsCoded, errorsCoded, coded_ber);
     }
 
-    if (result)
+    log_info("decode converged: %d", decodeResult.converged);
+    if (decodeResult.converged)
     {
         memset(dest, 0, RADE_TEXT_BYTES_PER_ENCODED_SEGMENT);
 
         for (int bitIndex = 0; bitIndex < 8; bitIndex++)
         {
-            if (output[bitIndex])
+            if (decodeResult.message[bitIndex])
                 dest[0] |= 1 << bitIndex;
         }
         for (int bitIndex = 8; bitIndex < (LDPC_TOTAL_SIZE_BITS / 2); bitIndex++)
         {
             int bitsSinceCrc = bitIndex - 8;
-            if (output[bitIndex])
+            if (decodeResult.message[bitIndex])
                 dest[1 + (bitsSinceCrc / 6)] |= (1 << (bitsSinceCrc % 6));
         }
     }
 
-    return result;
+    return decodeResult.converged;;
 }
 
 /* Decode received symbols from RADE decoder. */
@@ -280,7 +276,8 @@ void rade_text_rx(rade_text_t ptr, float *syms, int symSize)
     assert(obj != NULL);
 
     // Deinterleave received bits.
-    gp_deinterleave_comp((COMP *)obj->inbound_pending_syms, (COMP *)syms, LDPC_TOTAL_SIZE_BITS / 2);
+    //gp_deinterleave_comp((COMP *)obj->inbound_pending_syms, (COMP *)syms, LDPC_TOTAL_SIZE_BITS / 2);
+    memcpy(obj->inbound_pending_syms, syms, sizeof(RADE_COMP) * symSize);
 
     // Calculate RMS of all symbols
     float rms = 0;
@@ -290,16 +287,17 @@ void rade_text_rx(rade_text_t ptr, float *syms, int symSize)
     {
         if (index < (LDPC_TOTAL_SIZE_BITS / 2))
         {
-            COMP *sym = (COMP *)&obj->inbound_pending_syms[index];
+            RADE_COMP *sym = &obj->inbound_pending_syms[index];
             //sym->real = syms[2 * index];
             //sym->imag = syms[2 * index + 1];
+            //obj->inbound_pending_amps[index] = sqrtf(sym->real * sym->real + sym->imag * sym->imag);
             rms += sym->real * sym->real + sym->imag * sym->imag;
         }
         else
         {
             // This is the unused part of the EOO that was filled with a known sequence.
             float* sym = &syms[2 * index];
-            //rms += sym[0] * sym[0] + sym[1] * sym[1];
+            rms += sym[0] * sym[0] + sym[1] * sym[1];
 
             if (obj->enableStats)
             {
@@ -318,12 +316,12 @@ void rade_text_rx(rade_text_t ptr, float *syms, int symSize)
     // Copy over symbols prior to decode.
     for (int index = 0; index < LDPC_TOTAL_SIZE_BITS / 2; index++)
     {
-        COMP *sym = (COMP *)&obj->inbound_pending_syms[index];
-        log_debug("RX symbol: %f, %f", sym->real, sym->imag);
-
-        obj->inbound_pending_amps[index] = rms;
-        log_debug("RX symbol rotated: %f, %f, amp: %f", obj->inbound_pending_syms[index].real,
-                  obj->inbound_pending_syms[index].imag, obj->inbound_pending_amps[index]);
+        RADE_COMP *sym = &obj->inbound_pending_syms[index];
+        // Per-symbol amplitude as reliability weight; divide by sqrt(2) because
+        // the diagonal QPSK signal energy is split equally between I and Q.
+        float sym_amp = sqrtf(sym->real * sym->real + sym->imag * sym->imag) / sqrtf(2.0f);
+        obj->inbound_pending_amps[index] = sym_amp;
+        log_debug("RX symbol rotated: %f, %f, amp: %f", sym->real, sym->imag, sym_amp);
     }
 
     // We have all the bits we need, so we're ready to decode.
@@ -356,12 +354,8 @@ void rade_text_rx(rade_text_t ptr, float *syms, int symSize)
 
 rade_text_t rade_text_create()
 {
-    rade_text_impl_t *ret = calloc(1, sizeof(rade_text_impl_t));
+    rade_text_impl_t *ret = new rade_text_impl_t();
     assert(ret != NULL);
-
-    // Load LDPC code into memory.
-    int code_index = ldpc_codes_find("HRA_56_56");
-    memcpy(&ret->ldpc, &ldpc_codes[code_index], sizeof(struct LDPC));
 
     return (rade_text_t)ret;
 }
@@ -369,7 +363,8 @@ rade_text_t rade_text_create()
 void rade_text_destroy(rade_text_t ptr)
 {
     assert(ptr != NULL);
-    free(ptr);
+    auto impl = (rade_text_impl_t*)ptr;
+    delete impl;
 }
 
 void rade_text_generate_tx_string(rade_text_t ptr, const char *str, int strlength, float *syms, int symSize)
@@ -394,12 +389,12 @@ void rade_text_generate_tx_string(rade_text_t ptr, const char *str, int strlengt
     tmp[0] = crc;
 
     // Encode block of text using LDPC(112,56).
-    unsigned char ibits[LDPC_TOTAL_SIZE_BITS / 2];
+    std::array<uint8_t, LDPC_TOTAL_SIZE_BITS / 2> ibits;
     unsigned char pbits[LDPC_TOTAL_SIZE_BITS / 2];
-    memset(ibits, 0, LDPC_TOTAL_SIZE_BITS / 2);
     memset(pbits, 0, LDPC_TOTAL_SIZE_BITS / 2);
     for (int index = 0; index < 8; index++)
     {
+        ibits[index] = 0;
         if (tmp[0] & (1 << index))
             ibits[index] = 1;
     }
@@ -419,7 +414,8 @@ void rade_text_generate_tx_string(rade_text_t ptr, const char *str, int strlengt
         }
     }
 
-    encode(&impl->ldpc, ibits, pbits);
+    auto totalBits = ldpc_encode(ibits);
+    memcpy(pbits, &totalBits[LDPC_TOTAL_SIZE_BITS / 2], LDPC_TOTAL_SIZE_BITS / 2);
 
     // Split LDPC encoded bits into individual bits, with the first
     // RADE_TEXT_UW_LENGTH_BITS being UW.
@@ -432,7 +428,7 @@ void rade_text_generate_tx_string(rade_text_t ptr, const char *str, int strlengt
     memcpy(impl->tx_text, tmpbits, LDPC_TOTAL_SIZE_BITS);
 
     // Interleave the bits together to enhance fading performance.
-    gp_interleave_bits(&impl->tx_text[0], tmpbits, LDPC_TOTAL_SIZE_BITS / 2);
+    //gp_interleave_bits(&impl->tx_text[0], tmpbits, LDPC_TOTAL_SIZE_BITS / 2);
     //memcpy(impl->tx_text, tmpbits, LDPC_TOTAL_SIZE_BITS);
 
     // Generate floats based on the bits.
@@ -440,26 +436,12 @@ void rade_text_generate_tx_string(rade_text_t ptr, const char *str, int strlengt
     for (int index = 0; index < LDPC_TOTAL_SIZE_BITS / 2; index++)
     {
         char *ptr = &impl->tx_text[2 * index];
-        if (*ptr == 0 && *(ptr + 1) == 0)
-        {
-            syms[2 * index] = 1;
-            syms[2 * index + 1] = 0;
-        }
-        else if (*ptr == 0 && *(ptr + 1) == 1)
-        {
-            syms[2 * index] = 0;
-            syms[2 * index + 1] = 1;
-        }
-        else if (*ptr == 1 && *(ptr + 1) == 0)
-        {
-            syms[2 * index] = 0;
-            syms[2 * index + 1] = -1;
-        }
-        else if (*ptr == 1 && *(ptr + 1) == 1)
-        {
-            syms[2 * index] = -1;
-            syms[2 * index + 1] = 0;
-        }
+
+        // Diagonal QPSK: each bit maps independently to one axis.
+        // b0 -> I: bit=0 => +1, bit=1 => -1
+        // b1 -> Q: bit=0 => +1, bit=1 => -1
+        syms[2 * index]     = (*ptr       == 0) ? 1.0f : -1.0f;
+        syms[2 * index + 1] = (*(ptr + 1) == 0) ? 1.0f : -1.0f;
         debugString[2 * index] = impl->tx_text[2 * index] ? '1' : '0';
         debugString[2 * index + 1] = impl->tx_text[2 * index + 1] ? '1' : '0';
     }
@@ -475,12 +457,13 @@ void rade_text_generate_tx_string(rade_text_t ptr, const char *str, int strlengt
 
     if (symSize > LDPC_TOTAL_SIZE_BITS)
     {
-        // Stuff the remaining space in the EOO with a known sequence
-        // as anything else (i.e. zeros) will cause problems with decode.
+        // Zero-pad remaining EOO slots. The EOO demodulator uses the last data
+        // slot (d=2, frame position 4) as a phase-estimation pilot, so non-zero
+        // symbols there corrupt the channel estimate for odd carriers. Zeros
+        // match the native RADE convention and contribute nothing to the sum.
         for (int index = LDPC_TOTAL_SIZE_BITS; index < symSize; index++)
         {
-            // Default everything to 0 (represented by 1 + 0j)
-            syms[index] = index % 2 ? 0 : 1;
+            syms[index] = 0;
         }
     }
 }

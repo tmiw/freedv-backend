@@ -1,14 +1,14 @@
 #include <cassert>
 #include <random>
-#include <wx/string.h>
+#include <string>
 #include "../RADEReceiveStep.h"
 #include "../RADETransmitStep.h"
 #include "../rade_text.h"
 #include "../../util/logging/ulog.h"
 
 bool testPassed = false;
-wxString utRxFeatureFile;
-wxString utTxFeatureFile;
+std::string utRxFeatureFile;
+std::string utTxFeatureFile;
 
 std::default_random_engine generator;
 std::uniform_real_distribution<double> distribution(-0.789, 0.789);
@@ -55,6 +55,7 @@ int main()
     // Initialize RADE text
     rade_text_t txt = rade_text_create();
     assert(txt != nullptr);
+    rade_text_enable_stats_output(txt, 1);
     int nsyms = rade_n_eoo_bits(rade);
     float txSyms[1024]; // randomly selected maximum to suppress warning
     rade_text_generate_tx_string(txt, "K6AQ", 4, txSyms, nsyms);
