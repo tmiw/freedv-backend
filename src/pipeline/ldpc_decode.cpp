@@ -101,6 +101,12 @@ static const LDPCGraph graph;
 
 // ---- Belief-propagation decoder ----
 
+static float normalDistribution(float x, float var)
+{
+    float ex = std::exp(-(x * x) / (2 * var));
+    return (x / var) * ex; //ex / (std::sqrt(2 * M_PI * var));
+}
+
 static float distanceBetween(const RADE_COMP* sym, float x, float y)
 {
     float xdiff = sym->real - x;
@@ -157,8 +163,14 @@ LDPCDecodeResult ldpc_decode(const RADE_COMP* syms,
         float prob01 = 1 - (dist01 / norm);
         float prob10 = 1 - (dist10 / norm);
         float prob11 = 1 - (dist11 / norm);
-        llr_ch[2*k]     = std::clamp(scale * a * std::log((prob00 + prob01) / (prob10 + prob11)), -LLR_MAX, LLR_MAX);
-        llr_ch[2*k + 1] = std::clamp(scale * a * std::log((prob00 + prob10) / (prob01 + prob11)), -LLR_MAX, LLR_MAX);
+
+        float prob0x = prob00 + prob01;
+        float prob1x = prob10 + prob11;
+        float probx0 = prob00 + prob10;
+        float probx1 = prob01 + prob11;
+
+        llr_ch[2*k]     = std::clamp(scale * a * std::log(prob0x / prob1x), -LLR_MAX, LLR_MAX);
+        llr_ch[2*k + 1] = std::clamp(scale * a * std::log(probx0 / probx1), -LLR_MAX, LLR_MAX);
     }
 
     const int E = (int)graph.edges.size();
