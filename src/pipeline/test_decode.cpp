@@ -7,13 +7,31 @@
 #include <array>
 #include <random>
 
-// Map codeword bits to RADE diagonal QPSK symbols.
-// b0 -> I: bit=0 => +1, bit=1 => -1.  b1 -> Q: bit=0 => +1, bit=1 => -1.
+// Map codeword bits to QPSK symbols.
 static void bits_to_qpsk(const std::array<uint8_t,112>& bits, RADE_COMP syms[56])
 {
     for (int k = 0; k < 56; k++) {
-        syms[k].real = bits[2*k]     ? -1.0f : 1.0f;
-        syms[k].imag = bits[2*k + 1] ? -1.0f : 1.0f;
+        const uint8_t* ptr = &bits[2 * k];
+        if (*ptr == 0 && *(ptr + 1) == 0)
+        {
+            syms[k].real = 1;
+            syms[k].imag = 0;
+        }
+        else if (*ptr == 0 && *(ptr + 1) == 1)
+        {
+            syms[k].real = 0;
+            syms[k].imag = 1;
+        }
+        else if (*ptr == 1 && *(ptr + 1) == 0)
+        {
+            syms[k].real = 0;
+            syms[k].imag = -1;
+        }
+        else if (*ptr == 1 && *(ptr + 1) == 1)
+        {
+            syms[k].real = -1;
+            syms[k].imag = 0;
+        }
     }
 }
 

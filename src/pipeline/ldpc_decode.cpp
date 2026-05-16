@@ -101,24 +101,64 @@ static const LDPCGraph graph;
 
 // ---- Belief-propagation decoder ----
 
+static float distanceBetween(const RADE_COMP* sym, float x, float y)
+{
+    float xdiff = sym->real - x;
+    float ydiff = sym->imag - y;
+    return std::sqrt(xdiff * xdiff + ydiff * ydiff);
+}
+
 LDPCDecodeResult ldpc_decode(const RADE_COMP* syms,
                               const float*    amplitudes,
                               float           noise_var,
                               int             max_iter)
 {
-    constexpr float LLR_MAX = 20.0f;
+    constexpr float LLR_MAX = 300.0f;
 
     if (noise_var < 1e-10f) noise_var = 1e-10f;
     const float scale = 2.0f / noise_var;
 
-    // Compute channel LLRs for diagonal QPSK (RADE native constellation).
-    // Mapping: b0 -> I axis (+1 for bit=0, -1 for bit=1), b1 -> Q axis.
-    // Separable LLRs: LLR(b0) = a*r_I/σ², LLR(b1) = a*r_Q/σ²
+    // Compute channel LLRs. We do this by calculating the distance between
+    // the normalized symbol (|s| = 1) and each of the following QPSK symbols:
+    //
+    // (1, 0) -> (0, 0)
+    // (0, 1) -> (0, 1)
+    // (0, -1) -> (1, 0)
+    // (-1, 0) -> (1, 1)
+    //
+    // LLR is defined as ln(P(bit = 0) / P(bit = 1)), so:
+    // 
+    //   llr_ch[2*k] = ln(P(syms[k].real = 0) / P(syms[k].real = 1))
+    //               = ln(
+    //                    (P(syms[k].real = 0 && syms[k].imag = 0) + P(syms[k].real = 0 && syms[k].imag = 1)) / 
+    //                    (P(syms[k].real = 1 && syms[k].imag = 0) + P(syms[k].real = 1 && syms[k].imag = 1))
+    //                   ) 
+    //   llr_ch[2*k + 1] = ln(P(syms[k].imag = 0) / P(syms[k].imag = 1))
+    //                   = ln(
+    //                        (P(syms[k].real = 0 && syms[k].imag = 0) + P(syms[k].real = 1 && syms[k].imag = 0)) /
+    //                        (P(syms[k].real = 0 && syms[k].imag = 1) + P(syms[k].real = 1 && syms[k].imag = 1))
+    //                       )
+    // 
     float llr_ch[112];
     for (int k = 0; k < 56; k++) {
         const float a = amplitudes[k];
-        llr_ch[2*k]     = std::clamp(scale * a * syms[k].real, -LLR_MAX, LLR_MAX);
-        llr_ch[2*k + 1] = std::clamp(scale * a * syms[k].imag, -LLR_MAX, LLR_MAX);
+
+        RADE_COMP normSym;
+        normSym.real = syms[k].real / a;
+        normSym.imag = syms[k].imag / a;
+
+        float dist00 = distanceBetween(&syms[k], 1, 0);
+        float dist01 = distanceBetween(&syms[k], 0, 1);
+        float dist10 = distanceBetween(&syms[k], 0, -1);
+        float dist11 = distanceBetween(&syms[k], -1, 0);
+        float norm = dist00 + dist01 + dist10 + dist11; // normalize distances since all probabilities should add up to 1
+
+        float prob00 = 1 - (dist00 / norm);
+        float prob01 = 1 - (dist01 / norm);
+        float prob10 = 1 - (dist10 / norm);
+        float prob11 = 1 - (dist11 / norm);
+        llr_ch[2*k]     = std::clamp(scale * a * std::log((prob00 + prob01) / (prob10 + prob11)), -LLR_MAX, LLR_MAX);
+        llr_ch[2*k + 1] = std::clamp(scale * a * std::log((prob00 + prob10) / (prob01 + prob11)), -LLR_MAX, LLR_MAX);
     }
 
     const int E = (int)graph.edges.size();

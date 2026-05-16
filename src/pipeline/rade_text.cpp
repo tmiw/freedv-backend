@@ -221,7 +221,7 @@ static int rade_text_ldpc_decode(rade_text_impl_t *obj, char *dest, float meanAm
     // sigma2 = (per_component_power) / (2 * SNR_linear) = rms²/4
     // This keeps LLRs in the unsaturated range (≈ 4*r_I/rms) so the
     // BP decoder operates in proper soft-decision mode.
-    float sigma2 = meanAmplitude * meanAmplitude / 4.0f;
+    float sigma2 = 0.1; //meanAmplitude * meanAmplitude / 4.0f;
     if (sigma2 < 1e-6f) sigma2 = 1e-6f;
 
     auto decodeResult = ldpc_decode(obj->inbound_pending_syms, obj->inbound_pending_amps, sigma2);
@@ -317,9 +317,7 @@ void rade_text_rx(rade_text_t ptr, float *syms, int symSize)
     for (int index = 0; index < LDPC_TOTAL_SIZE_BITS / 2; index++)
     {
         RADE_COMP *sym = &obj->inbound_pending_syms[index];
-        // Per-symbol amplitude as reliability weight; divide by sqrt(2) because
-        // the diagonal QPSK signal energy is split equally between I and Q.
-        float sym_amp = sqrtf(sym->real * sym->real + sym->imag * sym->imag) / sqrtf(2.0f);
+        float sym_amp = sqrtf(sym->real * sym->real + sym->imag * sym->imag);
         obj->inbound_pending_amps[index] = sym_amp;
         log_debug("RX symbol rotated: %f, %f, amp: %f", sym->real, sym->imag, sym_amp);
     }
@@ -436,12 +434,26 @@ void rade_text_generate_tx_string(rade_text_t ptr, const char *str, int strlengt
     for (int index = 0; index < LDPC_TOTAL_SIZE_BITS / 2; index++)
     {
         char *ptr = &impl->tx_text[2 * index];
-
-        // Diagonal QPSK: each bit maps independently to one axis.
-        // b0 -> I: bit=0 => +1, bit=1 => -1
-        // b1 -> Q: bit=0 => +1, bit=1 => -1
-        syms[2 * index]     = (*ptr       == 0) ? 1.0f : -1.0f;
-        syms[2 * index + 1] = (*(ptr + 1) == 0) ? 1.0f : -1.0f;
+        if (*ptr == 0 && *(ptr + 1) == 0)
+        {
+            syms[2 * index] = 1;
+            syms[2 * index + 1] = 0;
+        }
+        else if (*ptr == 0 && *(ptr + 1) == 1)
+        {
+            syms[2 * index] = 0;
+            syms[2 * index + 1] = 1;
+        }
+        else if (*ptr == 1 && *(ptr + 1) == 0)
+        {
+            syms[2 * index] = 0;
+            syms[2 * index + 1] = -1;
+        }
+        else if (*ptr == 1 && *(ptr + 1) == 1)
+        {
+            syms[2 * index] = -1;
+            syms[2 * index + 1] = 0;
+        }
         debugString[2 * index] = impl->tx_text[2 * index] ? '1' : '0';
         debugString[2 * index + 1] = impl->tx_text[2 * index + 1] ? '1' : '0';
     }

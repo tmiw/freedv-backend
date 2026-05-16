@@ -1,4 +1,5 @@
 #include <cassert>
+#include <climits>
 #include <random>
 #include <string>
 #include "../RADEReceiveStep.h"
