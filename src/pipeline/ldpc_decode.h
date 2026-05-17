@@ -30,3 +30,32 @@ LDPCDecodeResult ldpc_decode(const RADE_COMP* syms,
                               const float*    amplitudes,
                               float           noise_var,
                               int             max_iter = 100);
+
+// Compute 112 channel LLRs from 56 received QPSK symbols using the
+// Simplified-MAX-Log-MAP (a.k.a. Max-Log-MAP) algorithm.
+//
+// The algorithm approximates the exact MAP log-likelihood ratio by replacing
+// the log-sum-exp over all constellation points sharing a bit value with a
+// plain max (equivalently, minimum squared Euclidean distance):
+//
+//   LLR_b ≈ min_{s: b=1} ||r - a·s||² / (2σ²)
+//          - min_{s: b=0} ||r - a·s||² / (2σ²)
+//
+// QPSK constellation and bit mapping (bit 2k = I, bit 2k+1 = Q):
+//   s = ( a,  0)  ->  bits (0,0)
+//   s = ( 0,  a)  ->  bits (0,1)
+//   s = ( 0, -a)  ->  bits (1,0)
+//   s = (-a,  0)  ->  bits (1,1)
+//
+// Sign convention: positive LLR => bit more likely 0,
+//                 negative LLR => bit more likely 1.
+//
+// Parameters:
+//   syms       - 56 received QPSK symbols
+//   amplitudes - per-symbol channel fading amplitude (use 1.0 for flat channel)
+//   noise_var  - noise variance per I/Q component (sigma^2 of the AWGN)
+//   llr_out    - caller-allocated output buffer of 112 floats
+void ldpc_simplified_max_log_map(const RADE_COMP* syms,
+                                  const float*    amplitudes,
+                                  float           noise_var,
+                                  float*          llr_out);

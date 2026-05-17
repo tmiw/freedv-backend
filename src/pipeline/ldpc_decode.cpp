@@ -281,3 +281,50 @@ LDPCDecodeResult ldpc_decode(const RADE_COMP* syms,
     }
     return result;
 }
+
+// ---- Simplified-MAX-Log-MAP channel LLR computation ----
+//
+// For each QPSK symbol the exact MAP log-likelihood ratio:
+//
+//   LLR_b = log( Σ_{s: b=0} exp(-||r - a·s||² / (2σ²)) )
+//         - log( Σ_{s: b=1} exp(-||r - a·s||² / (2σ²)) )
+//
+// is approximated by replacing log-sum-exp with max (i.e., min squared distance):
+//
+//   LLR_b ≈ min_{s: b=1} ||r - a·s||² / (2σ²)
+//          - min_{s: b=0} ||r - a·s||² / (2σ²)
+//
+// Constellation (amplitude a):
+//   s00 = ( a,  0)  bits (0,0)   s01 = ( 0,  a)  bits (0,1)
+//   s10 = ( 0, -a)  bits (1,0)   s11 = (-a,  0)  bits (1,1)
+
+void ldpc_simplified_max_log_map(const RADE_COMP* syms,
+                                  const float*    amplitudes,
+                                  float           noise_var,
+                                  float*          llr_out)
+{
+    constexpr float LLR_MAX = 300.0f;
+
+    if (noise_var < 1e-10f) noise_var = 1e-10f;
+    const float inv_2var = 0.5f / noise_var;
+
+    for (int k = 0; k < 56; k++) {
+        const float a  = amplitudes[k];
+        const float rI = syms[k].real;
+        const float rQ = syms[k].imag;
+
+        // Squared Euclidean distances to each amplitude-scaled constellation point.
+        const float D00 = (rI - a)*(rI - a) + rQ*rQ;
+        const float D01 = rI*rI + (rQ - a)*(rQ - a);
+        const float D10 = rI*rI + (rQ + a)*(rQ + a);
+        const float D11 = (rI + a)*(rI + a) + rQ*rQ;
+
+        // Bit 2k   (I bit):  bit=0 -> {s00, s01},  bit=1 -> {s10, s11}
+        // Bit 2k+1 (Q bit):  bit=0 -> {s00, s10},  bit=1 -> {s01, s11}
+        const float llr_bit0 = (std::min(D10, D11) - std::min(D00, D01)) * inv_2var;
+        const float llr_bit1 = (std::min(D01, D11) - std::min(D00, D10)) * inv_2var;
+
+        llr_out[2*k]     = std::clamp(llr_bit0, -LLR_MAX, LLR_MAX);
+        llr_out[2*k + 1] = std::clamp(llr_bit1, -LLR_MAX, LLR_MAX);
+    }
+}
