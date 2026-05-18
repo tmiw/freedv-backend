@@ -246,13 +246,22 @@ float calc_likelihood(const RADE_COMP* sym, float var, float real, float imag, f
     return -var * (errR * errR + errI * errI);
 }
 
-// Performs exact computation of max*(x,y). On modern systems, this should
-// be okay performance-wise.
+// Linear constant log-map. See https://sciencedirect.com/science/article/pii/S001600321200035X
 float max_star(float x, float y)
 {
     float maxXY = std::max(x, y);
-    float expXY = std::exp(-std::abs(x - y));
-    float logXY = std::log(1 + expXY);
+    float absdiff = std::abs(x - y);
+    float logXY = 0;
+
+    if (absdiff <= 2.45)
+    {
+        logXY = -0.24 * absdiff + 0.596;
+    }
+    else if (absdiff > 2.45 && absdiff <= 3.5)
+    {
+        logXY = 0.048;
+    }
+
     return maxXY + logXY;
 }
 
