@@ -178,7 +178,7 @@ static char calculateCRC8_(char *input, int length)
     return crc;
 }
 
-static int rade_text_ldpc_decode(rade_text_impl_t *obj, char *dest, float meanAmplitude)
+static int rade_text_ldpc_decode(rade_text_impl_t *obj, char *dest, float meanAmplitude, float noiseVar)
 {
     assert(obj != NULL);
     assert(dest != NULL);
@@ -214,14 +214,9 @@ static int rade_text_ldpc_decode(rade_text_impl_t *obj, char *dest, float meanAm
     }
 
     log_info("mean amplitude: %f", meanAmplitude);
+    log_info("noise var: %f", noiseVar);
 
-    // Diagonal QPSK: per-component amplitude ≈ meanAmplitude / sqrt(2).
-    // We don't have a direct noise estimate, so approximate sigma² from
-    // signal power assuming ~0 dB per-component SNR for the test channel.
-    // sigma2 = (per_component_power) / (2 * SNR_linear) = rms²/4
-    // This keeps LLRs in the unsaturated range (≈ 4*r_I/rms) so the
-    // BP decoder operates in proper soft-decision mode.
-    float sigma2 = 0.1; //meanAmplitude * meanAmplitude / 4.0f;
+    float sigma2 = noiseVar; //meanAmplitude * meanAmplitude / 4.0f;
     if (sigma2 < 1e-6f) sigma2 = 1e-6f;
 
     auto decodeResult = ldpc_decode(obj->inbound_pending_syms, obj->inbound_pending_amps, sigma2);
@@ -281,6 +276,8 @@ void rade_text_rx(rade_text_t ptr, float *syms, int symSize)
 
     // Calculate RMS of all symbols
     float rms = 0;
+    float ss = 0;
+    int ssCnt = 0;
     obj->unusedEooBitCount = 0;
     obj->unusedEooErrCount = 0;
     for (int index = 0; index < symSize; index++)
@@ -297,8 +294,14 @@ void rade_text_rx(rade_text_t ptr, float *syms, int symSize)
         {
             // This is the unused part of the EOO that was filled with a known sequence.
             float* sym = &syms[2 * index];
-            rms += sym[0] * sym[0] + sym[1] * sym[1];
-
+            float sym_amp = std::sqrt(sym[0] * sym[0] + sym[1] * sym[1]);
+            //rms += sym[0] * sym[0] + sym[1] * sym[1];
+            if (sym_amp > 0)
+            {
+                ss += std::pow(1 - sym[0] / sym_amp, 2);
+                ss += std::pow(0 - sym[1] / sym_amp, 2);
+                ssCnt += 2;
+            }
             if (obj->enableStats)
             {
                 obj->unusedEooBitCount += 2;
@@ -328,7 +331,8 @@ void rade_text_rx(rade_text_t ptr, float *syms, int symSize)
     memset(rawStr, 0, RADE_TEXT_MAX_RAW_LENGTH + 1);
     memset(decodedStr, 0, RADE_TEXT_MAX_RAW_LENGTH + 1);
 
-    if (rade_text_ldpc_decode(obj, rawStr, rms) != 0)
+    float noiseVar = ss / (ssCnt - 1);
+    if (rade_text_ldpc_decode(obj, rawStr, rms, noiseVar) != 0)
     {
         // BER is under limits.
         convert_ota_string_to_callsign_(&rawStr[RADE_TEXT_CRC_LENGTH], &decodedStr[RADE_TEXT_CRC_LENGTH],
@@ -469,13 +473,9 @@ void rade_text_generate_tx_string(rade_text_t ptr, const char *str, int strlengt
 
     if (symSize > LDPC_TOTAL_SIZE_BITS)
     {
-        // Zero-pad remaining EOO slots. The EOO demodulator uses the last data
-        // slot (d=2, frame position 4) as a phase-estimation pilot, so non-zero
-        // symbols there corrupt the channel estimate for odd carriers. Zeros
-        // match the native RADE convention and contribute nothing to the sum.
         for (int index = LDPC_TOTAL_SIZE_BITS; index < symSize; index++)
         {
-            syms[index] = 0;
+            syms[index] = index % 2 ? 0 : 1;
         }
     }
 }

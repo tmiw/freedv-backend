@@ -124,54 +124,9 @@ LDPCDecodeResult ldpc_decode(const RADE_COMP* syms,
     if (noise_var < 1e-10f) noise_var = 1e-10f;
     const float scale = 2.0f / noise_var;
 
-    // Compute channel LLRs. We do this by calculating the distance between
-    // the normalized symbol (|s| = 1) and each of the following QPSK symbols:
-    //
-    // (1, 0) -> (0, 0)
-    // (0, 1) -> (0, 1)
-    // (0, -1) -> (1, 0)
-    // (-1, 0) -> (1, 1)
-    //
-    // LLR is defined as ln(P(bit = 0) / P(bit = 1)), so:
-    // 
-    //   llr_ch[2*k] = ln(P(syms[k].real = 0) / P(syms[k].real = 1))
-    //               = ln(
-    //                    (P(syms[k].real = 0 && syms[k].imag = 0) + P(syms[k].real = 0 && syms[k].imag = 1)) / 
-    //                    (P(syms[k].real = 1 && syms[k].imag = 0) + P(syms[k].real = 1 && syms[k].imag = 1))
-    //                   ) 
-    //   llr_ch[2*k + 1] = ln(P(syms[k].imag = 0) / P(syms[k].imag = 1))
-    //                   = ln(
-    //                        (P(syms[k].real = 0 && syms[k].imag = 0) + P(syms[k].real = 1 && syms[k].imag = 0)) /
-    //                        (P(syms[k].real = 0 && syms[k].imag = 1) + P(syms[k].real = 1 && syms[k].imag = 1))
-    //                       )
-    // 
+    // Compute channel LLRs. 
     float llr_ch[112];
-    for (int k = 0; k < 56; k++) {
-        const float a = amplitudes[k];
-
-        RADE_COMP normSym;
-        normSym.real = syms[k].real / a;
-        normSym.imag = syms[k].imag / a;
-
-        float dist00 = distanceBetween(&syms[k], 1, 0);
-        float dist01 = distanceBetween(&syms[k], 0, 1);
-        float dist10 = distanceBetween(&syms[k], 0, -1);
-        float dist11 = distanceBetween(&syms[k], -1, 0);
-        float norm = dist00 + dist01 + dist10 + dist11; // normalize distances since all probabilities should add up to 1
-
-        float prob00 = 1 - (dist00 / norm);
-        float prob01 = 1 - (dist01 / norm);
-        float prob10 = 1 - (dist10 / norm);
-        float prob11 = 1 - (dist11 / norm);
-
-        float prob0x = prob00 + prob01;
-        float prob1x = prob10 + prob11;
-        float probx0 = prob00 + prob10;
-        float probx1 = prob01 + prob11;
-
-        llr_ch[2*k]     = std::clamp(scale * a * std::log(prob0x / prob1x), -LLR_MAX, LLR_MAX);
-        llr_ch[2*k + 1] = std::clamp(scale * a * std::log(probx0 / probx1), -LLR_MAX, LLR_MAX);
-    }
+    ldpc_linear_log_map(syms, amplitudes, noise_var, llr_ch);
 
     const int E = (int)graph.edges.size();
 
@@ -282,6 +237,25 @@ LDPCDecodeResult ldpc_decode(const RADE_COMP* syms,
     return result;
 }
 
+float calc_likelihood(const RADE_COMP* sym, float var, float real, float imag, float amp, float avg_amp)
+{
+    float tempR = amp * real / avg_amp;
+    float tempI = amp * imag / avg_amp;
+    float errR = sym->real / avg_amp - tempR;
+    float errI = sym->imag / avg_amp - tempI;
+    return -var * (errR * errR + errI * errI);
+}
+
+// Performs exact computation of max*(x,y). On modern systems, this should
+// be okay performance-wise.
+float max_star(float x, float y)
+{
+    float maxXY = std::max(x, y);
+    float expXY = std::exp(-std::abs(x - y));
+    float logXY = std::log(1 + expXY);
+    return maxXY + logXY;
+}
+
 // ---- Simplified-MAX-Log-MAP channel LLR computation ----
 //
 // For each QPSK symbol the exact MAP log-likelihood ratio:
@@ -298,33 +272,64 @@ LDPCDecodeResult ldpc_decode(const RADE_COMP* syms,
 //   s00 = ( a,  0)  bits (0,0)   s01 = ( 0,  a)  bits (0,1)
 //   s10 = ( 0, -a)  bits (1,0)   s11 = (-a,  0)  bits (1,1)
 
-void ldpc_simplified_max_log_map(const RADE_COMP* syms,
-                                  const float*    amplitudes,
-                                  float           noise_var,
-                                  float*          llr_out)
+void ldpc_linear_log_map(const RADE_COMP* syms,
+                         const float*    amplitudes,
+                         float           noise_var,
+                         float*          llr_out)
 {
+    constexpr int NUM_BITS_PER_SYMBOL = 2;
+    constexpr int NUM_SYMBOLS = 56;
     constexpr float LLR_MAX = 300.0f;
+    constexpr int NUM_POSSIBLE_SYMBOLS = 1 << NUM_BITS_PER_SYMBOL;
+    constexpr float EsNo = 3;
 
     if (noise_var < 1e-10f) noise_var = 1e-10f;
     const float inv_2var = 0.5f / noise_var;
 
-    for (int k = 0; k < 56; k++) {
+    float mean_amp = 0;
+    for (int k = 0; k < NUM_SYMBOLS; k++) 
+    {
+        mean_amp += std::sqrt(syms[k].real * syms[k].real + syms[k].imag * syms[k].imag);
+    }
+    mean_amp /= NUM_SYMBOLS;
+
+    for (int k = 0; k < NUM_SYMBOLS; k++) {
         const float a  = amplitudes[k];
-        const float rI = syms[k].real;
-        const float rQ = syms[k].imag;
 
-        // Squared Euclidean distances to each amplitude-scaled constellation point.
-        const float D00 = (rI - a)*(rI - a) + rQ*rQ;
-        const float D01 = rI*rI + (rQ - a)*(rQ - a);
-        const float D10 = rI*rI + (rQ + a)*(rQ + a);
-        const float D11 = (rI + a)*(rI + a) + rQ*rQ;
+        float num[NUM_BITS_PER_SYMBOL];
+        float den[NUM_BITS_PER_SYMBOL];
+        float sym_likelihoods[] = {
+            calc_likelihood(&syms[k], EsNo, 1, 0, a, mean_amp),  // 00
+            calc_likelihood(&syms[k], EsNo, 0, 1, a, mean_amp),  // 01
+            calc_likelihood(&syms[k], EsNo, 0, -1, a, mean_amp), // 10
+            calc_likelihood(&syms[k], EsNo, -1, 0, a, mean_amp)  // 11
+        };
 
-        // Bit 2k   (I bit):  bit=0 -> {s00, s01},  bit=1 -> {s10, s11}
-        // Bit 2k+1 (Q bit):  bit=0 -> {s00, s10},  bit=1 -> {s01, s11}
-        const float llr_bit0 = (std::min(D10, D11) - std::min(D00, D01)) * inv_2var;
-        const float llr_bit1 = (std::min(D01, D11) - std::min(D00, D10)) * inv_2var;
+        for (int index = 0; index < NUM_BITS_PER_SYMBOL; index++)
+        {
+            num[index] = den[index] = -LLR_MAX;
+        }
 
-        llr_out[2*k]     = std::clamp(llr_bit0, -LLR_MAX, LLR_MAX);
-        llr_out[2*k + 1] = std::clamp(llr_bit1, -LLR_MAX, LLR_MAX);
+        // 00
+        den[0] = max_star(den[0], sym_likelihoods[0]);
+        den[1] = max_star(den[1], sym_likelihoods[0]);
+
+        // 01
+        den[0] = max_star(den[0], sym_likelihoods[1]);
+        num[1] = max_star(num[1], sym_likelihoods[1]);
+
+        // 10
+        num[0] = max_star(num[0], sym_likelihoods[2]);
+        den[1] = max_star(den[1], sym_likelihoods[2]);
+
+        // 11
+        num[0] = max_star(num[0], sym_likelihoods[3]);
+        num[1] = max_star(num[1], sym_likelihoods[3]);
+
+        const float llr_bit0 = num[0] - den[0];
+        const float llr_bit1 = num[1] - den[1];
+
+        llr_out[2*k]     = -std::clamp(llr_bit0, -LLR_MAX, LLR_MAX);
+        llr_out[2*k + 1] = -std::clamp(llr_bit1, -LLR_MAX, LLR_MAX);
     }
 }

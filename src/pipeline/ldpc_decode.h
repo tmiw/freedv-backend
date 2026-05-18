@@ -55,7 +55,7 @@ LDPCDecodeResult ldpc_decode(const RADE_COMP* syms,
 //   amplitudes - per-symbol channel fading amplitude (use 1.0 for flat channel)
 //   noise_var  - noise variance per I/Q component (sigma^2 of the AWGN)
 //   llr_out    - caller-allocated output buffer of 112 floats
-void ldpc_simplified_max_log_map(const RADE_COMP* syms,
-                                  const float*    amplitudes,
-                                  float           noise_var,
-                                  float*          llr_out);
+void ldpc_linear_log_map(const RADE_COMP* syms,
+                         const float*    amplitudes,
+                         float           noise_var,
+                         float*          llr_out);

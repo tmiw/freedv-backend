@@ -90,7 +90,7 @@ int main()
     while (nout > 0)
     {
         auto outputSamples = txStep->execute(inputSamplesPtr.get(), 0, &nout);
-        addNoise(outputSamples, nout);
+        //addNoise(outputSamples, nout);
         recvStep->execute(outputSamples, nout, &noutRx);
     }
 
