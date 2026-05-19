@@ -261,7 +261,7 @@ static int rade_text_ldpc_decode(rade_text_impl_t *obj, char *dest, float meanAm
         }
     }
 
-    return decodeResult.converged;;
+    return decodeResult.converged;
 }
 
 /* Decode received symbols from RADE decoder. */
@@ -321,8 +321,10 @@ void rade_text_rx(rade_text_t ptr, float *syms, int symSize)
     {
         RADE_COMP *sym = &obj->inbound_pending_syms[index];
         float sym_amp = sqrtf(sym->real * sym->real + sym->imag * sym->imag);
+        sym->real /= sym_amp;
+        sym->imag /= sym_amp;
         obj->inbound_pending_amps[index] = sym_amp;
-        log_debug("RX symbol rotated: %f, %f, amp: %f", sym->real, sym->imag, sym_amp);
+        log_debug("RX symbol: %f, %f, amp: %f", sym->real, sym->imag, sym_amp);
     }
 
     // We have all the bits we need, so we're ready to decode.

@@ -117,7 +117,7 @@ int main()
             auto res = ldpc_decode(syms, amplitudes, sigma2, 100);
             conv += res.converged;
             total_iters += res.iterations;
-            if (res.message != msg) frame_errors++;
+            if (res.message != cw) frame_errors++;
         }
 
         printf("%6.1f  %6.3f  %4.1f  %d\n",
