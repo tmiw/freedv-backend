@@ -3,7 +3,7 @@
 
 std::array<uint8_t, 112> ldpc_encode(const std::array<uint8_t, 56>& s)
 {
-    std::array<uint8_t, 112> codeword;
+    std::array<uint8_t, 112> codeword{};
 
     // Codeword must satisfy Hc^t = 0. The first half of c is known
     // to be s, so we can prepopulate now.

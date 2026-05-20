@@ -443,7 +443,7 @@ void rade_text_generate_tx_string(rade_text_t ptr, const char *str, int strlengt
     tmp[0] = crc;
 
     // Encode block of text using LDPC(112,56).
-    std::array<uint8_t, LDPC_TOTAL_SIZE_BITS / 2> ibits;
+    std::array<uint8_t, LDPC_TOTAL_SIZE_BITS / 2> ibits{};  // zero-initialize; bits not explicitly set below must be 0
     unsigned char pbits[LDPC_TOTAL_SIZE_BITS / 2];
     memset(pbits, 0, LDPC_TOTAL_SIZE_BITS / 2);
     for (int index = 0; index < 8; index++)

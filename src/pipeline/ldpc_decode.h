@@ -5,9 +5,9 @@
 #include "rade_api.h"
 
 struct LDPCDecodeResult {
-    std::array<uint8_t, 112> message; // decoded message bits (0 or 1)
-    bool  converged;                  // true if all parity checks are satisfied
-    int   iterations;                 // number of BP iterations performed
+    std::array<uint8_t, 112> message{}; // decoded message bits (0 or 1)
+    bool  converged;                    // true if all parity checks are satisfied
+    int   iterations;                   // number of BP iterations performed
 };
 
 // Soft-decision LDPC(112,56) decoder using sum-product belief propagation.
