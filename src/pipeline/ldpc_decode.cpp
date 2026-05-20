@@ -142,11 +142,10 @@ LDPCDecodeResult ldpc_decode(const RADE_COMP* syms,
 
 float calc_likelihood(const RADE_COMP* sym, float var, float real, float imag, float amp, float avg_amp)
 {
-    float tempR = amp * real / avg_amp;
-    float tempI = amp * imag / avg_amp;
-    float errR = sym->real / avg_amp - tempR;
-    float errI = sym->imag / avg_amp - tempI;
-    return -var * (errR * errR + errI * errI);
+    float errR = sym->real - real;
+    float errI = sym->imag - imag;
+    float a = amp / avg_amp;
+    return -var * a * a * (errR * errR + errI * errI);
 }
 
 // Linear constant log-map. See https://sciencedirect.com/science/article/pii/S001600321200035X
@@ -199,7 +198,7 @@ void ldpc_linear_log_map(const RADE_COMP* syms,
         mean_amp += amplitudes[k];
     }
     mean_amp /= NUM_SYMBOLS;
-    float EsNo = mean_amp * mean_amp / (2.0f * noise_var);
+    float EsNo = 1.0f / (2.0f * noise_var);
 
     for (int k = 0; k < NUM_SYMBOLS; k++) {
         const float a  = amplitudes[k];

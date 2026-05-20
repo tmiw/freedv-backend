@@ -82,7 +82,7 @@ int main()
     for (int count = 0; count < 11; count++)
     {
         auto outputSamples = txStep->execute(inputSamplesPtr.get(), SAMPLES_PER_TX, &nout);
-        //addNoise(outputSamples, nout);
+        addNoise(outputSamples, nout);
         recvStep->execute(outputSamples, nout, &noutRx);
     }
 
@@ -90,7 +90,7 @@ int main()
     while (nout > 0)
     {
         auto outputSamples = txStep->execute(inputSamplesPtr.get(), 0, &nout);
-        //addNoise(outputSamples, nout);
+        addNoise(outputSamples, nout);
         recvStep->execute(outputSamples, nout, &noutRx);
     }
 
