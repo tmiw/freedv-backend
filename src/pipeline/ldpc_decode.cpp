@@ -52,7 +52,7 @@ LDPCDecodeResult ldpc_decode(const RADE_COMP* syms,
 
     // Compute channel LLRs. 
     float llr_ch[112];
-    ldpc_linear_log_map(syms, amplitudes, noise_var, llr_ch);
+    ldpc_linear_log_map(syms, amplitudes, llr_ch);
 
     const int E = (int)graph.edges.size();
 
@@ -184,16 +184,12 @@ float max_star(float x, float y)
 
 void ldpc_linear_log_map(const RADE_COMP* syms,
                          const float*    amplitudes,
-                         float           noise_var,
                          float*          llr_out)
 {
     constexpr int NUM_BITS_PER_SYMBOL = 2;
     constexpr int NUM_SYMBOLS = 56;
     constexpr int NUM_POSSIBLE_SYMBOLS = 1 << NUM_BITS_PER_SYMBOL;
     constexpr float EsNo = 3;
-
-    if (noise_var < 1e-10f) noise_var = 1e-10f;
-    const float inv_2var = 0.5f / noise_var;
 
     float mean_amp = 0;
     for (int k = 0; k < NUM_SYMBOLS; k++) 

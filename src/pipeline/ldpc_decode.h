@@ -57,5 +57,4 @@ LDPCDecodeResult ldpc_decode(const RADE_COMP* syms,
 //   llr_out    - caller-allocated output buffer of 112 floats
 void ldpc_linear_log_map(const RADE_COMP* syms,
                          const float*    amplitudes,
-                         float           noise_var,
                          float*          llr_out);
