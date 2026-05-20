@@ -58,7 +58,7 @@ static float LastEncodedLDPC[LDPC_TOTAL_SIZE_BITS];
 static char LastLDPCAsBits[LDPC_TOTAL_SIZE_BITS];
 
 /* Internal definition of rade_text_t. */
-typedef struct
+typedef struct RadeTextImpl
 {
     on_text_rx_t text_rx_callback;
     void *callback_state;
@@ -69,12 +69,42 @@ typedef struct
 
     RADE_COMP inbound_pending_syms[LDPC_TOTAL_SIZE_BITS / 2];
     float inbound_pending_amps[LDPC_TOTAL_SIZE_BITS / 2];
-    float incomingData[LDPC_TOTAL_SIZE_BITS];
 
     int enableStats;
 
     int unusedEooBitCount;
     int unusedEooErrCount;
+
+    RadeTextImpl()
+        : text_rx_callback(nullptr)
+        , callback_state(nullptr)
+        , tx_text_index(0)
+        , tx_text_length(0)
+        , enableStats(1)
+        , unusedEooBitCount(0)
+        , unusedEooErrCount(0)
+    {
+        memset(tx_text, 0, LDPC_TOTAL_SIZE_BITS);
+        memset(inbound_pending_syms, 0, sizeof(RADE_COMP) * LDPC_TOTAL_SIZE_BITS / 2);
+        memset(inbound_pending_amps, 0, sizeof(float) * LDPC_TOTAL_SIZE_BITS / 2);
+    }
+
+    RadeTextImpl(const RadeTextImpl& rhs)
+        : text_rx_callback(rhs.text_rx_callback)
+        , callback_state(rhs.callback_state)
+        , tx_text_index(rhs.tx_text_index)
+        , tx_text_length(rhs.tx_text_length)
+        , enableStats(rhs.enableStats)
+        , unusedEooBitCount(rhs.unusedEooBitCount)
+        , unusedEooErrCount(rhs.unusedEooErrCount)
+    {
+        memcpy(tx_text, rhs.tx_text, LDPC_TOTAL_SIZE_BITS);
+        memcpy(inbound_pending_syms, rhs.inbound_pending_syms, sizeof(RADE_COMP) * LDPC_TOTAL_SIZE_BITS / 2);
+        memcpy(inbound_pending_amps, rhs.inbound_pending_amps, sizeof(float) * LDPC_TOTAL_SIZE_BITS / 2);
+    }
+
+    RadeTextImpl(RadeTextImpl&&) noexcept = delete;
+
 } rade_text_impl_t;
 
 // 6 bit character set for text field use:
@@ -292,7 +322,6 @@ void rade_text_rx(rade_text_t ptr, float *syms, int symSize)
     assert(obj != NULL);
 
     // Deinterleave received bits.
-    memcpy(obj->inbound_pending_syms, syms, sizeof(RADE_COMP) * symSize); // ensures we get non-interleaved filler bits for noise calc
     deinterleave_comp(obj->inbound_pending_syms, (RADE_COMP*)syms, LDPC_TOTAL_SIZE_BITS / 2);
 
     // Calculate RMS of all symbols
@@ -379,7 +408,7 @@ void rade_text_rx(rade_text_t ptr, float *syms, int symSize)
 
 rade_text_t rade_text_create()
 {
-    rade_text_impl_t *ret = new rade_text_impl_t();
+    rade_text_impl_t *ret = new RadeTextImpl();
     assert(ret != NULL);
 
     return (rade_text_t)ret;
