@@ -178,6 +178,27 @@ static char calculateCRC8_(char *input, int length)
     return crc;
 }
 
+static constexpr int INTERLEAVER_B = 37;
+static void deinterleave_comp(RADE_COMP* out, RADE_COMP* in, int syms)
+{
+    for (int index = 0; index < syms; index++)
+    {
+        int newIndex = (INTERLEAVER_B * index) % syms;
+        out[newIndex].real = in[index].real;
+        out[newIndex].imag = in[index].imag;
+    }
+}
+
+static void interleave_bits(char* out, char* in, int syms)
+{
+    for (int index = 0; index < syms; index++)
+    {
+        int oldIndex = (INTERLEAVER_B * index) % syms;
+        out[2 * index] = in[2 * oldIndex];
+        out[2 * index + 1] = in[2 * oldIndex + 1];
+    }
+}
+
 static int rade_text_ldpc_decode(rade_text_impl_t *obj, char *dest, float meanAmplitude, float noiseVar)
 {
     assert(obj != NULL);
@@ -271,8 +292,8 @@ void rade_text_rx(rade_text_t ptr, float *syms, int symSize)
     assert(obj != NULL);
 
     // Deinterleave received bits.
-    //gp_deinterleave_comp((COMP *)obj->inbound_pending_syms, (COMP *)syms, LDPC_TOTAL_SIZE_BITS / 2);
-    memcpy(obj->inbound_pending_syms, syms, sizeof(RADE_COMP) * symSize);
+    memcpy(obj->inbound_pending_syms, syms, sizeof(RADE_COMP) * symSize); // ensures we get non-interleaved filler bits for noise calc
+    deinterleave_comp(obj->inbound_pending_syms, (RADE_COMP*)syms, LDPC_TOTAL_SIZE_BITS / 2);
 
     // Calculate RMS of all symbols
     float rms = 0;
@@ -429,11 +450,9 @@ void rade_text_generate_tx_string(rade_text_t ptr, const char *str, int strlengt
     memcpy(&tmpbits[0], &ibits[0], LDPC_TOTAL_SIZE_BITS / 2);
     memcpy(&tmpbits[LDPC_TOTAL_SIZE_BITS / 2], &pbits[0], LDPC_TOTAL_SIZE_BITS / 2);
     memcpy(LastLDPCAsBits, tmpbits, LDPC_TOTAL_SIZE_BITS);
-    memcpy(impl->tx_text, tmpbits, LDPC_TOTAL_SIZE_BITS);
 
     // Interleave the bits together to enhance fading performance.
-    //gp_interleave_bits(&impl->tx_text[0], tmpbits, LDPC_TOTAL_SIZE_BITS / 2);
-    //memcpy(impl->tx_text, tmpbits, LDPC_TOTAL_SIZE_BITS);
+    interleave_bits(&impl->tx_text[0], tmpbits, LDPC_TOTAL_SIZE_BITS / 2);
 
     // Generate floats based on the bits.
     char debugString[256];
