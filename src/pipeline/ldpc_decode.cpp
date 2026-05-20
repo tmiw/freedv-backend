@@ -32,16 +32,18 @@ struct LDPCGraph {
 static const LDPCGraph graph;
 
 // ---- Belief-propagation decoder ----
+constexpr float LLR_MAX = 10000.0f;
 
 static float phi(float x)
 {
+    if (x < 1e-10f) return LLR_MAX;
+
     auto expx = std::exp(x);
-    return std::log((expx + 1) / (expx - 1));
+    if (expx < 1e-10f) return LLR_MAX;
+
+    return std::log((expx + 1.0f) / (expx - 1.0f));
 }
 
-#include <iostream>
-
-constexpr float LLR_MAX = 10000.0f;
 LDPCDecodeResult ldpc_decode(const RADE_COMP* syms,
                               const float*    amplitudes,
                               float           noise_var,
@@ -52,7 +54,7 @@ LDPCDecodeResult ldpc_decode(const RADE_COMP* syms,
 
     // Compute channel LLRs. 
     float llr_ch[112];
-    ldpc_linear_log_map(syms, amplitudes, llr_ch);
+    ldpc_linear_log_map(syms, amplitudes, noise_var, llr_ch);
 
     const int E = (int)graph.edges.size();
 
@@ -84,13 +86,13 @@ LDPCDecodeResult ldpc_decode(const RADE_COMP* syms,
             for (int k = 0; k < nd; k++) {
                 const float v = m_vc[ce[k]];
                 sign *= (v >= 0.0f) ? 1 : -1;
-                sum += phi(std::abs(v));
+                sum += std::max(0.0f, phi(std::abs(v)));
             }
 
             for (int k = 0; k < nd; k++) {
                 const float v = m_vc[ce[k]];
                 int inv_sign = (v >= 0.0f) ? 1 : -1;
-                m_cv[ce[k]] = std::clamp(inv_sign * sign * phi(sum - phi(std::abs(v))), -LLR_MAX, LLR_MAX);
+                m_cv[ce[k]] = std::clamp(inv_sign * sign * std::max(0.0f, phi(sum - phi(std::abs(v)))), -LLR_MAX, LLR_MAX);
             }
         }
 
@@ -184,12 +186,12 @@ float max_star(float x, float y)
 
 void ldpc_linear_log_map(const RADE_COMP* syms,
                          const float*    amplitudes,
+                         float           noise_var,
                          float*          llr_out)
 {
     constexpr int NUM_BITS_PER_SYMBOL = 2;
     constexpr int NUM_SYMBOLS = 56;
     constexpr int NUM_POSSIBLE_SYMBOLS = 1 << NUM_BITS_PER_SYMBOL;
-    constexpr float EsNo = 3;
 
     float mean_amp = 0;
     for (int k = 0; k < NUM_SYMBOLS; k++) 
@@ -197,6 +199,7 @@ void ldpc_linear_log_map(const RADE_COMP* syms,
         mean_amp += amplitudes[k];
     }
     mean_amp /= NUM_SYMBOLS;
+    float EsNo = mean_amp * mean_amp / (2.0f * noise_var);
 
     for (int k = 0; k < NUM_SYMBOLS; k++) {
         const float a  = amplitudes[k];

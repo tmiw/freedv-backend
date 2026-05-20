@@ -94,7 +94,7 @@ int main()
     for (float ebn0_db : {0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f, 9.0f, 10.0f}) {
         // Rate-1/2 QPSK: per-component noise variance sigma^2 = 1 / (2 * Eb/N0 * rate)
         float ebn0   = std::pow(10.0f, ebn0_db / 10.0f);
-        float sigma2 = 1.0f / (2.0f * ebn0 * 0.5f);
+        float sigma2 = 1.0f / (2.0f * ebn0);
         float sigma  = std::sqrt(sigma2);
 
         int   frame_errors = 0;
