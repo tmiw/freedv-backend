@@ -216,7 +216,7 @@ static int rade_text_ldpc_decode(rade_text_impl_t *obj, char *dest, float meanAm
     log_info("mean amplitude: %f", meanAmplitude);
     log_info("noise var: %f", noiseVar);
 
-    float sigma2 = noiseVar; //meanAmplitude * meanAmplitude / 4.0f;
+    float sigma2 = noiseVar; //meanAmplitude * meanAmplitude / 5.0f;
     if (sigma2 < 1e-6f) sigma2 = 1e-6f;
 
     auto decodeResult = ldpc_decode(obj->inbound_pending_syms, obj->inbound_pending_amps, sigma2);

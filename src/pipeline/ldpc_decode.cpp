@@ -33,24 +33,13 @@ static const LDPCGraph graph;
 
 // ---- Belief-propagation decoder ----
 
-static float normalDistribution(float x, float var)
-{
-    float ex = std::exp(-(x * x) / (2 * var));
-    return (x / var) * ex; //ex / (std::sqrt(2 * M_PI * var));
-}
-
-static float distanceBetween(const RADE_COMP* sym, float x, float y)
-{
-    float xdiff = sym->real - x;
-    float ydiff = sym->imag - y;
-    return std::sqrt(xdiff * xdiff + ydiff * ydiff);
-}
-
 static float phi(float x)
 {
     auto expx = std::exp(x);
     return std::log((expx + 1) / (expx - 1));
 }
+
+#include <iostream>
 
 constexpr float LLR_MAX = 10000.0f;
 LDPCDecodeResult ldpc_decode(const RADE_COMP* syms,
@@ -88,7 +77,7 @@ LDPCDecodeResult ldpc_decode(const RADE_COMP* syms,
         //
         for (int i = 0; i < 56; i++) {
             const auto& ce = graph.check_edges[i];
-            const int   nd = (int)ce.size();   // 4 or 5 for this code
+            const int   nd = (int)ce.size();
 
             int sign = 1;
             float sum = 0;
@@ -100,7 +89,8 @@ LDPCDecodeResult ldpc_decode(const RADE_COMP* syms,
 
             for (int k = 0; k < nd; k++) {
                 const float v = m_vc[ce[k]];
-                m_cv[ce[k]] = std::clamp(sign * phi(sum - phi(std::abs(v))), -LLR_MAX, LLR_MAX);
+                int inv_sign = (v >= 0.0f) ? 1 : -1;
+                m_cv[ce[k]] = std::clamp(inv_sign * sign * phi(sum - phi(std::abs(v))), -LLR_MAX, LLR_MAX);
             }
         }
 
@@ -121,11 +111,10 @@ LDPCDecodeResult ldpc_decode(const RADE_COMP* syms,
 
         // ---- Posterior LLR, hard decision, syndrome check ----
 
-        uint8_t bits[112];
         for (int j = 0; j < 112; j++) {
             float L = llr_ch[j];
             for (int e : graph.var_edges[j]) L += m_cv[e];
-            bits[j] = (L < 0.0f) ? 1 : 0;
+            result.message[j] = (L < 0.0f) ? 1 : 0;
         }
 
         // bits * H' must equal 0. Check here.
@@ -133,25 +122,19 @@ LDPCDecodeResult ldpc_decode(const RADE_COMP* syms,
         for (int i = 0; i < 56 && ok; i++) {
             int ctr = 0;
             for (int j = 0; j < 112; j++) {
-                ctr += bits[j] * HRA_56_56[i][j];
+                ctr += HRA_56_56[i][j] * result.message[j];
             }
-            ok = !(ctr & 1); // non-zero check
+            ok = (ctr % 2) == 0; // non-zero check
         }
 
         result.iterations = iter + 1;
-        for (int k = 0; k < 112; k++) result.message[k] = bits[k];
         if (ok) {
             result.converged = true;
-            return result;
+            break;
         }
     }
 
-    // Not converged – return best posterior estimate of the message bits.
-    /*for (int j = 0; j < 112; j++) {
-        float L = llr_ch[j];
-        for (int e : graph.var_edges[j]) L += m_cv[e];
-        result.message[j] = (L < 0.0f) ? 1 : 0;
-    }*/
+    // Return result, even if not converged.
     return result;
 }
 

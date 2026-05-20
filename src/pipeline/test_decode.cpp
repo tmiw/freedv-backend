@@ -111,8 +111,8 @@ int main()
             bits_to_qpsk(cw, syms);
             add_noise(syms, sigma, rng);
 
-            float amplitudes[56];
-            for (int k = 0; k < 56; k++) amplitudes[k] = 1.0f;
+            float amplitudes[112];
+            for (int k = 0; k < 112; k++) amplitudes[k] = 1.0f;
 
             auto res = ldpc_decode(syms, amplitudes, sigma2, 100);
             conv += res.converged;
