@@ -56,7 +56,9 @@ DefineUnitTest(ResampleTest)
 target_link_libraries(ResampleTest PRIVATE ${FREEDV_LINK_LIBS})
 DefineUnitTest(TapTest)
 
-#if(LINUX)
+DefineUnitTest(ldpc_decode)
+DefineUnitTest(ldpc_encode)
+
 # TBD - won't execute on macOS just yet.
 DefineUnitTest(RadeTextTest)
 target_link_libraries(RadeTextTest PRIVATE ${FREEDV_LINK_LIBS} rade opus r8brain) 
@@ -66,10 +68,5 @@ if(BOOTSTRAP_WXWIDGETS)
     target_include_directories(RadeTextTest PRIVATE ${WXBUILD_INCLUDES})
 endif(BOOTSTRAP_WXWIDGETS)
 #endif(LINUX)
-
-add_executable(test_decode test_decode.cpp)
-target_link_libraries(test_decode PRIVATE fdv_audio_pipeline)
-add_executable(test_encode test_encode.cpp)
-target_link_libraries(test_encode PRIVATE fdv_audio_pipeline)
 
 endif(UNITTEST)

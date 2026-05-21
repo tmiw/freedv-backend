@@ -48,6 +48,8 @@ static float add_noise(RADE_COMP syms[56], float sigma, std::mt19937& rng)
 
 int main()
 {
+    bool success = true;
+
     // --- Test 1: high SNR decode of the reference codeword ---
     printf("=== Test 1: high-SNR decode ===\n");
     {
@@ -82,6 +84,8 @@ int main()
         bool match = true;
         for (int i = 0; i < 56; i++) if (res.message[i] != (uint8_t)(in_str[i]-'0')) { match=false; break; }
         printf("Match: %s\n\n", match ? "YES" : "NO");
+
+        success &= match && res.converged;
     }
 
     // --- Test 2: frame error rate sweep over Eb/N0 ---
@@ -126,5 +130,5 @@ int main()
                total_iters / FRAMES,
                conv);
     }
-    return 0;
+    return success ? 0 : -1;
 }

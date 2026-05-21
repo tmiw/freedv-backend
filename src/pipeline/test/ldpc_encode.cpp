@@ -19,6 +19,8 @@ int main() {
 
     printf("Got:      %s\n", out);
     printf("Expected: %s\n", expected);
-    printf("Match: %s\n", strcmp(out, expected) == 0 ? "YES" : "NO");
-    return 0;
+
+    bool success = strcmp(out, expected) == 0;
+    printf("Match: %s\n", success ? "YES" : "NO");
+    return success ? 0 : -1;
 }
