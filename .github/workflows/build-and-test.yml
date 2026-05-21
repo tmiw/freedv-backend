@@ -29,11 +29,11 @@ jobs:
         cmake -DUNITTEST=1 ..
 
     - name: Build backend and tests
-      working-directory: ${{github.workspace}}/build
       run: |
+        cd build
         make
 
     - name: Run tests
-      working-directory: ${{github.workspace}}/build
       run: |
+        cd build
         ctest -V
