@@ -1,5 +1,5 @@
 //==========================================================================
-// Name:            rade_text.c
+// Name:            rade_text.cpp
 //
 // Purpose:         Handles reliable text (e.g. text with FEC).
 // Created:         August 15, 2021
