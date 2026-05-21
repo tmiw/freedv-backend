@@ -28,10 +28,8 @@ add_library(fdv_audio_pipeline STATIC
 )
 
 target_compile_options(fdv_audio_pipeline PRIVATE ${WARNINGS_AS_ERRORS_FLAGS})
-target_link_libraries(fdv_audio_pipeline PRIVATE ebur128 agc rnnoise fdv_os_wrapper r8brain)
+target_link_libraries(fdv_audio_pipeline PRIVATE ebur128 agc rnnoise fdv_os_wrapper r8brain rade opus)
 target_include_directories(fdv_audio_pipeline PRIVATE ${CODEC2_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_BINARY_DIR}/..)
-
-add_dependencies(fdv_audio_pipeline rade opus)
 
 if(BOOTSTRAP_WXWIDGETS)
     add_dependencies(fdv_audio_pipeline wx::core wx::base wx::aui wx::html wx::net wx::adv wx::propgrid wx::xrc)
@@ -40,17 +38,12 @@ if(BOOTSTRAP_WXWIDGETS)
 endif(BOOTSTRAP_WXWIDGETS)
 
 if(UNITTEST)
-set(CMAKE_MACOSX_RPATH 1)
 macro(DefineUnitTest utName)
     add_executable(${utName} test/${utName}.cpp)
     target_link_libraries(${utName} PRIVATE fdv_audio_pipeline fdv_util r8brain)
     target_include_directories(${utName} PRIVATE ${CODEC2_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_BINARY_DIR}/..)
     
     add_test(NAME pipeline_${utName} COMMAND ${CMAKE_CURRENT_BINARY_DIR}/${utName})
-
-    set_target_properties(
-        ${utName}
-        PROPERTIES INSTALL_RPATH "${CMAKE_INSTALL_RPATH};${CMAKE_BINARY_DIR}/rade_build/src")  
 endmacro()
 
 DefineUnitTest(AudioPipelineTest)
