@@ -17,6 +17,11 @@ jobs:
     steps:
     - uses: actions/checkout@v6
 
+    - name: Install required packages (macOS)
+      if: ${{ matrix.os == "macos-15" }}
+      run: |
+        brew install automake libtool
+     
     - name: Configure build
       run: |
         mkdir build
