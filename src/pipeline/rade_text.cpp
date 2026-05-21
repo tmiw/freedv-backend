@@ -267,7 +267,7 @@ static int rade_text_ldpc_decode(rade_text_impl_t *obj, char *dest, float meanAm
     log_info("mean amplitude: %f", meanAmplitude);
     log_info("noise var: %f", noiseVar);
 
-    float sigma2 = noiseVar; //meanAmplitude * meanAmplitude / 5.0f;
+    float sigma2 = noiseVar; 
     if (sigma2 < 1e-6f) sigma2 = 1e-6f;
 
     auto decodeResult = ldpc_decode(obj->inbound_pending_syms, obj->inbound_pending_amps, sigma2);
@@ -335,9 +335,6 @@ void rade_text_rx(rade_text_t ptr, float *syms, int symSize)
         if (index < (LDPC_TOTAL_SIZE_BITS / 2))
         {
             RADE_COMP *sym = &obj->inbound_pending_syms[index];
-            //sym->real = syms[2 * index];
-            //sym->imag = syms[2 * index + 1];
-            //obj->inbound_pending_amps[index] = sqrtf(sym->real * sym->real + sym->imag * sym->imag);
             rms += sym->real * sym->real + sym->imag * sym->imag;
         }
         else
@@ -345,7 +342,6 @@ void rade_text_rx(rade_text_t ptr, float *syms, int symSize)
             // This is the unused part of the EOO that was filled with a known sequence.
             float* sym = &syms[2 * index];
             float sym_amp = std::sqrt(sym[0] * sym[0] + sym[1] * sym[1]);
-            //rms += sym[0] * sym[0] + sym[1] * sym[1];
             if (sym_amp > 0)
             {
                 ss += std::pow(1 - sym[0] / sym_amp, 2);
