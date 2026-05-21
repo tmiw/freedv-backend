@@ -31,7 +31,7 @@ jobs:
     - name: Build backend and tests
       run: |
         cd build
-        make
+        cmake --build .
 
     - name: Run tests
       run: |
