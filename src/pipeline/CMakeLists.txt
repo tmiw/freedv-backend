@@ -44,6 +44,10 @@ macro(DefineUnitTest utName)
     target_include_directories(${utName} PRIVATE ${CODEC2_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_BINARY_DIR}/..)
     
     add_test(NAME pipeline_${utName} COMMAND ${CMAKE_CURRENT_BINARY_DIR}/${utName})
+
+    set_target_properties(
+        ${utName}
+        PROPERTIES BUILD_RPATH "${CMAKE_BUILD_RPATH};${CMAKE_BINARY_DIR}/rade_build/src")
 endmacro()
 
 DefineUnitTest(AudioPipelineTest)
