@@ -5,7 +5,7 @@
 #include <thread>
 #include <atomic>
 
-#include "sanitizers.h"
+#include "freedv_sanitizers.h"
 
 #if defined(__aarch64__)
 // Not every compiler has intrinsics for this instruction.

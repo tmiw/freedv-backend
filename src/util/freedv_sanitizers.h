@@ -1,5 +1,5 @@
 //=========================================================================
-// Name:            sanitizers.h
+// Name:            freedv_sanitizers.h
 // Purpose:         Defines items needed to enable LLVM sanitizer execution.
 //
 // Authors:         Mooneer Salem

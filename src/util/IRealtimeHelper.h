@@ -23,7 +23,7 @@
 #ifndef I_REALTIME_HELPER_H
 #define I_REALTIME_HELPER_H
 
-#include "sanitizers.h"
+#include "freedv_sanitizers.h"
 
 class IRealtimeHelper
 {

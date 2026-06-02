@@ -31,7 +31,7 @@
 #include <semaphore.h>
 #endif // defined(_WIN32) || defined(__APPLE__)
 
-#include "sanitizers.h"
+#include "freedv_sanitizers.h"
 
 class Semaphore
 {

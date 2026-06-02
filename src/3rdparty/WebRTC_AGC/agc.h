@@ -27,7 +27,7 @@
 #include <stdint.h>  // NOLINT(build/include)
 #include <assert.h>
 
-#include "../../util/sanitizers.h"
+#include "../../util/freedv_sanitizers.h"
 
 // allpass filter coefficients.
 static const uint16_t kResampleAllpass1[3] = {3284, 24441, 49528};

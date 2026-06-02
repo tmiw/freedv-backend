@@ -37,7 +37,7 @@
 
 #include <cmath>
 #include <limits>
-#include "../util/sanitizers.h"
+#include "freedv_sanitizers.h"
 
 class IPipelineStep
 {

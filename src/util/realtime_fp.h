@@ -25,7 +25,7 @@
 #define REALTIME_FP_H
 
 #include <utility>
-#include "sanitizers.h"
+#include "freedv_sanitizers.h"
 
 template <typename>
 class realtime_fp;
