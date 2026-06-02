@@ -67,6 +67,26 @@ else(NOT USE_STATIC_LIBEBUR128)
     include(cmake/BuildEbur128.cmake)
 endif(NOT USE_STATIC_EBUR128)
 
+# Samplerate Library
+#   
+if(NOT USE_STATIC_SAMPLERATE) 
+    message(STATUS "Looking for samplerate...")
+    find_library(LIBSAMPLERATE samplerate)
+    find_path(LIBSAMPLERATE_INCLUDE_DIR samplerate.h)
+    message(STATUS "  samplerate library: ${LIBSAMPLERATE}")
+    message(STATUS "  samplerate headers: ${LIBSAMPLERATE_INCLUDE_DIR}")
+    if(LIBSAMPLERATE AND LIBSAMPLERATE_INCLUDE_DIR)
+        list(APPEND FREEDV_LINK_LIBS ${LIBSAMPLERATE})
+        include_directories(${LIBSAMPLERATE_INCLUDE_DIR})
+    else(LIBSTAMPLERATE AND LIBSAMPLERATE_INCLUDE_DIR)
+        message(STATUS "Will attempt static build of samplerate.")
+        include(cmake/BuildSamplerate.cmake)
+    endif(LIBSAMPLERATE AND LIBSAMPLERATE_INCLUDE_DIR)
+else(NOT USE_STATIC_SAMPLERATE)
+    message(STATUS "Will attempt static build of samplerate.")
+    include(cmake/BuildSamplerate.cmake)
+endif(NOT USE_STATIC_SAMPLERATE)
+
 # Enable CTest tests for freedv-gui
 option(BUILD_BACKEND_UNITTESTS "Build unit test binaries." OFF)
 if(BUILD_BACKEND_UNITTESTS)
