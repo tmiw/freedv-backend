@@ -9,13 +9,18 @@ endif (CMAKE_CROSSCOMPILING)
 set(RNNOISE_REPO https://github.com/xiph/rnnoise.git)
 
 include(ExternalProject)
+
+if(APPLE)
+set(RNNOISE_APPLE_MIN_BUILD -mmacosx-version-min=10.11)
+endif(APPLE)
+
 if(APPLE AND BUILD_OSX_UNIVERSAL)
 # RNNoise ./configure doesn't behave properly when built as a universal binary;
 # build it twice and use lipo to create a universal librnnoise.a instead.
 ExternalProject_Add(build_rnnoise_x86
     DOWNLOAD_EXTRACT_TIMESTAMP NO
     BUILD_IN_SOURCE 1
-    CONFIGURE_COMMAND ${CONFIGURE_COMMAND} --enable-x86-rtcd --host=x86_64-apple-darwin --target=x86_64-apple-darwin CFLAGS=-arch\ x86_64\ -O2\ -mmacosx-version-min=10.11
+    CONFIGURE_COMMAND ${CONFIGURE_COMMAND} --enable-x86-rtcd --host=x86_64-apple-darwin --target=x86_64-apple-darwin CFLAGS=-arch\ x86_64\ -O2\ ${RNNOISE_APPLE_MIN_BUILD}
     BUILD_COMMAND $(MAKE)
     INSTALL_COMMAND ""
     GIT_REPOSITORY ${RNNOISE_REPO}
@@ -25,7 +30,7 @@ ExternalProject_Add(build_rnnoise_x86
 ExternalProject_Add(build_rnnoise_arm
     DOWNLOAD_EXTRACT_TIMESTAMP NO
     BUILD_IN_SOURCE 1
-    CONFIGURE_COMMAND ${CONFIGURE_COMMAND} --host=aarch64-apple-darwin --target=aarch64-apple-darwin CFLAGS=-arch\ arm64\ -O2\ -mmacosx-version-min=10.11
+    CONFIGURE_COMMAND ${CONFIGURE_COMMAND} --host=aarch64-apple-darwin --target=aarch64-apple-darwin CFLAGS=-arch\ arm64\ -O2\ ${RNNOISE_APPLE_MIN_BUILD}
     BUILD_COMMAND $(MAKE)
     INSTALL_COMMAND ""
     GIT_REPOSITORY ${RNNOISE_REPO}
@@ -65,6 +70,10 @@ if(${CMAKE_SYSTEM_PROCESSOR} MATCHES "x86")
 message(STATUS "RNNoise: Enabling optimizations if available on user's system")
 set(CONFIGURE_COMMAND ${CONFIGURE_COMMAND} --enable-x86-rtcd)
 endif(${CMAKE_SYSTEM_PROCESSOR} MATCHES "x86")
+
+if(APPLE)
+set(CONFIGURE_COMMAND ${CONFIGURE_COMMAND} CFLAGS=-O2\ ${RNNOISE_APPLE_MIN_BUILD})
+endif(APPLE)
 
 ExternalProject_Add(build_rnnoise
     BUILD_IN_SOURCE 1

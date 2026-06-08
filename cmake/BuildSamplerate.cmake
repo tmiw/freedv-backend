@@ -11,12 +11,8 @@ FetchContent_Declare(
     GIT_TAG        master
 )
 
-FetchContent_GetProperties(samplerate)
-if(NOT samplerate_POPULATED)
-  FetchContent_Populate(samplerate)
-  add_subdirectory(${samplerate_SOURCE_DIR} ${samplerate_BINARY_DIR} EXCLUDE_FROM_ALL)
-  target_compile_options(samplerate PRIVATE -g -O3) # Ensure that samplerate is built with optimizations
-endif()
+FetchContent_MakeAvailable(samplerate)
+target_compile_options(samplerate PRIVATE -g -O3) # Ensure that samplerate is built with optimizations
 
 target_include_directories(samplerate BEFORE PRIVATE ${samplerate_BINARY_DIR})
 include_directories(${samplerate_SOURCE_DIR}/include)
