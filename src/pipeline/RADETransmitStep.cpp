@@ -47,6 +47,15 @@
 
 #include "../os/os_interface.h"
 
+extern "C" 
+{
+    #include "fargan_config.h"
+    #include "../silk/structs.h"
+    #include "osce_features.h"
+    #include "osce_structs.h"
+    #include "osce.h"
+}
+
 using namespace std::chrono_literals;
 
 #define FEATURE_FIFO_SIZE ((RADE_SPEECH_SAMPLE_RATE / LPCNET_FRAME_SIZE) * rade_n_features_in_out(dv_))
