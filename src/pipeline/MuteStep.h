@@ -42,13 +42,14 @@ class MuteStep : public IPipelineStep
 {
 public:
     MuteStep(int outputSampleRate);
+    MuteStep(int inputSampleRate, int outputSampleRate);
     virtual ~MuteStep() = default;
     
     // Returns required input sample rate.
-    virtual int getInputSampleRate() const FREEDV_NONBLOCKING override { return sampleRate_; }
+    virtual int getInputSampleRate() const FREEDV_NONBLOCKING override { return inputSampleRate_; }
 
     // Returns output sample rate after performing the pipeline step.
-    virtual int getOutputSampleRate() const FREEDV_NONBLOCKING override { return sampleRate_; }
+    virtual int getOutputSampleRate() const FREEDV_NONBLOCKING override { return outputSampleRate_; }
     
     // Executes pipeline step.
     // Required parameters:
@@ -59,7 +60,8 @@ public:
     virtual short* execute(short* inputSamples, int numInputSamples, int* numOutputSamples) FREEDV_NONBLOCKING override;
 
 private:
-    int sampleRate_;
+    int inputSampleRate_;
+    int outputSampleRate_;
     std::unique_ptr<short[]> outputSamples_;
 };
 

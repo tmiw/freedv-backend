@@ -38,15 +38,27 @@
 #include "MuteStep.h"
 
 MuteStep::MuteStep(int outputSampleRate)
-    : sampleRate_(outputSampleRate)
+    : inputSampleRate_(outputSampleRate)
+    , outputSampleRate_(outputSampleRate)
 {
     // Pre-allocate buffers so we don't have to do so during real-time operation.
-    outputSamples_ = std::make_unique<short[]>(sampleRate_);
+    outputSamples_ = std::make_unique<short[]>(outputSampleRate_);
     assert(outputSamples_ != nullptr);
 
-    memset(outputSamples_.get(), 0, sizeof(short) * sampleRate_);
+    memset(outputSamples_.get(), 0, sizeof(short) * outputSampleRate_);
 }
-    
+
+MuteStep::MuteStep(int inputSampleRate, int outputSampleRate)
+    : inputSampleRate_(inputSampleRate)
+    , outputSampleRate_(outputSampleRate)
+{
+    // Pre-allocate buffers so we don't have to do so during real-time operation.
+    outputSamples_ = std::make_unique<short[]>(outputSampleRate_);
+    assert(outputSamples_ != nullptr);
+
+    memset(outputSamples_.get(), 0, sizeof(short) * outputSampleRate_);
+}
+
 // Executes pipeline step.
 // Required parameters:
 //     inputSamples: Array of int16 values corresponding to input audio.
@@ -55,7 +67,7 @@ MuteStep::MuteStep(int outputSampleRate)
 // Returns: Array of int16 values corresponding to result audio.
 short* MuteStep::execute(short*, int numInputSamples, int* numOutputSamples) FREEDV_NONBLOCKING
 {
-    *numOutputSamples = numInputSamples;
+    *numOutputSamples = (numInputSamples * outputSampleRate_) / inputSampleRate_;
     
     if (*numOutputSamples > 0)
     {
