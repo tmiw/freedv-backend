@@ -136,7 +136,7 @@ void IPipelineStep::ConvertToIntSampleType_(SrcType* sourceSamples, DstType* des
             }
             else
             {
-                destSamples[index] = static_cast<DstType>(std::lrint(temp));
+                destSamples[index] = static_cast<DstType>(std::trunc(temp));
             }
         }
     }
