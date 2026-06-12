@@ -277,12 +277,24 @@ short* RADEReceiveStep::execute(short* inputSamples, int numInputSamples, int* n
 
     FREEDV_BEGIN_VERIFIED_SAFE
         sync = rade_sync(dv_);
-        snr = rade_snrdB_3k_est(dv_);
     FREEDV_END_VERIFIED_SAFE
 
     syncState_.store(sync, std::memory_order_release);
-    snr_.store(snr, std::memory_order_release);
     
+    // In RADEV1, SNR is only valid when in sync. It cannot be assumed
+    // that the SNR remains valid when not in sync (for instance, we
+    // can't assume it was the last SNR prior to losing sync). Thus,
+    // don't pass it up to higher layers if not previously determined
+    // that we are in sync.
+    if (sync)
+    {
+        FREEDV_BEGIN_VERIFIED_SAFE
+            snr = rade_snrdB_3k_est(dv_);
+        FREEDV_END_VERIFIED_SAFE
+
+        snr_.store(snr, std::memory_order_release);
+    }
+
     syncFn_(this);
 
     return outputSamples_.get();
