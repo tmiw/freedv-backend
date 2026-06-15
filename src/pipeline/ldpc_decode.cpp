@@ -72,7 +72,7 @@ static float phi(float x)
 {
     if (x < 1e-10f) return LLR_MAX;
 
-    auto expx = std::exp(x);
+    auto expx = std::exp((double)x);
     if (expx < 1e-10f) return LLR_MAX;
 
     return std::log((expx + 1.0f) / (expx - 1.0f));
