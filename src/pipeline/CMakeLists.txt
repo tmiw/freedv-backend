@@ -51,6 +51,8 @@ DefineUnitTest(ldpc_encode)
 
 DefineUnitTest(RadeTextTest)
 target_link_libraries(RadeTextTest PRIVATE rade opus samplerate)
+
+DefineUnitTest(RadeTextUnitTest)
 #endif(LINUX)
 
 # ---------------------------------------------------------------------------
