@@ -418,6 +418,216 @@ static bool test8_mild_noise()
 }
 
 // ---------------------------------------------------------------------------
+// Helpers for noise-level tests
+// ---------------------------------------------------------------------------
+
+struct NoiseTrialResult {
+    int correct;    // callback fired and callsign matched
+    int cb_any;     // callback fired (for any reason)
+    int cb_wrong;   // callback fired with the WRONG callsign
+    int trials;
+};
+
+// Run TRIALS encode→noise→decode cycles for one callsign at one sigma.
+// Returns tallied counts.  Uses 40 filler symbols to give the noise
+// estimator inside rade_text_rx a better variance sample.
+static NoiseTrialResult noiseTrials(const char* cs, float sigma,
+                                    int trials, unsigned base_seed = 0)
+{
+    // Larger filler count for better noise estimation at higher sigma.
+    constexpr int FILLER     = 40;
+    constexpr int TX_FLOATS  = PAYLOAD_FLOATS + FILLER * 2;
+    constexpr int RX_SYMBOLS = PAYLOAD_SYMBOLS + FILLER;
+
+    NoiseTrialResult r{};
+    r.trials = trials;
+
+    for (int t = 0; t < trials; t++) {
+        rade_text_t tx = rade_text_create();
+        rade_text_t rx = rade_text_create();
+        rade_text_enable_stats_output(tx, 0);
+        rade_text_enable_stats_output(rx, 0);
+
+        RxState state;
+        rade_text_set_rx_callback(rx, onTextRx, &state);
+
+        float syms[TX_FLOATS];
+        memset(syms, 0, sizeof(syms));
+        rade_text_generate_tx_string(tx, cs, (int)strlen(cs), syms, TX_FLOATS);
+
+        std::mt19937 rng(base_seed + (unsigned)t * 131071u + 3u);
+        addNoiseToSyms(syms, TX_FLOATS, sigma, rng);
+
+        rade_text_rx(rx, syms, RX_SYMBOLS);
+
+        if (state.callCount > 0) {
+            r.cb_any++;
+            if (state.received == cs) r.correct++;
+            else                       r.cb_wrong++;
+        }
+
+        rade_text_destroy(tx);
+        rade_text_destroy(rx);
+    }
+    return r;
+}
+
+// ---------------------------------------------------------------------------
+// Test 9: sigma=0.2 (~14 dB SNR) – robust above the floor
+// ---------------------------------------------------------------------------
+static bool test9_sigma02_robust()
+{
+    printf("=== Test 9: sigma=0.2 (~14 dB) – should decode reliably ===\n");
+
+    const char* callsigns[] = {"K6AQ", "W1AW", "VK2TGP", "AA0ZZ"};
+    bool ok = true;
+
+    for (const char* cs : callsigns) {
+        auto r = noiseTrials(cs, 0.2f, 20, 1000u);
+        bool passed = (r.correct >= 19) && (r.cb_wrong == 0);
+        printf("  %-10s  %2d/%d correct  %d wrong  %s\n",
+               cs, r.correct, r.trials, r.cb_wrong, passed ? "PASS" : "FAIL");
+        ok &= passed;
+    }
+    printf("sigma=0.2 robust: %s\n\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Test 10: sigma=0.3 (~10 dB SNR) – near the reliable operational limit
+// ---------------------------------------------------------------------------
+static bool test10_sigma03_reliable()
+{
+    printf("=== Test 10: sigma=0.3 (~10 dB) – should still succeed most of the time ===\n");
+
+    const char* callsigns[] = {"K6AQ", "W1AW", "VK2TGP", "N0CALL"};
+    bool ok = true;
+
+    for (const char* cs : callsigns) {
+        auto r = noiseTrials(cs, 0.3f, 30, 2000u);
+        // Require ≥90% success and zero wrong-callsign deliveries.
+        bool passed = (r.correct >= 27) && (r.cb_wrong == 0);
+        printf("  %-10s  %2d/%d correct  %d wrong  %s\n",
+               cs, r.correct, r.trials, r.cb_wrong, passed ? "PASS" : "FAIL");
+        ok &= passed;
+    }
+    printf("sigma=0.3 reliable: %s\n\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Test 11: sigma=0.5 (~6 dB SNR) – performance cliff; require ≥75% success
+// ---------------------------------------------------------------------------
+static bool test11_sigma05_cliff()
+{
+    printf("=== Test 11: sigma=0.5 (~6 dB) – performance cliff, >=75%% expected ===\n");
+
+    const char* callsigns[] = {"K6AQ", "W1AW", "VK2TGP"};
+    bool ok = true;
+
+    for (const char* cs : callsigns) {
+        auto r = noiseTrials(cs, 0.5f, 40, 3000u);
+        // Require ≥75% success and zero wrong-callsign deliveries.
+        bool passed = (r.correct >= 30) && (r.cb_wrong == 0);
+        printf("  %-10s  %2d/%d correct  %d wrong  %s\n",
+               cs, r.correct, r.trials, r.cb_wrong, passed ? "PASS" : "FAIL");
+        ok &= passed;
+    }
+    printf("sigma=0.5 cliff: %s\n\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Test 12: sigma=0.7 – marginal noise; callback must never deliver wrong callsign
+//
+// At this level the LDPC decoder mostly fails to converge (known limitation of
+// the current phi() implementation at high SNR causing BP messages to collapse).
+// Success rate may be low; what we guarantee is the CRC layer prevents any
+// incorrectly decoded callsign from reaching the application.
+// ---------------------------------------------------------------------------
+static bool test12_sigma07_no_false_positive()
+{
+    printf("=== Test 12: sigma=0.7 – no false-positive callsigns at marginal noise ===\n");
+
+    // Test with several callsigns to cover a range of bit patterns.
+    const char* callsigns[] = {"K6AQ", "W1AW", "VK2TGP", "N0CALL", "KA1BCD", "W4XYZ567"};
+    int total_wrong = 0;
+    int total_cb    = 0;
+    int total_pass  = 0;
+
+    for (const char* cs : callsigns) {
+        auto r = noiseTrials(cs, 0.7f, 30, 4000u);
+        total_wrong += r.cb_wrong;
+        total_cb    += r.cb_any;
+        total_pass  += r.correct;
+        printf("  %-10s  %2d/%d correct  %d/%d cb  %d wrong\n",
+               cs, r.correct, r.trials, r.cb_any, r.trials, r.cb_wrong);
+    }
+
+    bool ok = (total_wrong == 0);
+    printf("Total correct=%d  cb_any=%d  cb_wrong=%d\n",
+           total_pass, total_cb, total_wrong);
+    printf("No-false-positive at sigma=0.7: %s\n\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Test 13: sigma=1.0, 1.5, 2.0 – beyond operational limit
+//
+// At these noise levels the raw bit-error rate overwhelms the LDPC code and
+// decode almost always fails.  The essential invariant is that the CRC layer
+// never lets a spurious wrong-callsign delivery reach the application.
+// ---------------------------------------------------------------------------
+static bool test13_high_noise_no_false_positive()
+{
+    printf("=== Test 13: sigma=1.0/1.5/2.0 – beyond limit, never wrong callsign ===\n");
+
+    struct { float sigma; const char* label; } levels[] = {
+        {1.0f, "1.0 (~0 dB)"},
+        {1.5f, "1.5 (~-3 dB)"},
+        {2.0f, "2.0 (~-6 dB)"},
+    };
+    const char* callsigns[] = {"K6AQ", "W1AW", "VK2TGP", "AA0ZZ", "N0CALL"};
+
+    bool ok = true;
+    for (auto& lv : levels) {
+        int wrong = 0, cb = 0, pass = 0;
+        for (const char* cs : callsigns) {
+            auto r = noiseTrials(cs, lv.sigma, 20, 5000u);
+            wrong += r.cb_wrong;
+            cb    += r.cb_any;
+            pass  += r.correct;
+        }
+        bool level_ok = (wrong == 0);
+        printf("  sigma=%-12s  correct=%d  cb_any=%d  cb_wrong=%d  %s\n",
+               lv.label, pass, cb, wrong, level_ok ? "PASS" : "FAIL");
+        ok &= level_ok;
+    }
+    printf("High-noise no-false-positive: %s\n\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Test 14: Noise sweep diagnostic (informational – not in pass/fail)
+//
+// Prints a concise sigma vs. success-rate table so regressions in the
+// performance curve are visible in CI output even without a hard threshold.
+// ---------------------------------------------------------------------------
+static void test14_noise_sweep_diagnostic()
+{
+    printf("=== Test 14: noise sweep diagnostic (INFORMATIONAL) ===\n");
+    printf("  %-8s  %-12s  %s\n", "sigma", "correct/total", "cb_wrong");
+
+    const char* cs = "K6AQ";
+    for (float sigma : {0.1f, 0.2f, 0.3f, 0.5f, 0.7f, 1.0f, 1.5f, 2.0f}) {
+        auto r = noiseTrials(cs, sigma, 50, 9000u);
+        printf("  %-8.1f  %2d/%-10d  %d\n",
+               sigma, r.correct, r.trials, r.cb_wrong);
+    }
+    printf("\n");
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 int main()
@@ -432,6 +642,12 @@ int main()
     success &= test6_filler_symbols_no_crash();
     success &= test7_character_encoding_coverage();
     success &= test8_mild_noise();
+    success &= test9_sigma02_robust();
+    success &= test10_sigma03_reliable();
+    success &= test11_sigma05_cliff();
+    success &= test12_sigma07_no_false_positive();
+    success &= test13_high_noise_no_false_positive();
+    test14_noise_sweep_diagnostic();   // informational, not in success
 
     printf("=== Overall: %s ===\n", success ? "PASS" : "FAIL");
     return success ? 0 : 1;
