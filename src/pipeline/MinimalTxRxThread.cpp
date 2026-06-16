@@ -325,8 +325,8 @@ void MinimalTxRxThread::txProcessing_(IRealtimeHelper* helper) noexcept
                 {
                     if (!g_eoo_enqueued.load(std::memory_order_acquire))
                     {
-                        // Add 40ms of additional silence as Flex will otherwise cut off EOO.
-                        cbData_->outfifo1->write(inputSamplesZeros_.get(), 40 * outputSampleRate_ / 1000);
+                        // Add 120ms of additional silence as Flex will otherwise cut off EOO.
+                        cbData_->outfifo1->write(inputSamplesZeros_.get(), 120 * outputSampleRate_ / 1000);
                     }
                     g_eoo_enqueued.store(true, std::memory_order_release);
                 }
