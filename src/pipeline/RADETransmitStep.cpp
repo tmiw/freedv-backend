@@ -225,7 +225,6 @@ short* RADETransmitStep::execute(short* inputSamples, int numInputSamples, int* 
 void RADETransmitStep::restartVocoder() FREEDV_NONBLOCKING
 {
     // Queues up EOO for return on the next call to this pipeline step.
-    const int NUM_SAMPLES_SILENCE = 60 * getOutputSampleRate() / 1000;
     FREEDV_BEGIN_VERIFIED_SAFE
     int numEOOSamples = rade_n_tx_eoo_out(dv_);
     FREEDV_END_VERIFIED_SAFE
