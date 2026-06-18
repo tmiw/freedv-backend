@@ -61,6 +61,7 @@ using namespace std::chrono_literals;
 #define FEATURE_FIFO_SIZE ((RADE_SPEECH_SAMPLE_RATE / LPCNET_FRAME_SIZE) * rade_n_features_in_out(dv_))
 
 const int RADE_SCALING_FACTOR = 16383;
+const int NUM_SAMPLES_SILENCE = 180 * RADE_MODEM_SAMPLE_RATE / 1000;
 
 #if !defined(DISABLE_UNIT_TEST)
 #include <string>
@@ -101,7 +102,6 @@ RADETransmitStep::RADETransmitStep(struct rade* dv, LPCNetEncState* encState)
     radeOutShort_ = new short[numOutputSamples];
     assert(radeOutShort_ != nullptr);
 
-    const int NUM_SAMPLES_SILENCE = 60 * RADE_MODEM_SAMPLE_RATE / 1000;
     int numEOOSamples = rade_n_tx_eoo_out(dv_);
 
     eooOut_ = new RADE_COMP[numEOOSamples];
