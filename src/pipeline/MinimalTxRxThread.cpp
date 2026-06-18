@@ -58,8 +58,7 @@ static const float TxScaleFactor_ = 2.0;
 
 int MinimalTxRxThread::getTxNNomModemSamples() const
 {
-    const int NUM_SAMPLES_SILENCE = 60 * RADE_MODEM_SAMPLE_RATE / 1000;
-    return std::max(rade_n_tx_out(rade_), rade_n_tx_eoo_out(rade_) + NUM_SAMPLES_SILENCE);
+    return std::max(rade_n_tx_out(rade_), txStep_->eooLengthInSamples());
 }
 
 int MinimalTxRxThread::getRxNumSpeechSamples() const

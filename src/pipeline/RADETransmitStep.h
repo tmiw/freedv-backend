@@ -74,7 +74,11 @@ public:
     
     // For triggering EOO
     void restartVocoder() FREEDV_NONBLOCKING;
-    
+
+    // Returns the length of the EOO, including all silence added at the end. This 
+    // is in terms of number of samples at RADE_MODEM_SAMPLE_RATE (8000 Hz).
+    int eooLengthInSamples() const FREEDV_NONBLOCKING;
+
 private:
     struct rade* dv_;
     LPCNetEncState* encState_;
