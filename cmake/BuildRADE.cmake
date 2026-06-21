@@ -9,7 +9,7 @@ ExternalProject_Add(build_rade
    SOURCE_DIR rade_src
    BINARY_DIR rade_build
    GIT_REPOSITORY https://github.com/peterbmarks/radae_nopy/
-   GIT_TAG main
+   GIT_TAG ms-rade-snr-debug
    GIT_SUBMODULES ""
    GIT_SUBMODULES_RECURSE NO
    CMAKE_ARGS ${RADE_CMAKE_ARGS}
