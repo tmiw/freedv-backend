@@ -59,6 +59,7 @@ private:
     std::atomic<int> numQueued_; // dispatch groups don't fully seem to wait
 #else
     std::atomic<bool> isDestroying_;
+    std::atomic<bool> taskCurrentlyExecuting_;
     std::thread objectThread_;
     std::deque<std::function<void()> > eventQueue_;
     std::recursive_mutex eventQueueMutex_;

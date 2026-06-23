@@ -31,6 +31,7 @@ ThreadedObject::ThreadedObject(std::string name, ThreadedObject* parent)
     , name_(std::move(name))
     , suppressEnqueue_(false)
     , isDestroying_(false)
+    , taskCurrentlyExecuting_(false)
 {
     // Instantiate thread here rather than the initializer since otherwise
     // we might not be able to guarantee that the mutex is initialized first.
@@ -148,7 +149,9 @@ void ThreadedObject::eventLoop_()
         
             if (!isDestroying_.load(std::memory_order_acquire) && fn)
             {
+                taskCurrentlyExecuting_.store(true, std::memory_order_release);
                 fn();
+                taskCurrentlyExecuting_.store(false, std::memory_order_release);
             }
 
             count--;
@@ -165,7 +168,7 @@ void ThreadedObject::waitForAllTasksComplete_()
 
     constexpr int MAX_TIMEOUT_COUNT = 250; // should be ~250ms
     int timeoutCount = 0;
-    while (count > 0 && timeoutCount < MAX_TIMEOUT_COUNT)
+    while ((count > 0 || taskCurrentlyExecuting_.load(std::memory_order_acquire)) && timeoutCount < MAX_TIMEOUT_COUNT)
     {
         std::this_thread::sleep_for(1ms);
         lk.lock();
