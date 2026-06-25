@@ -110,8 +110,6 @@ short* ResampleStep::execute(short* inputSamples, int numInputSamples, int* numO
         src_short_to_float_array(inputPtr, tempInput_, inputSize);
         FREEDV_END_VERIFIED_SAFE
 
-        //ConvertToFloatSampleType_<float, short>(inputPtr, tempInput_, inputSize);
-
         src_data.data_in = tempInput_;
         src_data.data_out = tempOutput_;
         src_data.input_frames = inputSize;
@@ -128,13 +126,11 @@ short* ResampleStep::execute(short* inputSamples, int numInputSamples, int* numO
         assert(src_data.output_frames_gen <= outputSize);
         FREEDV_END_VERIFIED_SAFE
 
-        //ConvertToIntSampleType_<short, float>(tempOutput_, outputPtr, src_data.output_frames_gen);
         // libsamplerate is unlikely to use RT-unsafe constructs in normal use
         // (verified with RTsan-enabled automated testing). Verified on 2025-09-30.
         FREEDV_BEGIN_VERIFIED_SAFE
         src_float_to_short_array(tempOutput_, outputPtr, src_data.output_frames_gen);
         FREEDV_END_VERIFIED_SAFE
-
 
         outputPtr += src_data.output_frames_gen;
         inputPtr += inputSize;

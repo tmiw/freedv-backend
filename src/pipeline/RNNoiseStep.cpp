@@ -90,7 +90,10 @@ short* RNNoiseStep::execute(short* inputSamples, int numInputSamples, int* numOu
             inputSampleFifo_.read(tmpOutput, RNNOISE_FRAME_SIZE);
 
             float tmpFloat[RNNOISE_FRAME_SIZE];
-            ConvertToFloatSampleType_<float, short, 1>(tmpOutput, tmpFloat, RNNOISE_FRAME_SIZE);
+            for (int index = 0; index < RNNOISE_FRAME_SIZE; index++)
+            {
+                tmpFloat[index] = (float)tmpOutput[index];
+            }
 
             // Note: RNNoise is unlikely to use RT-unsafe constructs in normal operation
             // (per existing RTSan-enabled tests). Verified on 2025-09-30.
@@ -100,8 +103,10 @@ short* RNNoiseStep::execute(short* inputSamples, int numInputSamples, int* numOu
 
             if (!firstFrame_)
             {
-                ConvertToIntSampleType_<short, float, 1>(tmpFloat, tmpOutput, RNNOISE_FRAME_SIZE);
-                tmpOutput += RNNOISE_FRAME_SIZE;
+                for (int index = 0; index < RNNOISE_FRAME_SIZE; index++)
+                {
+                    *tmpOutput++ = tmpFloat[index];
+                }
             }
             firstFrame_ = false;
         }
