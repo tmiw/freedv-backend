@@ -343,7 +343,7 @@ void FreeDVReporter::connect_()
     
     std::string host;
     std::string portStr;
-    int port = 80;
+    int port = 443;
     std::getline(ss, host, ':');
     std::getline(ss, portStr, ':');
     if (portStr != "")
