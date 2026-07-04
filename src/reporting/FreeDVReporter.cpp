@@ -43,7 +43,7 @@
 using namespace std::chrono_literals;
 using namespace std::placeholders;
 
-FreeDVReporter::FreeDVReporter(std::string hostname, std::string callsign, std::string gridSquare, std::string software, bool rxOnly, bool writeOnly)
+FreeDVReporter::FreeDVReporter(std::string hostname, std::string callsign, std::string gridSquare, std::string software, bool rxOnly, bool writeOnly, bool useSecureConnection)
     : isConnecting_(false)
     , hostname_(std::move(hostname))
     , callsign_(std::move(callsign))
@@ -54,6 +54,7 @@ FreeDVReporter::FreeDVReporter(std::string hostname, std::string callsign, std::
     , rxOnly_(rxOnly)
     , hidden_(false)
     , writeOnly_(writeOnly)
+    , useSecureConnection_(useSecureConnection)
 {
     if (hostname_ == "")
     {
@@ -343,7 +344,7 @@ void FreeDVReporter::connect_()
     
     std::string host;
     std::string portStr;
-    int port = 443;
+    int port = useSecureConnection_ ? 443 : 80;
     std::getline(ss, host, ':');
     std::getline(ss, portStr, ':');
     if (portStr != "")
@@ -351,7 +352,7 @@ void FreeDVReporter::connect_()
         port = atoi(portStr.c_str());
     }
     sioClient_->setAuthDictionary(authDoc); // frees authDoc
-    sioClient_->connect(host.c_str(), port, true, true);
+    sioClient_->connect(host.c_str(), port, true, useSecureConnection_);
     
     if (onReporterConnectFn_)
     {
