@@ -62,13 +62,13 @@ using namespace std::chrono_literals;
 #if defined(ENABLE_TLS_SUPPORT)
 static std::string GetSSLError_()
 {
-    std::string ret = ERR_error_string(ERR_get_error(), NULL);
-    /*BIO *bio = BIO_new(BIO_s_mem());
+    //std::string ret = ERR_error_string(ERR_get_error(), NULL);
+    BIO *bio = BIO_new(BIO_s_mem());
     ERR_print_errors(bio);
     char *buf;
     size_t len = BIO_get_mem_data(bio, &buf);
     std::string ret(buf, len);
-    BIO_free(bio);*/
+    BIO_free(bio);
     return ret;
 }
 #endif // defined(ENABLE_TLS_SUPPORT)
@@ -481,11 +481,18 @@ next_fd:
             else
             {
                 // Set up certificate validation
-                SSL_CTX_set_verify(sslCtx_, SSL_VERIFY_NONE, nullptr);
-                if (SSL_CTX_set_default_verify_paths(sslCtx_) == 0)
+                SSL_CTX_set_verify(sslCtx_, SSL_VERIFY_PEER, nullptr);
+                if (!SSL_CTX_set_default_verify_paths(sslCtx_))
                 {
                     auto errStr = GetSSLError_();
                     log_warn("Unable to set TLS certificate validation paths: %s", errStr.c_str());
+                }
+
+                // Force >= TLS 1.2
+                if (!SSL_CTX_set_min_proto_version(sslCtx_, TLS1_2_VERSION)) 
+                {
+                    auto errStr = GetSSLError_();
+                    log_warn("Unable to mandate minimum TLS version: %s", errStr.c_str());
                 }
 
                 ssl_ = SSL_new(sslCtx_);
@@ -502,6 +509,11 @@ next_fd:
                 {
                     // Set hostname for SSL negotiation
                     SSL_set_tlsext_host_name(ssl_, host_.c_str());
+                    if (!SSL_set1_host(ssl_, host_.c_str())) 
+                    {
+                        auto errStr = GetSSLError_();
+                        log_warn("Unable to assign hostname for certificate validation: %s", errStr.c_str());
+                    }
 
                     // Attempt SSL negotiation
                     int sslRet = 0;
@@ -523,6 +535,11 @@ next_fd:
                         }
                         else
                         {
+                            if (SSL_get_verify_result(ssl_) != X509_V_OK)
+                            {
+                                log_error("Certificate validation error: %s", X509_verify_cert_error_string(SSL_get_verify_result(ssl_)));
+                            }
+
                             auto errStr = GetSSLError_();
                             log_error("Unable to negotiate TLS connection: %s", errStr.c_str());
                             disconnectImpl_(false);
