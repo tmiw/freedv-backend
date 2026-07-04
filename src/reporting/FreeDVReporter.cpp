@@ -351,7 +351,7 @@ void FreeDVReporter::connect_()
         port = atoi(portStr.c_str());
     }
     sioClient_->setAuthDictionary(authDoc); // frees authDoc
-    sioClient_->connect(host.c_str(), port, true);
+    sioClient_->connect(host.c_str(), port, true, true);
     
     if (onReporterConnectFn_)
     {
