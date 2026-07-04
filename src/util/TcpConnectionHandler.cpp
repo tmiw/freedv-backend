@@ -97,11 +97,12 @@ TcpConnectionHandler::~TcpConnectionHandler()
 #endif // defined(WIN32)
 }
 
-std::future<void> TcpConnectionHandler::connect(const char* host, int port, bool enableReconnect)
+std::future<void> TcpConnectionHandler::connect(const char* host, int port, bool enableReconnect, bool enableTLS)
 {
     cancelConnect_ = false;
     host_ = host;
     port_ = port;
+    usingTLS_ = enableTLS;
     enableReconnect_.store(enableReconnect, std::memory_order_release);
     
     std::shared_ptr<std::promise<void>> prom = std::make_shared<std::promise<void> >();
@@ -448,33 +449,86 @@ next_fd:
     
     if (socket_.load(std::memory_order_acquire) != INVALID_SOCKET)
     {
-        // Call connect handler (defined by child class).
-        char buf[256];
-        struct sockaddr_storage addr;
-        socklen_t len = sizeof(addr);
-        if (getpeername(socket_.load(std::memory_order_acquire), (struct sockaddr*)&addr, &len) != 0)
+        bool connSucceeded = true;
+#if defined(ENABLE_TLS_SUPPORT)
+        // We have a valid socket. If the user wants to connect via TLS, attempt TLS negotiation now.
+        // If we can't negotiate TLS for whatever reason, close socket and try again in a bit.
+        if (usingTLS_)
         {
-#if defined(WIN32)
-            int err = WSAGetLastError();
-#else
-            int err = errno;
-#endif // defined(WIN32)
-            log_warn("could not get IP address of socket (err=%d)", err);
-        }
-        int nameErr = 0;
-        if ((nameErr = getnameinfo((struct sockaddr*)&addr, len, buf, sizeof(buf), nullptr, 0, NI_NUMERICHOST)) != 0)
-        {
-#if defined(WIN32)
-            nameErr = WSAGetLastError();
-#endif // defined(WIN32)
-            log_warn("could not get string representation of IP address (err=%d)", nameErr);
-        }
+            const SSL_METHOD* method = TLS_client_method();
+            sslCtx_ = SSL_CTX_new(method);
+            if (sslCtx_ == nullptr)
+            {
+                log_error("Unable to create SSL context");
+                disconnectImpl_(false);
+                connSucceeded = false;
+            }
+            else
+            {
+                // Set up certificate validation
+                SSL_CTX_set_verify(sslCtx_, SSL_VERIFY_PEER, nullptr);
+                SSL_CTX_set_default_verify_paths(sslCtx_);
 
-        log_info("connection succeeded to %s", buf);
-        enqueue_(std::bind(&TcpConnectionHandler::onConnect_, this));
+                ssl_ = SSL_new(sslCtx_);
+                assert(ssl_ != nullptr);
+
+                if (!SSL_set_fd(ssl_, (int)socket_.load(std::memory_order_acquire)))
+                {
+                    log_error("Unable to assign socket to SSL context");
+                    disconnectImpl_(false);
+                    connSucceeded = false;
+                }
+                else
+                {
+                    // Set hostname for SSL negotiation
+                    SSL_set_tlsext_host_name(ssl_, host_.c_str());
+
+                    // Attempt SSL negotiation
+                    if (SSL_connect(ssl_) == 1)
+                    {
+                        
+                    }
+                    else
+                    {
+                        log_error("Unable to negotiate TLS connection");
+                        disconnectImpl_(false);
+                        connSucceeded = false;
+                    }
+                }
+            }
+        }
+#endif // defined(ENABLE_TLS_SUPPORT)
+
+        // Call connect handler (defined by child class).
+        if (connSucceeded)
+        {
+            char buf[256];
+            struct sockaddr_storage addr;
+            socklen_t len = sizeof(addr);
+            if (getpeername(socket_.load(std::memory_order_acquire), (struct sockaddr*)&addr, &len) != 0)
+            {
+#if defined(WIN32)
+                int err = WSAGetLastError();
+#else
+                int err = errno;
+#endif // defined(WIN32)
+                log_warn("could not get IP address of socket (err=%d)", err);
+            }
+            int nameErr = 0;
+            if ((nameErr = getnameinfo((struct sockaddr*)&addr, len, buf, sizeof(buf), nullptr, 0, NI_NUMERICHOST)) != 0)
+            {
+#if defined(WIN32)
+                nameErr = WSAGetLastError();
+#endif // defined(WIN32)
+                log_warn("could not get string representation of IP address (err=%d)", nameErr);
+            }
+
+            log_info("connection succeeded to %s", buf);
+            enqueue_(std::bind(&TcpConnectionHandler::onConnect_, this));
         
-        // Start receive thread
-        receiveThread_ = std::thread(std::bind(&TcpConnectionHandler::receiveImpl_, this));
+            // Start receive thread
+            receiveThread_ = std::thread(std::bind(&TcpConnectionHandler::receiveImpl_, this));
+        }
     }
     else if (enableReconnect_.load(std::memory_order_acquire))
     {
@@ -509,12 +563,26 @@ next_fd:
     }
 }
 
-void TcpConnectionHandler::disconnectImpl_()
+void TcpConnectionHandler::disconnectImpl_(bool callHandler)
 {
     auto tmp = socket_.load(std::memory_order_acquire);
     if (tmp != INVALID_SOCKET)
     {
         socket_.store(INVALID_SOCKET, std::memory_order_release);
+
+#if defined(ENABLE_TLS_SUPPORT)
+        if (ssl_ != nullptr) 
+        {
+            SSL_shutdown(ssl_);
+            SSL_free(ssl_);
+            ssl_ = nullptr;
+        }
+        if (sslCtx_ != nullptr)
+        {
+            SSL_CTX_free(sslCtx_);
+            sslCtx_ = nullptr;
+        }
+#endif // defined(ENABLE_TLS_SUPPORT)
 
 #if defined(WIN32)
         closesocket(tmp);
@@ -527,8 +595,11 @@ void TcpConnectionHandler::disconnectImpl_()
             receiveThread_.join();
         }
 
-        onDisconnect_();
-        
+        if (callHandler)
+        {
+            onDisconnect_();
+        }
+
         if (enableReconnect_.load(std::memory_order_acquire))
         {
             reconnectTimer_.start();
@@ -552,11 +623,21 @@ void TcpConnectionHandler::sendImpl_(const char* buf, int length)
             int rv = select(socket_.load(std::memory_order_acquire) + 1, nullptr, &writeSet, nullptr, nullptr);
             if (rv > 0)
             {
+                int numWritten = 0;
+#if defined(ENABLE_TLS_SUPPORT)
+                if (usingTLS_)
+                {
+                    numWritten = SSL_write(ssl_, buf, length);
+                }
+                else
+#endif // defined(ENABLE_TLS_SUPPORT)
+                {
 #if defined(WIN32)
-                int numWritten = ::send(socket_.load(std::memory_order_acquire), buf, length, 0);
+                    numWritten = ::send(socket_.load(std::memory_order_acquire), buf, length, 0);
 #else
-                int numWritten = write(socket_.load(std::memory_order_acquire), buf, length);
+                    numWritten = write(socket_.load(std::memory_order_acquire), buf, length);
 #endif // defined(WIN32)
+                }
                 if (numWritten > 0)
                 {
                     buf += numWritten;
@@ -618,12 +699,28 @@ void TcpConnectionHandler::receiveImpl_()
         {
             int numRead = 0;
             int numHaveRead = 0;
-#if defined(WIN32)
-            while ((numRead = recv(socket_.load(std::memory_order_acquire), buf, READ_SIZE_BYTES, 0)) > 0)
-#else
-            while ((numRead = read(socket_.load(std::memory_order_acquire), buf, READ_SIZE_BYTES)) > 0)
-#endif // defined(WIN32)
+            while(true)
             {
+#if defined(ENABLE_TLS_SUPPORT)
+                if (usingTLS_)
+                {
+                    numRead = SSL_read(ssl_, buf, READ_SIZE_BYTES);
+                }
+                else
+#endif // defined(ENABLE_TLS_SUPPORT)
+                {
+#if defined(WIN32)
+                    numRead = recv(socket_.load(std::memory_order_acquire), buf, READ_SIZE_BYTES, 0);
+#else
+                    numRead = read(socket_.load(std::memory_order_acquire), buf, READ_SIZE_BYTES);
+#endif // defined(WIN32)
+                }
+
+                if (numRead <= 0)
+                {
+                    break;
+                }
+
                 // Queue RX handler
                 numHaveRead += numRead;
                 receiveBuffer_.write(buf, numRead);
