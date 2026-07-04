@@ -34,6 +34,10 @@ if(NOT DISABLE_TLS_SUPPORT)
     else (LIBRESSL_FOUND)
         target_link_libraries(fdv_util tls)
     endif (LIBRESSL_FOUND)
+
+    if(WIN32)
+        target_link_libraries(fdv_util crypt32 cryptui)
+    endif(WIN32)
 endif(NOT DISABLE_TLS_SUPPORT)
 
 target_include_directories(fdv_util PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

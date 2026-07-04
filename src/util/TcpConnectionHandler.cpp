@@ -29,6 +29,8 @@
 #include <algorithm>
 #include <sstream>
 
+#include "TcpConnectionHandler.h"
+
 #if defined(WIN32) || defined(__MINGW32__)
 
 #ifndef _WIN32_WINNT
@@ -38,6 +40,8 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <ws2def.h>
+#include <wincrypt.h>
+#include <cryptuiapi.h>
 #else
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -45,7 +49,6 @@
 #include <fcntl.h>
 #endif // defined(WIN32) || defined(__MINGW32__)
 
-#include "TcpConnectionHandler.h"
 #include "logging/ulog.h"
 #include "../os/os_interface.h"
 
@@ -482,11 +485,54 @@ next_fd:
             {
                 // Set up certificate validation
                 SSL_CTX_set_verify(sslCtx_, SSL_VERIFY_PEER, nullptr);
+
+                // Set up root certificate locations. Note that on Windows,
+                // we use the Windows certificate store, so we need to manually
+                // import those root certificates.
+#if defined(WIN32)
+                {
+                    HCERTSTORE hStore;
+                    PCCERT_CONTEXT pContext = nullptr;
+                    X509 *x509 = nullptr;
+                    X509_STORE *store = SSL_CTX_get_cert_store(sslCtx_);
+                    
+                    if (store == nullptr)
+                    {
+                        store = X509_STORE_new();
+                        SSL_CTX_set_cert_store(sslCtx_, store);
+                    }
+
+                    hStore = CertOpenSystemStoreW(NULL, L"ROOT");
+                    if (!hStore)
+                    {
+                        log_warn("Could not open Windows certificate store");
+                    }
+                    else
+                    {
+                        while ((pContext = CertEnumCertificatesInStore(hStore, pContext)) != nullptr)
+                        {
+                            const unsigned char *encoded_cert = pContext->pbCertEncoded;
+                            x509 = d2i_X509(NULL, &encoded_cert, pContext->cbCertEncoded);
+                            if (x509)
+                            {
+                                if (X509_STORE_add_cert(store, x509) != 1)
+                                {
+                                   auto errStr = GetSSLError_();
+                                   log_warn("Could not add certificate to internal store: %s", errStr.c_str());
+                                }
+                                X509_free(x509);
+                            }
+                        }
+                        CertCloseStore(hStore, 0);
+                    }
+                }
+#else
                 if (!SSL_CTX_set_default_verify_paths(sslCtx_))
                 {
                     auto errStr = GetSSLError_();
                     log_warn("Unable to set TLS certificate validation paths: %s", errStr.c_str());
                 }
+#endif // defined(WIN32)
 
                 // Force >= TLS 1.2
                 if (!SSL_CTX_set_min_proto_version(sslCtx_, TLS1_2_VERSION)) 
