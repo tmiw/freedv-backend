@@ -59,6 +59,20 @@ using namespace std::chrono_literals;
 #define INVALID_SOCKET (-1)
 #endif // INVALID_SOCKET
 
+#if defined(ENABLE_TLS_SUPPORT)
+static std::string GetSSLError_()
+{
+    std::string ret = ERR_error_string(ERR_get_error(), NULL);
+    /*BIO *bio = BIO_new(BIO_s_mem());
+    ERR_print_errors(bio);
+    char *buf;
+    size_t len = BIO_get_mem_data(bio, &buf);
+    std::string ret(buf, len);
+    BIO_free(bio);*/
+    return ret;
+}
+#endif // defined(ENABLE_TLS_SUPPORT)
+
 TcpConnectionHandler::TcpConnectionHandler()
     : ThreadedObject("TcpConn")
     , enableReconnect_(false)
@@ -459,22 +473,28 @@ next_fd:
             sslCtx_ = SSL_CTX_new(method);
             if (sslCtx_ == nullptr)
             {
-                log_error("Unable to create SSL context");
+                auto errStr = GetSSLError_();
+                log_error("Unable to create SSL context: %s", errStr.c_str());
                 disconnectImpl_(false);
                 connSucceeded = false;
             }
             else
             {
                 // Set up certificate validation
-                SSL_CTX_set_verify(sslCtx_, SSL_VERIFY_PEER, nullptr);
-                SSL_CTX_set_default_verify_paths(sslCtx_);
+                SSL_CTX_set_verify(sslCtx_, SSL_VERIFY_NONE, nullptr);
+                if (SSL_CTX_set_default_verify_paths(sslCtx_) == 0)
+                {
+                    auto errStr = GetSSLError_();
+                    log_warn("Unable to set TLS certificate validation paths: %s", errStr.c_str());
+                }
 
                 ssl_ = SSL_new(sslCtx_);
                 assert(ssl_ != nullptr);
 
                 if (!SSL_set_fd(ssl_, (int)socket_.load(std::memory_order_acquire)))
                 {
-                    log_error("Unable to assign socket to SSL context");
+                    auto errStr = GetSSLError_();
+                    log_error("Unable to assign socket to SSL context: %s", errStr.c_str());
                     disconnectImpl_(false);
                     connSucceeded = false;
                 }
@@ -484,15 +504,31 @@ next_fd:
                     SSL_set_tlsext_host_name(ssl_, host_.c_str());
 
                     // Attempt SSL negotiation
-                    if (SSL_connect(ssl_) == 1)
+                    int sslRet = 0;
+                    while ((sslRet = SSL_connect(ssl_)) != 1)
                     {
-                        
-                    }
-                    else
-                    {
-                        log_error("Unable to negotiate TLS connection");
-                        disconnectImpl_(false);
-                        connSucceeded = false;
+                        fd_set writeSet;
+                        fd_set readSet;
+                        FD_ZERO(&writeSet);
+                        FD_ZERO(&readSet);
+                        auto sslErr = SSL_get_error(ssl_, sslRet);
+                        if (sslErr == SSL_ERROR_WANT_READ || sslErr == SSL_ERROR_WANT_WRITE)
+                        {
+                            // Block until we're able to continue.
+                            auto rawSock = socket_.load(std::memory_order_acquire);
+                            if (sslErr == SSL_ERROR_WANT_READ) FD_SET(rawSock, &readSet);
+                            else FD_SET(rawSock, &writeSet);
+
+                            select(socket_.load(std::memory_order_acquire) + 1, &readSet, &writeSet, nullptr, nullptr);
+                        }
+                        else
+                        {
+                            auto errStr = GetSSLError_();
+                            log_error("Unable to negotiate TLS connection: %s", errStr.c_str());
+                            disconnectImpl_(false);
+                            connSucceeded = false;
+                            break;
+                        }
                     }
                 }
             }
@@ -627,7 +663,29 @@ void TcpConnectionHandler::sendImpl_(const char* buf, int length)
 #if defined(ENABLE_TLS_SUPPORT)
                 if (usingTLS_)
                 {
-                    numWritten = SSL_write(ssl_, buf, length);
+                    while ((numWritten = SSL_write(ssl_, buf, length)) < 0)
+                    {
+                        fd_set writeSet;
+                        fd_set readSet;
+                        FD_ZERO(&writeSet);
+                        FD_ZERO(&readSet);
+                        auto sslErr = SSL_get_error(ssl_, numWritten);
+                        if (sslErr == SSL_ERROR_WANT_READ || sslErr == SSL_ERROR_WANT_WRITE)
+                        {
+                            // Block until we're able to continue.
+                            auto rawSock = socket_.load(std::memory_order_acquire);
+                            if (sslErr == SSL_ERROR_WANT_READ) FD_SET(rawSock, &readSet);
+                            else FD_SET(rawSock, &writeSet);
+
+                            select(socket_.load(std::memory_order_acquire) + 1, &readSet, &writeSet, nullptr, nullptr);
+                        }
+                        else
+                        {
+                            auto errStr = GetSSLError_();
+                            log_error("Unable to read from TLS connection: %s", errStr.c_str());
+                            break;
+                        }
+                    }
                 }
                 else
 #endif // defined(ENABLE_TLS_SUPPORT)
@@ -704,7 +762,29 @@ void TcpConnectionHandler::receiveImpl_()
 #if defined(ENABLE_TLS_SUPPORT)
                 if (usingTLS_)
                 {
-                    numRead = SSL_read(ssl_, buf, READ_SIZE_BYTES);
+                    while ((numRead = SSL_read(ssl_, buf, READ_SIZE_BYTES)) < 0)
+                    {
+                        fd_set writeSet;
+                        fd_set readSet;
+                        FD_ZERO(&writeSet);
+                        FD_ZERO(&readSet);
+                        auto sslErr = SSL_get_error(ssl_, numRead);
+                        if (sslErr == SSL_ERROR_WANT_READ || sslErr == SSL_ERROR_WANT_WRITE)
+                        {
+                            // Block until we're able to continue.
+                            auto rawSock = socket_.load(std::memory_order_acquire);
+                            if (sslErr == SSL_ERROR_WANT_READ) FD_SET(rawSock, &readSet);
+                            else FD_SET(rawSock, &writeSet);
+
+                            select(socket_.load(std::memory_order_acquire) + 1, &readSet, &writeSet, nullptr, nullptr);
+                        }
+                        else
+                        {
+                            auto errStr = GetSSLError_();
+                            log_error("Unable to read from TLS connection: %s", errStr.c_str());
+                            break;
+                        }
+                    }
                 }
                 else
 #endif // defined(ENABLE_TLS_SUPPORT)

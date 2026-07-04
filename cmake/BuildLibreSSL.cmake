@@ -1,8 +1,10 @@
 set(LIBRESSL_VERSION "4.3.2")
 
+# LibreSSL configuration options
 set(LIBRESSL_SKIP_INSTALL ON)
 set(LIBRESSL_APPS OFF)
 set(LIBRESSL_TESTS OFF)
+set(ENABLE_ASM OFF)
 
 include(FetchContent)
 if (CMAKE_VERSION VERSION_GREATER_EQUAL "3.28.0")
