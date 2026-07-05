@@ -468,8 +468,8 @@ next_fd:
     {
         bool connSucceeded = true;
 #if defined(ENABLE_TLS_SUPPORT)
-	sslCtx_ = nullptr;
-	ssl_ = nullptr;
+        sslCtx_ = nullptr;
+        ssl_ = nullptr;
 
         // We have a valid socket. If the user wants to connect via TLS, attempt TLS negotiation now.
         // If we can't negotiate TLS for whatever reason, close socket and try again in a bit.
@@ -673,16 +673,18 @@ void TcpConnectionHandler::disconnectImpl_(bool callHandler)
         socket_.store(INVALID_SOCKET, std::memory_order_release);
 
 #if defined(ENABLE_TLS_SUPPORT)
-        if (ssl_ != nullptr) 
+        auto tmpSsl = ssl_.load(std::memory_order_acquire);
+        ssl_ = nullptr;
+        if (tmpSsl != nullptr) 
         {
-            SSL_shutdown(ssl_);
-            SSL_free(ssl_);
-            ssl_ = nullptr;
+            SSL_shutdown(tmpSsl);
+            SSL_free(tmpSsl);
         }
-        if (sslCtx_ != nullptr)
+        auto tmpCtx = sslCtx_.load(std::memory_order_acquire);
+        sslCtx_.store(nullptr, std::memory_order_release);
+        if (tmpCtx != nullptr)
         {
-            SSL_CTX_free(sslCtx_);
-            sslCtx_ = nullptr;
+            SSL_CTX_free(tmpCtx);
         }
 #endif // defined(ENABLE_TLS_SUPPORT)
 
