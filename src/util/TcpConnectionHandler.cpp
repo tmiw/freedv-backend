@@ -729,23 +729,25 @@ void TcpConnectionHandler::sendImpl_(const char* buf, int length)
             {
                 int numWritten = 0;
 #if defined(ENABLE_TLS_SUPPORT)
-                if (usingTLS_)
+                if (usingTLS_ && ssl_.load(std::memory_order_acquire) != nullptr)
                 {
-                    while ((numWritten = SSL_write(ssl_, buf, length)) < 0)
+                    while ((numWritten = SSL_write(ssl_.load(std::memory_order_acquire), buf, length)) < 0)
                     {
-                        fd_set writeSet;
                         fd_set readSet;
-                        FD_ZERO(&writeSet);
                         FD_ZERO(&readSet);
                         auto sslErr = SSL_get_error(ssl_, numWritten);
-                        if (sslErr == SSL_ERROR_WANT_READ || sslErr == SSL_ERROR_WANT_WRITE)
+                        if (sslErr == SSL_ERROR_WANT_WRITE)
+                        {
+                            // Can be handled by the top level loop. Not an error.
+                            break;
+                        }
+                        else if (sslErr == SSL_ERROR_WANT_READ)
                         {
                             // Block until we're able to continue.
                             auto rawSock = socket_.load(std::memory_order_acquire);
-                            if (sslErr == SSL_ERROR_WANT_READ) FD_SET(rawSock, &readSet);
-                            else FD_SET(rawSock, &writeSet);
+                            FD_SET(rawSock, &writeSet);
 
-                            select(socket_.load(std::memory_order_acquire) + 1, &readSet, &writeSet, nullptr, nullptr);
+                            select(socket_.load(std::memory_order_acquire) + 1, &readSet, nullptr, nullptr, nullptr);
                         }
                         else
                         {
@@ -825,26 +827,34 @@ void TcpConnectionHandler::receiveImpl_()
         {
             int numRead = 0;
             int numHaveRead = 0;
+#if defined(ENABLE_TLS_SUPPORT)
+            while(!usingTLS_ || ssl_.load(std::memory_order_acquire) != nullptr)
+#else
             while(true)
+#endif // defined(ENABLE_TLS_SUPPORT)
             {
 #if defined(ENABLE_TLS_SUPPORT)
                 if (usingTLS_)
                 {
-                    while ((numRead = SSL_read(ssl_, buf, READ_SIZE_BYTES)) < 0)
+                    numRead = SSL_read(ssl_.load(std::memory_order_acquire), buf, READ_SIZE_BYTES);
+                    if (numRead < 0)
                     {
                         fd_set writeSet;
-                        fd_set readSet;
                         FD_ZERO(&writeSet);
-                        FD_ZERO(&readSet);
                         auto sslErr = SSL_get_error(ssl_, numRead);
-                        if (sslErr == SSL_ERROR_WANT_READ || sslErr == SSL_ERROR_WANT_WRITE)
+                        if (sslErr == SSL_ERROR_WANT_READ)
                         {
-                            // Block until we're able to continue.
+                            // This case can be handled by the top-level select()
+                            // loop. Not an error.
+                            break;
+                        }
+                        else if (sslErr == SSL_ERROR_WANT_WRITE)
+                        {
+                            // Block until we're able to continue writing.
                             auto rawSock = socket_.load(std::memory_order_acquire);
-                            if (sslErr == SSL_ERROR_WANT_READ) FD_SET(rawSock, &readSet);
-                            else FD_SET(rawSock, &writeSet);
+                            FD_SET(rawSock, &writeSet);
 
-                            select(socket_.load(std::memory_order_acquire) + 1, &readSet, &writeSet, nullptr, nullptr);
+                            select(socket_.load(std::memory_order_acquire) + 1, nullptr, &writeSet, nullptr, nullptr);
                         }
                         else
                         {
