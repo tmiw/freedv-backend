@@ -468,6 +468,9 @@ next_fd:
     {
         bool connSucceeded = true;
 #if defined(ENABLE_TLS_SUPPORT)
+	sslCtx_ = nullptr;
+	ssl_ = nullptr;
+
         // We have a valid socket. If the user wants to connect via TLS, attempt TLS negotiation now.
         // If we can't negotiate TLS for whatever reason, close socket and try again in a bit.
         if (usingTLS_)

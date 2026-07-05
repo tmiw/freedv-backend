@@ -75,8 +75,8 @@ private:
     GenericFIFO<char> receiveBuffer_;
     OnRecvEndFn onRecvEndFn_;
 #if defined(ENABLE_TLS_SUPPORT)
-    SSL_CTX* sslCtx_;
-    SSL* ssl_;
+    std::atomic<SSL_CTX*> sslCtx_;
+    std::atomic<SSL*> ssl_;
 #endif // defined(ENABLE_TLS_SUPPORT)
 
     void connectImpl_();
