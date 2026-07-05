@@ -59,6 +59,9 @@ Tests take some time. A good result ends like this:
 Total Test time (real) = 198.79 sec
 ```
 
+TLS support (mainly for FreeDV Reporter) is enabled by default, but can be disabled (i.e. for platforms that can't do TLS) by passing `-DDISABLE_TLS_SUPPORT=1` to `cmake`.
+Additionally, LibreSSL can be statically linked instead of the system's copy of OpenSSL by passing in `-DUSE_STATIC_LIBRESSL=1`.
+
 ## Getting Support
 
 Please create a GitHub issue if you find a problem with this repository.
