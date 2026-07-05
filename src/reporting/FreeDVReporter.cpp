@@ -344,7 +344,11 @@ void FreeDVReporter::connect_()
     
     std::string host;
     std::string portStr;
+#if defined(ENABLE_TLS_SUPPORT)
     int port = useSecureConnection_ ? 443 : 80;
+#else
+    int port = 80;
+#endif // defined(ENABLE_TLS_SUPPORT)
     std::getline(ss, host, ':');
     std::getline(ss, portStr, ':');
     if (portStr != "")
@@ -352,7 +356,11 @@ void FreeDVReporter::connect_()
         port = atoi(portStr.c_str());
     }
     sioClient_->setAuthDictionary(authDoc); // frees authDoc
+#if defined(ENABLE_TLS_SUPPORT)
     sioClient_->connect(host.c_str(), port, true, useSecureConnection_);
+#else
+    sioClient_->connect(host.c_str(), port, true, false);
+#endif // defined(ENABLE_TLS_SUPPORT)
     
     if (onReporterConnectFn_)
     {
