@@ -44,19 +44,34 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Include helpers
+include(cmake/IsMacOSUniversalBinary.cmake)
+
 # Compile backend dependencies
 include(cmake/BuildRADE.cmake)
 include(cmake/BuildRNNoise.cmake)
 
 if(NOT DISABLE_TLS_SUPPORT)
     message(STATUS "Enabling TLS support for FreeDV Reporter")
-    add_definitions(-DENABLE_TLS_SUPPORT)
+
+    # ENABLE_TLS_SUPPORT is applied via target_compile_definitions() on fdv_util/
+    # fdv_reporting (not add_definitions() here) so it also propagates to
+    # consumers outside this subproject, like FlexTcpTask in freedv-integrations.
+    # TcpConnectionHandler's layout depends on this macro, so every TU that sees
+    # it must agree, or subclasses silently corrupt adjacent members at runtime.
 
     if(NOT USE_STATIC_LIBRESSL)
         find_package(OpenSSL)
         if(OpenSSL_FOUND)
-            message(STATUS "Using OpenSSL for TLS support.")
-            include_directories(${OPENSSL_INCLUDE_DIR})
+            IsMacOSUniversalBinary(${OPENSSL_CRYPTO_LIBRARY} CRYPTO_USABLE)
+            IsMacOSUniversalBinary(${OPENSSL_SSL_LIBRARY} SSL_USABLE)
+            if (CRYPTO_USABLE AND SSL_USABLE)
+                message(STATUS "Using OpenSSL for TLS support.")
+                include_directories(${OPENSSL_INCLUDE_DIR})
+            else()
+                message(STATUS "OpenSSL is not a universal binary, ignoring found library")
+                set(OpenSSL_FOUND 0)
+            endif()
         endif(OpenSSL_FOUND)
     endif(NOT USE_STATIC_LIBRESSL)
     if(USE_STATIC_LIBRESSL OR NOT OpenSSL_FOUND)
@@ -74,6 +89,12 @@ if(NOT USE_STATIC_EBUR128)
     find_path(LIBEBUR128_INCLUDE_DIR ebur128.h)
     message(STATUS "  ebur128 library: ${LIBEBUR128}")
     message(STATUS "  ebur128 headers: ${LIBEBUR128_INCLUDE_DIR}")
+    IsMacOSUniversalBinary(${LIBEBUR128} LIBEBUR128_USABLE)
+    if (NOT LIBEBUR128_USABLE)
+        message(STATUS "libebur128 is not a universal binary, ignoring found library")
+        set(LIBEBUR128 0)
+        set(LIBEBUR128_INCLUDE_DIR "")
+    endif()
     if(LIBEBUR128 AND LIBEBUR128_INCLUDE_DIR)
         list(APPEND FREEDV_LINK_LIBS ${LIBEBUR128})
         include_directories(${LIBEBUR128_INCLUDE_DIR})
@@ -94,6 +115,12 @@ if(NOT USE_STATIC_SAMPLERATE)
     find_path(LIBSAMPLERATE_INCLUDE_DIR samplerate.h)
     message(STATUS "  samplerate library: ${LIBSAMPLERATE}")
     message(STATUS "  samplerate headers: ${LIBSAMPLERATE_INCLUDE_DIR}")
+    IsMacOSUniversalBinary("${LIBSAMPLERATE}" LIBSAMPLERATE_USABLE)
+    if (NOT LIBSAMPLERATE_USABLE)
+        message(STATUS "libsamplerate is not a universal binary, ignoring found library")
+        set(LIBSAMPLERATE 0)
+        set(LIBSAMPLERATE_INCLUDE_DIR "")
+    endif()
     if(LIBSAMPLERATE AND LIBSAMPLERATE_INCLUDE_DIR)
         list(APPEND FREEDV_LINK_LIBS ${LIBSAMPLERATE})
         include_directories(${LIBSAMPLERATE_INCLUDE_DIR})
