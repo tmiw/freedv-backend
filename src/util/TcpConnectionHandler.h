@@ -31,6 +31,11 @@
 #include <future>
 #include <atomic>
 
+#if defined(ENABLE_TLS_SUPPORT)
+#include <openssl/ssl.h>
+#include <openssl/err.h> 
+#endif // defined(ENABLE_TLS_SUPPORT)
+
 class TcpConnectionHandler : public ThreadedObject
 {
 public:
@@ -39,7 +44,7 @@ public:
     TcpConnectionHandler();
     virtual ~TcpConnectionHandler();
     
-    std::future<void> connect(const char* host, int port, bool enableReconnect);
+    std::future<void> connect(const char* host, int port, bool enableReconnect, bool enableTLS = false);
     std::future<void> disconnect();
     
     std::future<void> send(const char* buf, int length);
@@ -49,6 +54,7 @@ public:
 protected:
     std::string host_;
     int port_;
+    bool usingTLS_;
     std::atomic<bool> enableReconnect_;
     
     virtual void onConnect_() = 0;
@@ -68,9 +74,13 @@ private:
     std::atomic<bool> cancelConnect_;
     GenericFIFO<char> receiveBuffer_;
     OnRecvEndFn onRecvEndFn_;
+#if defined(ENABLE_TLS_SUPPORT)
+    std::atomic<SSL_CTX*> sslCtx_;
+    std::atomic<SSL*> ssl_;
+#endif // defined(ENABLE_TLS_SUPPORT)
 
     void connectImpl_();
-    void disconnectImpl_();
+    void disconnectImpl_(bool callHandler = true);
     void sendImpl_(const char* buf, int length);
     void receiveImpl_();
     

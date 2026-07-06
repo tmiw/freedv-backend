@@ -26,6 +26,18 @@ add_library(fdv_util STATIC
 
 target_compile_options(fdv_util PRIVATE ${WARNINGS_AS_ERRORS_FLAGS})
 target_link_libraries(fdv_util yyjson fdv_os_wrapper)
+if(NOT DISABLE_TLS_SUPPORT)
+    if (OpenSSL_FOUND)
+        target_link_libraries(fdv_util OpenSSL::SSL)
+    else (OpenSSL_FOUND)
+        target_link_libraries(fdv_util tls)
+    endif (OpenSSL_FOUND)
+
+    if(WIN32)
+        target_link_libraries(fdv_util crypt32 cryptui)
+    endif(WIN32)
+endif(NOT DISABLE_TLS_SUPPORT)
+
 target_include_directories(fdv_util PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 if(BUILD_BACKEND_UNITTESTS)

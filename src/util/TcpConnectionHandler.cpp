@@ -29,6 +29,8 @@
 #include <algorithm>
 #include <sstream>
 
+#include "TcpConnectionHandler.h"
+
 #if defined(WIN32) || defined(__MINGW32__)
 
 #ifndef _WIN32_WINNT
@@ -38,6 +40,8 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <ws2def.h>
+#include <wincrypt.h>
+#include <cryptuiapi.h>
 #else
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -45,7 +49,6 @@
 #include <fcntl.h>
 #endif // defined(WIN32) || defined(__MINGW32__)
 
-#include "TcpConnectionHandler.h"
 #include "logging/ulog.h"
 #include "../os/os_interface.h"
 
@@ -58,6 +61,20 @@ using namespace std::chrono_literals;
 #ifndef INVALID_SOCKET
 #define INVALID_SOCKET (-1)
 #endif // INVALID_SOCKET
+
+#if defined(ENABLE_TLS_SUPPORT)
+static std::string GetSSLError_()
+{
+    //std::string ret = ERR_error_string(ERR_get_error(), NULL);
+    BIO *bio = BIO_new(BIO_s_mem());
+    ERR_print_errors(bio);
+    char *buf;
+    size_t len = BIO_get_mem_data(bio, &buf);
+    std::string ret(buf, len);
+    BIO_free(bio);
+    return ret;
+}
+#endif // defined(ENABLE_TLS_SUPPORT)
 
 TcpConnectionHandler::TcpConnectionHandler()
     : ThreadedObject("TcpConn")
@@ -97,11 +114,12 @@ TcpConnectionHandler::~TcpConnectionHandler()
 #endif // defined(WIN32)
 }
 
-std::future<void> TcpConnectionHandler::connect(const char* host, int port, bool enableReconnect)
+std::future<void> TcpConnectionHandler::connect(const char* host, int port, bool enableReconnect, bool enableTLS)
 {
     cancelConnect_ = false;
     host_ = host;
     port_ = port;
+    usingTLS_ = enableTLS;
     enableReconnect_.store(enableReconnect, std::memory_order_release);
     
     std::shared_ptr<std::promise<void>> prom = std::make_shared<std::promise<void> >();
@@ -448,33 +466,171 @@ next_fd:
     
     if (socket_.load(std::memory_order_acquire) != INVALID_SOCKET)
     {
-        // Call connect handler (defined by child class).
-        char buf[256];
-        struct sockaddr_storage addr;
-        socklen_t len = sizeof(addr);
-        if (getpeername(socket_.load(std::memory_order_acquire), (struct sockaddr*)&addr, &len) != 0)
-        {
-#if defined(WIN32)
-            int err = WSAGetLastError();
-#else
-            int err = errno;
-#endif // defined(WIN32)
-            log_warn("could not get IP address of socket (err=%d)", err);
-        }
-        int nameErr = 0;
-        if ((nameErr = getnameinfo((struct sockaddr*)&addr, len, buf, sizeof(buf), nullptr, 0, NI_NUMERICHOST)) != 0)
-        {
-#if defined(WIN32)
-            nameErr = WSAGetLastError();
-#endif // defined(WIN32)
-            log_warn("could not get string representation of IP address (err=%d)", nameErr);
-        }
+        bool connSucceeded = true;
+#if defined(ENABLE_TLS_SUPPORT)
+        sslCtx_.store(nullptr, std::memory_order_release);
+        ssl_.store(nullptr, std::memory_order_release);
 
-        log_info("connection succeeded to %s", buf);
-        enqueue_(std::bind(&TcpConnectionHandler::onConnect_, this));
+        // We have a valid socket. If the user wants to connect via TLS, attempt TLS negotiation now.
+        // If we can't negotiate TLS for whatever reason, close socket and try again in a bit.
+        if (usingTLS_)
+        {
+            const SSL_METHOD* method = TLS_client_method();
+            sslCtx_.store(SSL_CTX_new(method), std::memory_order_release);
+            if (sslCtx_.load(std::memory_order_acquire) == nullptr)
+            {
+                auto errStr = GetSSLError_();
+                log_error("Unable to create SSL context: %s", errStr.c_str());
+                disconnectImpl_(false);
+                connSucceeded = false;
+            }
+            else
+            {
+                // Set up certificate validation
+                SSL_CTX_set_verify(sslCtx_.load(std::memory_order_acquire), SSL_VERIFY_PEER, nullptr);
+
+                // Set up root certificate locations. Note that on Windows,
+                // we use the Windows certificate store, so we need to manually
+                // import those root certificates.
+#if defined(WIN32)
+                {
+                    HCERTSTORE hStore;
+                    PCCERT_CONTEXT pContext = nullptr;
+                    X509 *x509 = nullptr;
+                    X509_STORE *store = SSL_CTX_get_cert_store(sslCtx_.load(std::memory_order_acquire));
+                    
+                    if (store == nullptr)
+                    {
+                        store = X509_STORE_new();
+                        SSL_CTX_set_cert_store(sslCtx_.load(std::memory_order_acquire), store);
+                    }
+
+                    hStore = CertOpenSystemStoreW(NULL, L"ROOT");
+                    if (!hStore)
+                    {
+                        log_warn("Could not open Windows certificate store");
+                    }
+                    else
+                    {
+                        while ((pContext = CertEnumCertificatesInStore(hStore, pContext)) != nullptr)
+                        {
+                            const unsigned char *encoded_cert = pContext->pbCertEncoded;
+                            x509 = d2i_X509(NULL, &encoded_cert, pContext->cbCertEncoded);
+                            if (x509)
+                            {
+                                if (X509_STORE_add_cert(store, x509) != 1)
+                                {
+                                   auto errStr = GetSSLError_();
+                                   log_warn("Could not add certificate to internal store: %s", errStr.c_str());
+                                }
+                                X509_free(x509);
+                            }
+                        }
+                        CertCloseStore(hStore, 0);
+                    }
+                }
+#else
+                if (!SSL_CTX_set_default_verify_paths(sslCtx_.load(std::memory_order_acquire)))
+                {
+                    auto errStr = GetSSLError_();
+                    log_warn("Unable to set TLS certificate validation paths: %s", errStr.c_str());
+                }
+#endif // defined(WIN32)
+
+                // Force >= TLS 1.2
+                if (!SSL_CTX_set_min_proto_version(sslCtx_.load(std::memory_order_acquire), TLS1_2_VERSION)) 
+                {
+                    auto errStr = GetSSLError_();
+                    log_warn("Unable to mandate minimum TLS version: %s", errStr.c_str());
+                }
+
+                ssl_.store(SSL_new(sslCtx_.load(std::memory_order_acquire)), std::memory_order_release);
+                assert(ssl_ != nullptr);
+
+                if (!SSL_set_fd(ssl_.load(std::memory_order_acquire), (int)socket_.load(std::memory_order_acquire)))
+                {
+                    auto errStr = GetSSLError_();
+                    log_error("Unable to assign socket to SSL context: %s", errStr.c_str());
+                    disconnectImpl_(false);
+                    connSucceeded = false;
+                }
+                else
+                {
+                    // Set hostname for SSL negotiation
+                    SSL_set_tlsext_host_name(ssl_.load(std::memory_order_acquire), host_.c_str());
+                    if (!SSL_set1_host(ssl_.load(std::memory_order_acquire), host_.c_str())) 
+                    {
+                        auto errStr = GetSSLError_();
+                        log_warn("Unable to assign hostname for certificate validation: %s", errStr.c_str());
+                    }
+
+                    // Attempt SSL negotiation
+                    int sslRet = 0;
+                    while ((sslRet = SSL_connect(ssl_.load(std::memory_order_acquire))) != 1)
+                    {
+                        fd_set writeSet;
+                        fd_set readSet;
+                        FD_ZERO(&writeSet);
+                        FD_ZERO(&readSet);
+                        auto sslErr = SSL_get_error(ssl_.load(std::memory_order_acquire), sslRet);
+                        if (sslErr == SSL_ERROR_WANT_READ || sslErr == SSL_ERROR_WANT_WRITE)
+                        {
+                            // Block until we're able to continue.
+                            auto rawSock = socket_.load(std::memory_order_acquire);
+                            if (sslErr == SSL_ERROR_WANT_READ) FD_SET(rawSock, &readSet);
+                            else FD_SET(rawSock, &writeSet);
+
+                            select(socket_.load(std::memory_order_acquire) + 1, &readSet, &writeSet, nullptr, nullptr);
+                        }
+                        else
+                        {
+                            if (SSL_get_verify_result(ssl_.load(std::memory_order_acquire)) != X509_V_OK)
+                            {
+                                log_error("Certificate validation error: %s", X509_verify_cert_error_string(SSL_get_verify_result(ssl_.load(std::memory_order_acquire))));
+                            }
+
+                            auto errStr = GetSSLError_();
+                            log_error("Unable to negotiate TLS connection: %s", errStr.c_str());
+                            disconnectImpl_(false);
+                            connSucceeded = false;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+#endif // defined(ENABLE_TLS_SUPPORT)
+
+        // Call connect handler (defined by child class).
+        if (connSucceeded)
+        {
+            char buf[256];
+            struct sockaddr_storage addr;
+            socklen_t len = sizeof(addr);
+            if (getpeername(socket_.load(std::memory_order_acquire), (struct sockaddr*)&addr, &len) != 0)
+            {
+#if defined(WIN32)
+                int err = WSAGetLastError();
+#else
+                int err = errno;
+#endif // defined(WIN32)
+                log_warn("could not get IP address of socket (err=%d)", err);
+            }
+            int nameErr = 0;
+            if ((nameErr = getnameinfo((struct sockaddr*)&addr, len, buf, sizeof(buf), nullptr, 0, NI_NUMERICHOST)) != 0)
+            {
+#if defined(WIN32)
+                nameErr = WSAGetLastError();
+#endif // defined(WIN32)
+                log_warn("could not get string representation of IP address (err=%d)", nameErr);
+            }
+
+            log_info("connection succeeded to %s", buf);
+            enqueue_(std::bind(&TcpConnectionHandler::onConnect_, this));
         
-        // Start receive thread
-        receiveThread_ = std::thread(std::bind(&TcpConnectionHandler::receiveImpl_, this));
+            // Start receive thread
+            receiveThread_ = std::thread(std::bind(&TcpConnectionHandler::receiveImpl_, this));
+        }
     }
     else if (enableReconnect_.load(std::memory_order_acquire))
     {
@@ -509,12 +665,28 @@ next_fd:
     }
 }
 
-void TcpConnectionHandler::disconnectImpl_()
+void TcpConnectionHandler::disconnectImpl_(bool callHandler)
 {
     auto tmp = socket_.load(std::memory_order_acquire);
     if (tmp != INVALID_SOCKET)
     {
         socket_.store(INVALID_SOCKET, std::memory_order_release);
+
+#if defined(ENABLE_TLS_SUPPORT)
+        auto tmpSsl = ssl_.load(std::memory_order_acquire);
+        ssl_.store(nullptr, std::memory_order_release);
+        if (tmpSsl != nullptr) 
+        {
+            SSL_shutdown(tmpSsl);
+            SSL_free(tmpSsl);
+        }
+        auto tmpCtx = sslCtx_.load(std::memory_order_acquire);
+        sslCtx_.store(nullptr, std::memory_order_release);
+        if (tmpCtx != nullptr)
+        {
+            SSL_CTX_free(tmpCtx);
+        }
+#endif // defined(ENABLE_TLS_SUPPORT)
 
 #if defined(WIN32)
         closesocket(tmp);
@@ -527,8 +699,11 @@ void TcpConnectionHandler::disconnectImpl_()
             receiveThread_.join();
         }
 
-        onDisconnect_();
-        
+        if (callHandler)
+        {
+            onDisconnect_();
+        }
+
         if (enableReconnect_.load(std::memory_order_acquire))
         {
             reconnectTimer_.start();
@@ -552,11 +727,48 @@ void TcpConnectionHandler::sendImpl_(const char* buf, int length)
             int rv = select(socket_.load(std::memory_order_acquire) + 1, nullptr, &writeSet, nullptr, nullptr);
             if (rv > 0)
             {
+                int numWritten = 0;
+#if defined(ENABLE_TLS_SUPPORT)
+                if (usingTLS_ && ssl_.load(std::memory_order_acquire) != nullptr)
+                {
+                    while (
+                        (ssl_.load(std::memory_order_acquire) != nullptr) &&
+                        (numWritten = SSL_write(ssl_.load(std::memory_order_acquire), buf, length)) < 0)
+                    {
+                        fd_set readSet;
+                        FD_ZERO(&readSet);
+                        auto sslErr = SSL_get_error(ssl_.load(std::memory_order_acquire), numWritten);
+                        if (sslErr == SSL_ERROR_WANT_WRITE)
+                        {
+                            // Can be handled by the top level loop. Not an error.
+                            goto tryAgain;
+                        }
+                        else if (sslErr == SSL_ERROR_WANT_READ && socket_.load(std::memory_order_acquire) != INVALID_SOCKET)
+                        {
+                            // Block until we're able to continue.
+                            auto rawSock = socket_.load(std::memory_order_acquire);
+                            FD_SET(rawSock, &readSet);
+
+                            select(socket_.load(std::memory_order_acquire) + 1, &readSet, nullptr, nullptr, nullptr);
+                            continue;
+                        }
+                        else
+                        {
+                            auto errStr = GetSSLError_();
+                            log_error("Unable to read from TLS connection: %s", errStr.c_str());
+                            break;
+                        }
+                    }
+                }
+                else
+#endif // defined(ENABLE_TLS_SUPPORT)
+                {
 #if defined(WIN32)
-                int numWritten = ::send(socket_.load(std::memory_order_acquire), buf, length, 0);
+                    numWritten = ::send(socket_.load(std::memory_order_acquire), buf, length, 0);
 #else
-                int numWritten = write(socket_.load(std::memory_order_acquire), buf, length);
+                    numWritten = write(socket_.load(std::memory_order_acquire), buf, length);
 #endif // defined(WIN32)
+                }
                 if (numWritten > 0)
                 {
                     buf += numWritten;
@@ -594,6 +806,9 @@ void TcpConnectionHandler::sendImpl_(const char* buf, int length)
                     disconnectImpl_();
                 });
             }
+            continue;
+tryAgain:
+            assert(usingTLS_); // to silence warning
         }
     }
 }
@@ -618,12 +833,59 @@ void TcpConnectionHandler::receiveImpl_()
         {
             int numRead = 0;
             int numHaveRead = 0;
-#if defined(WIN32)
-            while ((numRead = recv(socket_.load(std::memory_order_acquire), buf, READ_SIZE_BYTES, 0)) > 0)
+#if defined(ENABLE_TLS_SUPPORT)
+            while(!usingTLS_ || ssl_.load(std::memory_order_acquire) != nullptr)
 #else
-            while ((numRead = read(socket_.load(std::memory_order_acquire), buf, READ_SIZE_BYTES)) > 0)
-#endif // defined(WIN32)
+            while(true)
+#endif // defined(ENABLE_TLS_SUPPORT)
             {
+#if defined(ENABLE_TLS_SUPPORT)
+                if (usingTLS_ && ssl_.load(std::memory_order_acquire) != nullptr)
+                {
+                    numRead = SSL_read(ssl_.load(std::memory_order_acquire), buf, READ_SIZE_BYTES);
+                    if (numRead < 0 && ssl_.load(std::memory_order_acquire))
+                    {
+                        fd_set writeSet;
+                        FD_ZERO(&writeSet);
+                        auto sslErr = SSL_get_error(ssl_.load(std::memory_order_acquire), numRead);
+                        if (sslErr == SSL_ERROR_WANT_READ)
+                        {
+                            // This case can be handled by the top-level select()
+                            // loop. Not an error.
+                            goto tryAgain;
+                        }
+                        else if (sslErr == SSL_ERROR_WANT_WRITE && socket_.load(std::memory_order_acquire) != INVALID_SOCKET)
+                        {
+                            // Block until we're able to continue writing.
+                            auto rawSock = socket_.load(std::memory_order_acquire);
+                            FD_SET(rawSock, &writeSet);
+
+                            select(socket_.load(std::memory_order_acquire) + 1, nullptr, &writeSet, nullptr, nullptr);
+                            continue;
+                        }
+                        else
+                        {
+                            auto errStr = GetSSLError_();
+                            log_error("Unable to read from TLS connection: %s", errStr.c_str());
+                            break;
+                        }
+                    }
+                }
+                else
+#endif // defined(ENABLE_TLS_SUPPORT)
+                {
+#if defined(WIN32)
+                    numRead = recv(socket_.load(std::memory_order_acquire), buf, READ_SIZE_BYTES, 0);
+#else
+                    numRead = read(socket_.load(std::memory_order_acquire), buf, READ_SIZE_BYTES);
+#endif // defined(WIN32)
+                }
+
+                if (numRead <= 0)
+                {
+                    break;
+                }
+
                 // Queue RX handler
                 numHaveRead += numRead;
                 receiveBuffer_.write(buf, numRead);
@@ -680,6 +942,9 @@ void TcpConnectionHandler::receiveImpl_()
                 disconnectImpl_();
             });
         }
+        continue;
+tryAgain:
+        assert(usingTLS_); // silencing warning
     }
 }
 
