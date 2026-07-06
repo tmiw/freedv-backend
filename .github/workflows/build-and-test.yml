@@ -57,14 +57,14 @@ jobs:
         pip install torch matplotlib
      
     - name: Configure build (standard)
-      if: ${{ matrix.is-windows-build == false && matrix.is-universal-build == false }}
+      if: ${{ matrix.is-windows-build == false && matrix.is-univ-build == false }}
       run: |
         mkdir build
         cd build
         cmake -DRADAE_PYTHON_EXECUTABLE=${{ github.workspace }}/rade-venv/bin/python3 -DBUILD_BACKEND_UNITTESTS=1 ..
 
     - name: Configure build (macOS universal)
-      if: ${{ matrix.is-universal-build == true }}
+      if: ${{ matrix.is-univ-build == true }}
       run: |
         mkdir build
         cd build
@@ -78,9 +78,17 @@ jobs:
         export PATH=${{github.workspace}}/llvm-mingw-20251216-ucrt-ubuntu-22.04-x86_64/bin:$PATH
         cmake -DCMAKE_TOOLCHAIN_FILE=${{github.workspace}}/cross-compile/freedv-mingw-llvm-x86_64.cmake ..
 
-    - name: Build backend and tests
+    - name: Build backend and tests (non-Windows)
+      if: ${{ matrix.is-windows-build == false }}
       run: |
         cd build
+        cmake --build .
+
+    - name: Build backend (Windows)
+      if: ${{ matrix.is-windows-build == true }}
+      run: |
+        cd build
+        export PATH=${{github.workspace}}/llvm-mingw-20251216-ucrt-ubuntu-22.04-x86_64/bin:$PATH
         cmake --build .
 
     - name: Run tests
