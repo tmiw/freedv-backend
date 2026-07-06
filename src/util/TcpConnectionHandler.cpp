@@ -555,7 +555,7 @@ next_fd:
                     if (!SSL_CTX_load_verify_file(sslCtx_.load(std::memory_order_acquire), sslCertFileEnv))
                     {
                         auto errStr = GetSSLError_();
-                        log_warn("Unable to set TLS certificate directory: %s", errStr.c_str());
+                        log_warn("Unable to set TLS certificate file: %s", errStr.c_str());
                     }
                 }
 
