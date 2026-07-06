@@ -540,23 +540,11 @@ next_fd:
                 }
 
                 auto sslCertDirEnv = getenv("SSL_CERT_DIR"); // NOLINT
-                if (sslCertDirEnv != nullptr)
-                {
-                    if (!SSL_CTX_load_verify_dir(sslCtx_.load(std::memory_order_acquire), sslCertDirEnv))
-                    {
-                        auto errStr = GetSSLError_();
-                        log_warn("Unable to set TLS certificate directory: %s", errStr.c_str());
-                    }
-                }
-
                 auto sslCertFileEnv = getenv("SSL_CERT_FILE"); // NOLINT
-                if (sslCertFileEnv != nullptr)
+                if (!SSL_CTX_load_verify_locations(sslCtx_.load(std::memory_order_acquire), sslCertFileEnv, sslCertDirEnv))
                 {
-                    if (!SSL_CTX_load_verify_file(sslCtx_.load(std::memory_order_acquire), sslCertFileEnv))
-                    {
-                        auto errStr = GetSSLError_();
-                        log_warn("Unable to set TLS certificate file: %s", errStr.c_str());
-                    }
+                    auto errStr = GetSSLError_();
+                    log_warn("Unable to set TLS certificate locations: %s", errStr.c_str());
                 }
 
 #endif // defined(WIN32)
