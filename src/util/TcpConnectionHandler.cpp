@@ -491,7 +491,10 @@ next_fd:
 
                 // Set up root certificate locations. Note that on Windows,
                 // we use the Windows certificate store, so we need to manually
-                // import those root certificates.
+                // import those root certificates. For non-Windows platforms, we
+                // query SSL_CERT_DIR/SSL_CERT_FILE from the environment and override
+                // the default paths as needed. (OpenSSL does this for us, but LibreSSL does not,
+                // hence the need to manually query the environment here.)
 #if defined(WIN32)
                 {
                     HCERTSTORE hStore;
@@ -535,6 +538,27 @@ next_fd:
                     auto errStr = GetSSLError_();
                     log_warn("Unable to set TLS certificate validation paths: %s", errStr.c_str());
                 }
+
+                auto sslCertDirEnv = getenv("SSL_CERT_DIR"); // NOLINT
+                if (sslCertDirEnv != nullptr)
+                {
+                    if (!SSL_CTX_load_verify_dir(sslCtx_.load(std::memory_order_acquire), sslCertDirEnv))
+                    {
+                        auto errStr = GetSSLError_();
+                        log_warn("Unable to set TLS certificate directory: %s", errStr.c_str());
+                    }
+                }
+
+                auto sslCertFileEnv = getenv("SSL_CERT_FILE"); // NOLINT
+                if (sslCertFileEnv != nullptr)
+                {
+                    if (!SSL_CTX_load_verify_file(sslCtx_.load(std::memory_order_acquire), sslCertFileEnv))
+                    {
+                        auto errStr = GetSSLError_();
+                        log_warn("Unable to set TLS certificate directory: %s", errStr.c_str());
+                    }
+                }
+
 #endif // defined(WIN32)
 
                 // Force >= TLS 1.2
