@@ -468,16 +468,16 @@ next_fd:
     {
         bool connSucceeded = true;
 #if defined(ENABLE_TLS_SUPPORT)
-        sslCtx_ = nullptr;
-        ssl_ = nullptr;
+        sslCtx_.store(nullptr, std::memory_order_release);
+        ssl_.store(nullptr, std::memory_order_release);
 
         // We have a valid socket. If the user wants to connect via TLS, attempt TLS negotiation now.
         // If we can't negotiate TLS for whatever reason, close socket and try again in a bit.
         if (usingTLS_)
         {
             const SSL_METHOD* method = TLS_client_method();
-            sslCtx_ = SSL_CTX_new(method);
-            if (sslCtx_ == nullptr)
+            sslCtx_.store(SSL_CTX_new(method), std::memory_order_release);
+            if (sslCtx_.load(std::memory_order_acquire) == nullptr)
             {
                 auto errStr = GetSSLError_();
                 log_error("Unable to create SSL context: %s", errStr.c_str());
@@ -487,22 +487,25 @@ next_fd:
             else
             {
                 // Set up certificate validation
-                SSL_CTX_set_verify(sslCtx_, SSL_VERIFY_PEER, nullptr);
+                SSL_CTX_set_verify(sslCtx_.load(std::memory_order_acquire), SSL_VERIFY_PEER, nullptr);
 
                 // Set up root certificate locations. Note that on Windows,
                 // we use the Windows certificate store, so we need to manually
-                // import those root certificates.
+                // import those root certificates. For non-Windows platforms, we
+                // query SSL_CERT_DIR/SSL_CERT_FILE from the environment and override
+                // the default paths as needed. (OpenSSL does this for us, but LibreSSL does not,
+                // hence the need to manually query the environment here.)
 #if defined(WIN32)
                 {
                     HCERTSTORE hStore;
                     PCCERT_CONTEXT pContext = nullptr;
                     X509 *x509 = nullptr;
-                    X509_STORE *store = SSL_CTX_get_cert_store(sslCtx_);
+                    X509_STORE *store = SSL_CTX_get_cert_store(sslCtx_.load(std::memory_order_acquire));
                     
                     if (store == nullptr)
                     {
                         store = X509_STORE_new();
-                        SSL_CTX_set_cert_store(sslCtx_, store);
+                        SSL_CTX_set_cert_store(sslCtx_.load(std::memory_order_acquire), store);
                     }
 
                     hStore = CertOpenSystemStoreW(NULL, L"ROOT");
@@ -530,24 +533,45 @@ next_fd:
                     }
                 }
 #else
-                if (!SSL_CTX_set_default_verify_paths(sslCtx_))
+                if (!SSL_CTX_set_default_verify_paths(sslCtx_.load(std::memory_order_acquire)))
                 {
                     auto errStr = GetSSLError_();
                     log_warn("Unable to set TLS certificate validation paths: %s", errStr.c_str());
                 }
+
+                auto sslCertDirEnv = getenv("SSL_CERT_DIR"); // NOLINT
+                if (sslCertDirEnv != nullptr)
+                {
+                    if (!SSL_CTX_load_verify_dir(sslCtx_.load(std::memory_order_acquire), sslCertDirEnv))
+                    {
+                        auto errStr = GetSSLError_();
+                        log_warn("Unable to set TLS certificate directory: %s", errStr.c_str());
+                    }
+                }
+
+                auto sslCertFileEnv = getenv("SSL_CERT_FILE"); // NOLINT
+                if (sslCertFileEnv != nullptr)
+                {
+                    if (!SSL_CTX_load_verify_file(sslCtx_.load(std::memory_order_acquire), sslCertFileEnv))
+                    {
+                        auto errStr = GetSSLError_();
+                        log_warn("Unable to set TLS certificate file: %s", errStr.c_str());
+                    }
+                }
+
 #endif // defined(WIN32)
 
                 // Force >= TLS 1.2
-                if (!SSL_CTX_set_min_proto_version(sslCtx_, TLS1_2_VERSION)) 
+                if (!SSL_CTX_set_min_proto_version(sslCtx_.load(std::memory_order_acquire), TLS1_2_VERSION)) 
                 {
                     auto errStr = GetSSLError_();
                     log_warn("Unable to mandate minimum TLS version: %s", errStr.c_str());
                 }
 
-                ssl_ = SSL_new(sslCtx_);
+                ssl_.store(SSL_new(sslCtx_.load(std::memory_order_acquire)), std::memory_order_release);
                 assert(ssl_ != nullptr);
 
-                if (!SSL_set_fd(ssl_, (int)socket_.load(std::memory_order_acquire)))
+                if (!SSL_set_fd(ssl_.load(std::memory_order_acquire), (int)socket_.load(std::memory_order_acquire)))
                 {
                     auto errStr = GetSSLError_();
                     log_error("Unable to assign socket to SSL context: %s", errStr.c_str());
@@ -557,8 +581,8 @@ next_fd:
                 else
                 {
                     // Set hostname for SSL negotiation
-                    SSL_set_tlsext_host_name(ssl_, host_.c_str());
-                    if (!SSL_set1_host(ssl_, host_.c_str())) 
+                    SSL_set_tlsext_host_name(ssl_.load(std::memory_order_acquire), host_.c_str());
+                    if (!SSL_set1_host(ssl_.load(std::memory_order_acquire), host_.c_str())) 
                     {
                         auto errStr = GetSSLError_();
                         log_warn("Unable to assign hostname for certificate validation: %s", errStr.c_str());
@@ -566,13 +590,13 @@ next_fd:
 
                     // Attempt SSL negotiation
                     int sslRet = 0;
-                    while ((sslRet = SSL_connect(ssl_)) != 1)
+                    while ((sslRet = SSL_connect(ssl_.load(std::memory_order_acquire))) != 1)
                     {
                         fd_set writeSet;
                         fd_set readSet;
                         FD_ZERO(&writeSet);
                         FD_ZERO(&readSet);
-                        auto sslErr = SSL_get_error(ssl_, sslRet);
+                        auto sslErr = SSL_get_error(ssl_.load(std::memory_order_acquire), sslRet);
                         if (sslErr == SSL_ERROR_WANT_READ || sslErr == SSL_ERROR_WANT_WRITE)
                         {
                             // Block until we're able to continue.
@@ -584,9 +608,9 @@ next_fd:
                         }
                         else
                         {
-                            if (SSL_get_verify_result(ssl_) != X509_V_OK)
+                            if (SSL_get_verify_result(ssl_.load(std::memory_order_acquire)) != X509_V_OK)
                             {
-                                log_error("Certificate validation error: %s", X509_verify_cert_error_string(SSL_get_verify_result(ssl_)));
+                                log_error("Certificate validation error: %s", X509_verify_cert_error_string(SSL_get_verify_result(ssl_.load(std::memory_order_acquire))));
                             }
 
                             auto errStr = GetSSLError_();
@@ -674,7 +698,7 @@ void TcpConnectionHandler::disconnectImpl_(bool callHandler)
 
 #if defined(ENABLE_TLS_SUPPORT)
         auto tmpSsl = ssl_.load(std::memory_order_acquire);
-        ssl_ = nullptr;
+        ssl_.store(nullptr, std::memory_order_release);
         if (tmpSsl != nullptr) 
         {
             SSL_shutdown(tmpSsl);
@@ -729,23 +753,28 @@ void TcpConnectionHandler::sendImpl_(const char* buf, int length)
             {
                 int numWritten = 0;
 #if defined(ENABLE_TLS_SUPPORT)
-                if (usingTLS_)
+                if (usingTLS_ && ssl_.load(std::memory_order_acquire) != nullptr)
                 {
-                    while ((numWritten = SSL_write(ssl_, buf, length)) < 0)
+                    while (
+                        (ssl_.load(std::memory_order_acquire) != nullptr) &&
+                        (numWritten = SSL_write(ssl_.load(std::memory_order_acquire), buf, length)) < 0)
                     {
-                        fd_set writeSet;
                         fd_set readSet;
-                        FD_ZERO(&writeSet);
                         FD_ZERO(&readSet);
-                        auto sslErr = SSL_get_error(ssl_, numWritten);
-                        if (sslErr == SSL_ERROR_WANT_READ || sslErr == SSL_ERROR_WANT_WRITE)
+                        auto sslErr = SSL_get_error(ssl_.load(std::memory_order_acquire), numWritten);
+                        if (sslErr == SSL_ERROR_WANT_WRITE)
+                        {
+                            // Can be handled by the top level loop. Not an error.
+                            goto tryAgain;
+                        }
+                        else if (sslErr == SSL_ERROR_WANT_READ && socket_.load(std::memory_order_acquire) != INVALID_SOCKET)
                         {
                             // Block until we're able to continue.
                             auto rawSock = socket_.load(std::memory_order_acquire);
-                            if (sslErr == SSL_ERROR_WANT_READ) FD_SET(rawSock, &readSet);
-                            else FD_SET(rawSock, &writeSet);
+                            FD_SET(rawSock, &readSet);
 
-                            select(socket_.load(std::memory_order_acquire) + 1, &readSet, &writeSet, nullptr, nullptr);
+                            select(socket_.load(std::memory_order_acquire) + 1, &readSet, nullptr, nullptr, nullptr);
+                            continue;
                         }
                         else
                         {
@@ -801,6 +830,9 @@ void TcpConnectionHandler::sendImpl_(const char* buf, int length)
                     disconnectImpl_();
                 });
             }
+            continue;
+tryAgain:
+            assert(usingTLS_); // to silence warning
         }
     }
 }
@@ -825,26 +857,35 @@ void TcpConnectionHandler::receiveImpl_()
         {
             int numRead = 0;
             int numHaveRead = 0;
+#if defined(ENABLE_TLS_SUPPORT)
+            while(!usingTLS_ || ssl_.load(std::memory_order_acquire) != nullptr)
+#else
             while(true)
+#endif // defined(ENABLE_TLS_SUPPORT)
             {
 #if defined(ENABLE_TLS_SUPPORT)
-                if (usingTLS_)
+                if (usingTLS_ && ssl_.load(std::memory_order_acquire) != nullptr)
                 {
-                    while ((numRead = SSL_read(ssl_, buf, READ_SIZE_BYTES)) < 0)
+                    numRead = SSL_read(ssl_.load(std::memory_order_acquire), buf, READ_SIZE_BYTES);
+                    if (numRead < 0 && ssl_.load(std::memory_order_acquire))
                     {
                         fd_set writeSet;
-                        fd_set readSet;
                         FD_ZERO(&writeSet);
-                        FD_ZERO(&readSet);
-                        auto sslErr = SSL_get_error(ssl_, numRead);
-                        if (sslErr == SSL_ERROR_WANT_READ || sslErr == SSL_ERROR_WANT_WRITE)
+                        auto sslErr = SSL_get_error(ssl_.load(std::memory_order_acquire), numRead);
+                        if (sslErr == SSL_ERROR_WANT_READ)
                         {
-                            // Block until we're able to continue.
+                            // This case can be handled by the top-level select()
+                            // loop. Not an error.
+                            goto tryAgain;
+                        }
+                        else if (sslErr == SSL_ERROR_WANT_WRITE && socket_.load(std::memory_order_acquire) != INVALID_SOCKET)
+                        {
+                            // Block until we're able to continue writing.
                             auto rawSock = socket_.load(std::memory_order_acquire);
-                            if (sslErr == SSL_ERROR_WANT_READ) FD_SET(rawSock, &readSet);
-                            else FD_SET(rawSock, &writeSet);
+                            FD_SET(rawSock, &writeSet);
 
-                            select(socket_.load(std::memory_order_acquire) + 1, &readSet, &writeSet, nullptr, nullptr);
+                            select(socket_.load(std::memory_order_acquire) + 1, nullptr, &writeSet, nullptr, nullptr);
+                            continue;
                         }
                         else
                         {
@@ -925,6 +966,9 @@ void TcpConnectionHandler::receiveImpl_()
                 disconnectImpl_();
             });
         }
+        continue;
+tryAgain:
+        assert(usingTLS_); // silencing warning
     }
 }
 

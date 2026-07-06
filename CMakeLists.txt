@@ -50,7 +50,12 @@ include(cmake/BuildRNNoise.cmake)
 
 if(NOT DISABLE_TLS_SUPPORT)
     message(STATUS "Enabling TLS support for FreeDV Reporter")
-    add_definitions(-DENABLE_TLS_SUPPORT)
+
+    # ENABLE_TLS_SUPPORT is applied via target_compile_definitions() on fdv_util/
+    # fdv_reporting (not add_definitions() here) so it also propagates to
+    # consumers outside this subproject, like FlexTcpTask in freedv-integrations.
+    # TcpConnectionHandler's layout depends on this macro, so every TU that sees
+    # it must agree, or subclasses silently corrupt adjacent members at runtime.
 
     if(NOT USE_STATIC_LIBRESSL)
         find_package(OpenSSL)
