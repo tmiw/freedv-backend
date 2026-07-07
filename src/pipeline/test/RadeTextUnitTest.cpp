@@ -36,10 +36,13 @@
 //==========================================================================
 
 #include "../rade_text.h"
+#include "../ldpc_encode.h"
 #include "../../util/logging/ulog.h"
 
+#include <array>
 #include <cassert>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <random>
@@ -130,7 +133,7 @@ static bool test1_noiseless_callsigns()
         "AA0ZZ",     // US callsign with digit in prefix
         "N0CALL",    // 6-char callsign
         "KA1BCD",    // 6-char callsign
-        "W4XYZ567",  // 8-char max-length callsign
+        "W4XYZ56",   // 7-char max-length free-text fallback (not a valid structured callsign)
     };
 
     bool ok = true;
@@ -381,8 +384,11 @@ static bool test7_character_encoding_coverage()
         {"letters only",  "ABCDEFG"},
         {"mixed",         "W4AB123"},
         {"single char",   "K"},
-        {"8 chars",       "KA1BCDE7"},
+        {"7 chars (free text)", "7654321"},
         {"slash (portable)", "K6AQ/5"},
+        {"routing prefix",   "VK/K6AQ"},
+        {"DXpedition prefix", "VP8/G4ABC"},
+        {"mode modifier",    "JA1ABC/MM"},
     };
 
     bool ok = true;
@@ -420,7 +426,7 @@ static bool test7_character_encoding_coverage()
     // exercise multi-character combinations of punctuation, digits, letters,
     // and '/' together.
     printf("  -- grouped 8-character sweep --\n");
-    constexpr size_t MAX_CALLSIGN_LEN = 8;  // matches RADE_TEXT_MAX_LENGTH in rade_text.cpp
+    constexpr size_t MAX_CALLSIGN_LEN = 7;  // matches RADE_TEXT_FREEFORM_MAX_LENGTH in rade_text.cpp
     int group_fail = 0;
     int group_total = 0;
     for (size_t i = 0; i < allChars.size(); i += MAX_CALLSIGN_LEN) {
@@ -596,7 +602,7 @@ static bool test12_sigma07_no_false_positive()
     printf("=== Test 12: sigma=0.7 – no false-positive callsigns at marginal noise ===\n");
 
     // Test with several callsigns to cover a range of bit patterns.
-    const char* callsigns[] = {"K6AQ", "W1AW", "VK2TGP", "N0CALL", "KA1BCD", "W4XYZ567"};
+    const char* callsigns[] = {"K6AQ", "W1AW", "VK2TGP", "N0CALL", "KA1BCD", "W4XYZ56"};
     int total_wrong = 0;
     int total_cb    = 0;
     int total_pass  = 0;
@@ -674,6 +680,146 @@ static void test14_noise_sweep_diagnostic()
 }
 
 // ---------------------------------------------------------------------------
+// Test 15: Backward/forward compatibility of the format-flag placement
+//
+// rade_text.cpp now reserves message bit 55 (the very last content bit) as
+// a format flag distinguishing free-form text (0) from structured callsign
+// encoding (1). That bit was deliberately placed there -- rather than at
+// the start of the content region -- because it aliases the top bit of what
+// used to be the 8th free-text character slot, which the *original*
+// (pre-flag) 8-character encoder always left as 0 for any callsign shorter
+// than 8 characters (zero-padding). This test hand-builds messages using
+// that original scheme to verify the compatibility claim actually holds:
+//   - legacy callsigns of <=7 characters must still decode correctly
+//   - legacy callsigns that used all 8 characters must be safely rejected
+//     (no callback), not silently mis-decoded
+// ---------------------------------------------------------------------------
+
+static uint8_t legacy_char_to_ota(char c)
+{
+    if (c >= 38 && c <= 46) return (uint8_t)(c - 37);
+    if (c == '/') return 46;
+    if (c >= '0' && c <= '9') return (uint8_t)(c - '0' + 10);
+    if (c >= 'A' && c <= 'Z') return (uint8_t)(c - 'A' + 20);
+    return 0;
+}
+
+static unsigned char legacyCRC8(const char* input, int length)
+{
+    unsigned char generator = 0x1D;
+    unsigned char crc = 0x00;
+    while (length > 0) {
+        unsigned char ch = (unsigned char)*input++;
+        length--;
+        if (ch == 0) break;
+        crc ^= ch;
+        for (int i = 0; i < 8; i++) {
+            if (crc & 0x80) crc = (unsigned char)((crc << 1) ^ generator);
+            else crc <<= 1;
+        }
+    }
+    return crc;
+}
+
+// Encodes `callsign` (<=8 chars) using the ORIGINAL pre-flag-bit 8-character
+// free-text scheme (8 chars x 6 bits, no reserved/flag bit), independently
+// of rade_text.cpp's current implementation, so we can verify how the new
+// decoder handles messages from an old encoder.
+static void legacyEncode(const char* callsign, float* syms, int symSize)
+{
+    int len = (int)strlen(callsign);
+    if (len > 8) len = 8;
+    unsigned char crc = legacyCRC8(callsign, len);
+
+    std::array<uint8_t, 56> ibits{};
+    for (int i = 0; i < 8; i++) ibits[i] = (uint8_t)((crc >> i) & 1);
+    for (int charIdx = 0; charIdx < 8; charIdx++) {
+        uint8_t ota = (charIdx < len) ? legacy_char_to_ota(callsign[charIdx]) : 0;
+        for (int bit = 0; bit < 6; bit++) {
+            ibits[8 + 6 * charIdx + bit] = (uint8_t)((ota >> bit) & 1);
+        }
+    }
+
+    auto totalBits = ldpc_encode(ibits);
+
+    char tmpbits[112];
+    for (int i = 0; i < 56; i++) tmpbits[i] = (char)ibits[i];
+    for (int i = 0; i < 56; i++) tmpbits[56 + i] = (char)totalBits[56 + i];
+
+    char interleaved[112] = {0};
+    for (int index = 0; index < 56; index++) {
+        int newIndex = (37 * index) % 56;
+        interleaved[2 * newIndex] = tmpbits[2 * index];
+        interleaved[2 * newIndex + 1] = tmpbits[2 * index + 1];
+    }
+
+    for (int index = 0; index < 56; index++) {
+        char b0 = interleaved[2 * index];
+        char b1 = interleaved[2 * index + 1];
+        if (!b0 && !b1) { syms[2 * index] = 1;  syms[2 * index + 1] = 0; }
+        else if (!b0 && b1) { syms[2 * index] = 0;  syms[2 * index + 1] = 1; }
+        else if (b0 && !b1) { syms[2 * index] = 0;  syms[2 * index + 1] = -1; }
+        else { syms[2 * index] = -1; syms[2 * index + 1] = 0; }
+    }
+    for (int index = 112; index < symSize; index++) {
+        syms[index] = index % 2 ? 0 : 1;
+    }
+}
+
+static bool test15_legacy_compat()
+{
+    printf("=== Test 15: legacy 8-char scheme compatibility with new decoder ===\n");
+    bool ok = true;
+
+    // Legacy callsigns <=7 chars must still decode correctly: the old
+    // encoder zero-pads the unused tail of the 8th character slot, so bit
+    // 55 (the new flag bit) is naturally 0, matching "free text" mode.
+    const char* shortCallsigns[] = {"K6AQ", "W1AW", "ABCDEFG", "N"};
+    for (const char* cs : shortCallsigns) {
+        rade_text_t rx = rade_text_create();
+        rade_text_enable_stats_output(rx, 0);
+        RxState state;
+        rade_text_set_rx_callback(rx, onTextRx, &state);
+
+        float syms[TOTAL_FLOATS];
+        memset(syms, 0, sizeof(syms));
+        legacyEncode(cs, syms, TOTAL_FLOATS);
+        rade_text_rx(rx, syms, TOTAL_SYMS);
+
+        bool passed = (state.callCount == 1 && state.received == cs);
+        printf("  legacy short  %-10s  %s\n", cs, passed ? "PASS" : "FAIL");
+        ok &= passed;
+
+        rade_text_destroy(rx);
+    }
+
+    // Legacy callsigns using all 8 characters must be safely rejected (no
+    // callback) rather than mis-decoded, since the new decoder can only
+    // recover 7 characters worth of free text and the CRC won't match.
+    const char* fullLengthCallsigns[] = {"KA1BCDE7", "W4XYZ567"};
+    for (const char* cs : fullLengthCallsigns) {
+        rade_text_t rx = rade_text_create();
+        rade_text_enable_stats_output(rx, 0);
+        RxState state;
+        rade_text_set_rx_callback(rx, onTextRx, &state);
+
+        float syms[TOTAL_FLOATS];
+        memset(syms, 0, sizeof(syms));
+        legacyEncode(cs, syms, TOTAL_FLOATS);
+        rade_text_rx(rx, syms, TOTAL_SYMS);
+
+        bool passed = (state.callCount == 0);
+        printf("  legacy 8-char %-10s  callCount=%d  %s\n", cs, state.callCount, passed ? "PASS (safely rejected)" : "FAIL (delivered something)");
+        ok &= passed;
+
+        rade_text_destroy(rx);
+    }
+
+    printf("Legacy compatibility: %s\n\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 int main()
@@ -694,6 +840,7 @@ int main()
     success &= test12_sigma07_no_false_positive();
     success &= test13_high_noise_no_false_positive();
     test14_noise_sweep_diagnostic();   // informational, not in success
+    success &= test15_legacy_compat();
 
     printf("=== Overall: %s ===\n", success ? "PASS" : "FAIL");
     return success ? 0 : 1;
