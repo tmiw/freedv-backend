@@ -391,6 +391,50 @@ static bool test7_character_encoding_coverage()
         printf("  %-15s %-10s  %s\n", c.label, c.cs, passed ? "PASS" : "FAIL");
         ok &= passed;
     }
+
+    // Exhaustively test every individual character in the 6-bit OTA alphabet
+    // (ASCII 38-46 punctuation, '0'-'9', 'A'-'Z', and '/') round-trips on its
+    // own as a single-character string.
+    printf("  -- exhaustive single-character sweep --\n");
+    std::string allChars;
+    for (char ch = 38; ch <= 46; ch++) allChars.push_back(ch);
+    for (char ch = '0'; ch <= '9'; ch++) allChars.push_back(ch);
+    for (char ch = 'A'; ch <= 'Z'; ch++) allChars.push_back(ch);
+    allChars.push_back('/');
+
+    int single_fail = 0;
+    for (char ch : allChars) {
+        char cs[2] = { ch, 0 };
+        bool passed = roundTrip(cs);
+        if (!passed) {
+            printf("  FAIL char='%c' (0x%02X)\n", ch, (unsigned char)ch);
+            single_fail++;
+        }
+    }
+    bool singleOk = (single_fail == 0);
+    printf("  Single-character sweep: %d/%zu passed  %s\n",
+           (int)allChars.size() - single_fail, allChars.size(), singleOk ? "PASS" : "FAIL");
+    ok &= singleOk;
+
+    // Group every valid character into 8-char (max-length) strings to also
+    // exercise multi-character combinations of punctuation, digits, letters,
+    // and '/' together.
+    printf("  -- grouped 8-character sweep --\n");
+    constexpr size_t MAX_CALLSIGN_LEN = 8;  // matches RADE_TEXT_MAX_LENGTH in rade_text.cpp
+    int group_fail = 0;
+    int group_total = 0;
+    for (size_t i = 0; i < allChars.size(); i += MAX_CALLSIGN_LEN) {
+        std::string chunk = allChars.substr(i, MAX_CALLSIGN_LEN);
+        group_total++;
+        bool passed = roundTrip(chunk.c_str());
+        printf("  %-10s  %s\n", chunk.c_str(), passed ? "PASS" : "FAIL");
+        if (!passed) group_fail++;
+    }
+    bool groupOk = (group_fail == 0);
+    printf("  Grouped sweep: %d/%d passed  %s\n",
+           group_total - group_fail, group_total, groupOk ? "PASS" : "FAIL");
+    ok &= groupOk;
+
     printf("Character encoding coverage: %s\n\n", ok ? "PASS" : "FAIL");
     return ok;
 }
