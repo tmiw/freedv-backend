@@ -361,16 +361,17 @@ static bool test6_filler_symbols_no_crash()
 // Test 7: Low-level character encoding round-trip
 //         Encode callsign to OTA then decode back; check identity.
 //         This is tested indirectly through a generate→receive cycle that uses
-//         each character type: letters, digits, ASCII 38-47 punctuation.
+//         each character type: letters, digits, ASCII 38-46 punctuation, '/'.
 // ---------------------------------------------------------------------------
 static bool test7_character_encoding_coverage()
 {
     printf("=== Test 7: character encoding coverage ===\n");
 
     // Characters in the 6-bit OTA alphabet:
-    //   ASCII 38-47 ('&','\'','(',')','*','+',',','-','.','/') -> OTA 1-9  (skip 0=null)
-    //   ASCII '0'-'9'                                           -> OTA 10-19
-    //   ASCII 'A'-'Z'                                          -> OTA 20-46
+    //   ASCII 38-46 ('&','\'','(',')','*','+',',','-','.') -> OTA 1-9  (skip 0=null)
+    //   ASCII '0'-'9'                                       -> OTA 10-19
+    //   ASCII 'A'-'Z'                                      -> OTA 20-45
+    //   ASCII '/'                                          -> OTA 46
     //
     // We test a sample from each range as part of the callsign.
     // (Real callsigns only use letters and digits but the code supports the
@@ -381,6 +382,7 @@ static bool test7_character_encoding_coverage()
         {"mixed",         "W4AB123"},
         {"single char",   "K"},
         {"8 chars",       "KA1BCDE7"},
+        {"slash (portable)", "K6AQ/5"},
     };
 
     bool ok = true;

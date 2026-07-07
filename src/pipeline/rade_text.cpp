@@ -109,9 +109,10 @@ typedef struct RadeTextImpl
 
 // 6 bit character set for text field use:
 // 0: ASCII null
-// 1-9: ASCII 38-47
+// 1-9: ASCII 38-46
 // 10-19: ASCII '0'-'9'
-// 20-46: ASCII 'A'-'Z'
+// 20-45: ASCII 'A'-'Z'
+// 46: ASCII '/'
 // 47: ASCII ' '
 static void convert_callsign_to_ota_string_(const char *input, char *output, int maxLength)
 {
@@ -125,9 +126,13 @@ static void convert_callsign_to_ota_string_(const char *input, char *output, int
         if (input[index] == 0)
             break;
 
-        if (input[index] >= 38 && input[index] <= 47)
+        if (input[index] >= 38 && input[index] <= 46)
         {
             output[outidx++] = input[index] - 37;
+        }
+        else if (input[index] == '/')
+        {
+            output[outidx++] = 46;
         }
         else if (input[index] >= '0' && input[index] <= '9')
         {
@@ -165,9 +170,13 @@ static void convert_ota_string_to_callsign_(const char *input, char *output, int
         {
             output[outidx++] = input[index] - 10 + '0';
         }
-        else if (input[index] >= 20 && input[index] <= 46)
+        else if (input[index] >= 20 && input[index] <= 45)
         {
             output[outidx++] = input[index] - 20 + 'A';
+        }
+        else if (input[index] == 46)
+        {
+            output[outidx++] = '/';
         }
     }
     output[outidx] = 0;
