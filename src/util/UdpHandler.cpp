@@ -38,6 +38,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <ws2def.h>
+#include <iphlpapi.h>
 #else
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -354,7 +355,7 @@ void UdpHandler::joinMulticastGroup_(struct addrinfo* addr)
         //
         // Source: https://github.com/ntop/n2n/pull/576
         DWORD ifIndex = 0;
-        auto rv = GetBestInterface(addr->ai_addr, &ifIndex);
+        auto rv = GetBestInterface(*(IPAddr*)addr->ai_addr, &ifIndex);
         if (rv != NO_ERROR)
         {
             log_warn("Could not get best interface for multicast address (rv=%d)", (int)rv);
@@ -385,7 +386,14 @@ void UdpHandler::joinMulticastGroup_(struct addrinfo* addr)
                     if (ptr->Index == ifIndex)
                     {
                         log_info("Found best interface at address %s", ptr->IpAddressList.IpAddress.String);
-                        multicastRequest.imr_interface.s_addr = htonl(inet_addr(ptr->IpAddressList.IpAddress.String));
+                        auto ifAddr = inet_addr(ptr->IpAddressList.IpAddress.String);
+                        multicastRequest.imr_interface.s_addr = ifAddr;
+
+                        // We also need to specify IP_MULTICAST_IF too.
+                        if (setsockopt(socket_.load(std::memory_order_acquire), IPPROTO_IP, IP_MULTICAST_IF, (char*) &ifAddr, sizeof(ifAddr)) != 0) 
+                        {
+                            log_warn("Cannot join multicast group (err=%d)", WSAGetLastError());
+                        }
                         break;
                     }
                     
@@ -397,7 +405,7 @@ void UdpHandler::joinMulticastGroup_(struct addrinfo* addr)
         }
 #endif // defined(WIN32)
 
-            /* Join the multicast address */
+        /* Join the multicast address */
         if (setsockopt(socket_.load(std::memory_order_acquire), IPPROTO_IP, IP_ADD_MEMBERSHIP, (char*) &multicastRequest, sizeof(multicastRequest)) != 0) 
         {
 #if defined(WIN32)
