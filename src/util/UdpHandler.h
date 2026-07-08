@@ -62,6 +62,8 @@ private:
     void receiveImpl_();
     
     struct addrinfo* resolveIpAddress_(const char* host, int port);
+    bool isMulticastAddress_(struct addrinfo* addr);
+    void joinMulticastGroup_(struct addrinfo* addr);
 };
 
 #endif // UDP_HANDLER_H
