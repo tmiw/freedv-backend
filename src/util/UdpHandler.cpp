@@ -130,24 +130,14 @@ void UdpHandler::openImpl_(const char* sendIp, int sendPort)
     if (host_ == "")
     {
         auto addressType = AF_INET;
+        struct addrinfo* result = nullptr;
         if (sendIp != nullptr)
         {
-            struct addrinfo* result = resolveIpAddress_(sendIp, sendPort);
+            result = resolveIpAddress_(sendIp, sendPort);
             if (result != nullptr)
             {
                 addressType = result->ai_family;
 
-                // XXX (Windows): if the send address is multicast, we need to join
-                // the associated multicast group in order to not get "unreachable" errors.
-                // This theoretically shouldn't be necessary per Microsoft's own documentation
-                // but apparently Windows will use localhost for the multicast interface otherwise,
-                // causing the issue.
-                // See https://github.com/python/cpython/issues/102590 for details.
-                if (isMulticastAddress_(result))
-                {
-                    joinMulticastGroup_(result);
-                }
-                freeaddrinfo(result);
             }
         }
 
@@ -164,6 +154,21 @@ void UdpHandler::openImpl_(const char* sendIp, int sendPort)
             log_warn("cannot open socket (err=%d)", errno);
         }
 #endif // defined(WIN32)
+
+        // XXX (Windows): if the send address is multicast, we need to join
+        // the associated multicast group in order to not get "unreachable" errors.
+        // This theoretically shouldn't be necessary per Microsoft's own documentation
+        // but apparently Windows will use localhost for the multicast interface otherwise,
+        // causing the issue.
+        // See https://github.com/python/cpython/issues/102590 for details.
+        if (result != nullptr)
+        {
+            if (isMulticastAddress_(result))
+            {
+                joinMulticastGroup_(result);
+            }
+            freeaddrinfo(result);
+        }
     }
     else
     {
