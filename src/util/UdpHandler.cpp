@@ -136,6 +136,17 @@ void UdpHandler::openImpl_(const char* sendIp, int sendPort)
             if (result != nullptr)
             {
                 addressType = result->ai_family;
+
+                // XXX (Windows): if the send address is multicast, we need to join
+                // the associated multicast group in order to not get "unreachable" errors.
+                // This theoretically shouldn't be necessary per Microsoft's own documentation
+                // but apparently Windows will use localhost for the multicast interface otherwise,
+                // causing the issue.
+                // See https://github.com/python/cpython/issues/102590 for details.
+                if (isMulticastAddress_(result))
+                {
+                    joinMulticastGroup_(result);
+                }
                 freeaddrinfo(result);
             }
         }
@@ -188,12 +199,16 @@ void UdpHandler::openImpl_(const char* sendIp, int sendPort)
                 // Start receive thread
                 receiveThread_ = std::thread(std::bind(&UdpHandler::receiveImpl_, this));
             }
+
+            // Join multicast group.
+            if (isMulticastAddress_(result))
+            {
+                joinMulticastGroup_(result);
+            }
             
             freeaddrinfo(result);           /* No longer needed */
         }
     }
-    
-    // TBD - join multicast if required
 }
 
 void UdpHandler::closeImpl_()
@@ -266,4 +281,77 @@ struct addrinfo* UdpHandler::resolveIpAddress_(const char* host, int port)
     }
     
     return result;
+}
+
+bool UdpHandler::isMulticastAddress_(struct addrinfo* addr)
+{
+    if (addr->ai_family == AF_INET6)
+    {
+        auto ipv6Addr = (struct sockaddr_in6*)(addr->ai_addr);
+        return ipv6Addr->sin6_addr.s6_addr[0] == 0xFF; // ff00::/8
+    }
+    else if (addr->ai_family == AF_INET)
+    {
+        auto ipv4Addr = (struct sockaddr_in*)(addr->ai_addr);
+        auto addrAsHost = ntohl(ipv4Addr->sin_addr.s_addr);
+        return addrAsHost >= 0xE0000000 && addrAsHost <= 0xEFFFFFFF; // 224.0.0.0-239.255.255.255            
+    }
+    else
+    {
+        return false;
+    }
+}
+
+void UdpHandler::joinMulticastGroup_(struct addrinfo* addr)
+{
+    log_info("Joining multicast group");
+
+    if (addr->ai_family == AF_INET6)
+    {
+        struct ipv6_mreq multicastRequest;  /* Multicast address join structure */
+
+	    /* Specify the multicast group */
+	    memcpy(&multicastRequest.ipv6mr_multiaddr,
+		   &((struct sockaddr_in6*)(addr->ai_addr))->sin6_addr,
+		   sizeof(multicastRequest.ipv6mr_multiaddr));
+
+	    /* Accept multicast from any interface */
+	    multicastRequest.ipv6mr_interface = 0;
+
+	    /* Join the multicast address */
+	    if (setsockopt(socket_.load(std::memory_order_acquire), IPPROTO_IPV6, IPV6_JOIN_GROUP, (char*) &multicastRequest, sizeof(multicastRequest)) != 0) 
+        {
+#if defined(WIN32)
+            log_warn("Cannot join multicast group (err=%d)", WSAGetLastError());
+#else
+            log_warn("Cannot join multicast group (err=%d)", errno);
+#endif // defined(WIN32)
+	    }
+    }
+    else if (addr->ai_family == AF_INET)
+    {
+        struct ip_mreq multicastRequest;  /* Multicast address join structure */
+
+	    /* Specify the multicast group */
+	    memcpy(&multicastRequest.imr_multiaddr,
+		   &((struct sockaddr_in*)(addr->ai_addr))->sin_addr,
+		   sizeof(multicastRequest.imr_multiaddr));
+
+	    /* Accept multicast from any interface */
+	    multicastRequest.imr_interface.s_addr = htonl(INADDR_ANY);
+
+	    /* Join the multicast address */
+	    if (setsockopt(socket_.load(std::memory_order_acquire), IPPROTO_IP, IP_ADD_MEMBERSHIP, (char*) &multicastRequest, sizeof(multicastRequest)) != 0) 
+        {
+#if defined(WIN32)
+            log_warn("Cannot join multicast group (err=%d)", WSAGetLastError());
+#else
+            log_warn("Cannot join multicast group (err=%d)", errno);
+#endif // defined(WIN32)
+	    }
+    }
+    else
+    {
+        assert(0); // should not reach here
+    }
 }
