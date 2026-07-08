@@ -398,6 +398,24 @@ static bool test7_character_encoding_coverage()
         ok &= passed;
     }
 
+    // Known limitation: the routing-prefix field (before the first '/') has
+    // no digit slot, so a trailing call-district digit on the routing
+    // prefix itself (as opposed to the base callsign) can't be represented.
+    // Both examples fall back to free-form text and get truncated past 7
+    // characters. This is a deliberate, documented gap -- not asserted as a
+    // pass/fail condition -- so the suite doesn't block on it, but a status
+    // flip (in either direction) is still visible in the output.
+    printf("  -- known limitation: routing prefix + call-district digit --\n");
+    struct { const char* label; const char* cs; } knownGaps[] = {
+        {"call-area routing", "EA7/G9ZZZ"},
+        {"routing+call-area base", "3DA0/VK6AQ"},
+    };
+    for (auto& c : knownGaps) {
+        bool passed = roundTrip(c.cs);
+        printf("  %-15s %-10s  %s\n", c.label, c.cs,
+               passed ? "PASS (gap appears fixed!)" : "FAIL (known gap, expected)");
+    }
+
     // Exhaustively test every individual character in the 6-bit OTA alphabet
     // (ASCII 38-46 punctuation, '0'-'9', 'A'-'Z', and '/') round-trips on its
     // own as a single-character string.

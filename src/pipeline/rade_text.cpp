@@ -85,7 +85,10 @@ static char LastLDPCAsBits[LDPC_TOTAL_SIZE_BITS];
 //                  ROUTING_PREFIX_NONE means no routing prefix present.
 //     bits 18-27 : base_prefix_idx     (10 bits) -- the base callsign's own
 //                  prefix, e.g. the K in "K6AQ". Always a valid table index.
-//     bits 28-31 : base_digit          (4 bits)  -- 0-9
+//     bits 28-31 : base_digit          (4 bits)  -- 0-9, or DIGIT_NONE (10)
+//                  when the base prefix already ends in the DXCC entity's
+//                  own fixed digit (e.g. AH0, KH6, 9M2) and no separate
+//                  call-district digit follows it
 //     bits 32-50 : base_suffix_idx     (19 bits) -- mixed-radix index over
 //                  all 1-4 letter (A-Z) combinations, e.g. AQ in "K6AQ".
 //     bits 51-54 : modifier_idx        (4 bits)  -- optional trailing
@@ -115,7 +118,8 @@ static char LastLDPCAsBits[LDPC_TOTAL_SIZE_BITS];
 // Radio Regulations Appendix 42) as allocations change over time.
 static const char* const GENUINE_PREFIXES[] = {
     "1A0", "1C", "1P", "1S", "2D", "2E", "2I", "2J", "2M", "2U",
-    "2W", "3A", "3B6", "3B7", "3B8", "3B9", "3C", "3C0", "3D2", "3E",
+    "2W", "3A", "3B6", "3B7", "3B8", "3B9", "3C", "3C0", "3D2", "3DA",
+    "3E",
     "3F", "3G", "3V", "3W", "3X", "3Y", "3Z", "4A", "4B", "4C",
     "4D", "4E", "4F", "4G", "4H", "4I", "4J", "4K", "4L", "4M",
     "4N1", "4O", "4S", "4T", "4U", "4V", "4W", "4X", "4Z", "5A",
@@ -196,6 +200,12 @@ static const char* const GENUINE_PREFIXES[] = {
 };
 static constexpr int NUM_GENUINE_PREFIXES = sizeof(GENUINE_PREFIXES) / sizeof(GENUINE_PREFIXES[0]);
 static constexpr uint32_t ROUTING_PREFIX_NONE = (uint32_t)NUM_GENUINE_PREFIXES;  // sentinel: no routing prefix
+
+// Sentinel for base_digit: the matched base prefix already ends in the
+// DXCC entity's own fixed digit (e.g. AH0, KH6, 9M2), so no separate
+// call-district digit character follows it. Fits in the existing 4-bit
+// digit field (values 0-9 are real digits; 10-15 were previously unused).
+static constexpr uint32_t DIGIT_NONE = 10;
 
 // Trailing modifier "modes" recognized in addition to a plain "/digit".
 static const char* const MODIFIER_MODES[] = { "P", "M", "MM", "AM", "QRP" };
@@ -286,7 +296,10 @@ static int find_prefix_index(const char* s, int* matchedLen)
 }
 
 // Parses a base call with no slashes: PREFIX + single DIGIT + 1-4 LETTERS,
-// fully consuming s.
+// fully consuming s. Some table entries (AH0-9, KH0-9, 9M2, VK0, etc.) end
+// in a digit that's a fixed part of that DXCC entity's designator rather
+// than a free call-district choice -- for those, no separate digit follows
+// the prefix and DIGIT_NONE is used instead.
 static bool parse_base_call(const char* s, uint32_t* prefixIdx, uint32_t* digit, uint32_t* suffixIdx)
 {
     int plen = 0;
@@ -294,10 +307,23 @@ static bool parse_base_call(const char* s, uint32_t* prefixIdx, uint32_t* digit,
     if (idx < 0) return false;
 
     const char* rest = s + plen;
-    if (rest[0] < '0' || rest[0] > '9') return false;
-    int dig = rest[0] - '0';
+    const char* suffix;
+    uint32_t dig;
+    if (rest[0] >= '0' && rest[0] <= '9')
+    {
+        dig = (uint32_t)(rest[0] - '0');
+        suffix = rest + 1;
+    }
+    else if (GENUINE_PREFIXES[idx][plen - 1] >= '0' && GENUINE_PREFIXES[idx][plen - 1] <= '9')
+    {
+        dig = DIGIT_NONE;
+        suffix = rest;
+    }
+    else
+    {
+        return false;
+    }
 
-    const char* suffix = rest + 1;
     int slen = (int)strlen(suffix);
     if (slen < 1 || slen > 4) return false;
     for (int i = 0; i < slen; i++)
@@ -306,7 +332,7 @@ static bool parse_base_call(const char* s, uint32_t* prefixIdx, uint32_t* digit,
     }
 
     *prefixIdx = (uint32_t)idx;
-    *digit = (uint32_t)dig;
+    *digit = dig;
     *suffixIdx = suffix_to_index(suffix, slen);
     return true;
 }
@@ -407,7 +433,7 @@ static bool reconstruct_structured(uint32_t routing_idx, uint32_t base_idx, uint
                                     uint32_t suffix_idx, uint32_t modifier_idx, std::string* out)
 {
     if (base_idx >= (uint32_t)NUM_GENUINE_PREFIXES) return false;
-    if (digit > 9) return false;
+    if (digit > DIGIT_NONE) return false;
     if (suffix_idx >= SUFFIX_TOTAL_COMBOS) return false;
     if (modifier_idx > MODIFIER_NONE) return false;
     if (routing_idx != ROUTING_PREFIX_NONE && routing_idx >= (uint32_t)NUM_GENUINE_PREFIXES) return false;
@@ -419,7 +445,10 @@ static bool reconstruct_structured(uint32_t routing_idx, uint32_t base_idx, uint
         s += '/';
     }
     s += GENUINE_PREFIXES[base_idx];
-    s += (char)('0' + digit);
+    if (digit != DIGIT_NONE)
+    {
+        s += (char)('0' + digit);
+    }
 
     char letters[4];
     int slen = index_to_suffix(suffix_idx, letters);
