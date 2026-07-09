@@ -56,6 +56,15 @@
 // this many symbols; matches LDPC_TOTAL_SIZE_BITS in rade_text.cpp.
 static constexpr int CODEWORD_SYMS = 112;
 
+// rade_text_rx_symbol() spreads its rotation-sweep search across several
+// calls rather than deciding the instant the buffer fills (see
+// ROTATIONS_PER_CALL in rade_text.cpp), so tests need to feed some margin
+// of symbols beyond one codeword before a decode can complete. This margin
+// is generous enough to accommodate that internal chunk size without
+// hardcoding it here.
+static constexpr int SWEEP_MARGIN = 20;
+static constexpr int SWEEP_COMPLETE_SYMS = CODEWORD_SYMS + SWEEP_MARGIN;
+
 struct RxState {
     std::string received;
     int callCount = 0;
@@ -91,10 +100,13 @@ static void addNoiseToSyms(std::vector<float>& syms, float sigma, std::mt19937& 
 // Test helpers
 // ---------------------------------------------------------------------------
 
-// Encode callsign, optionally add noise, then stream exactly one codeword's
-// worth of symbols into a freshly created rx object (aligned to the
-// codeword boundary, so exactly one decode attempt occurs, on the last
-// symbol). Returns whether the callsign was recovered.
+// Encode callsign, optionally add noise, then stream enough symbols for the
+// rotation sweep to complete (aligned to the codeword boundary, so the
+// sweep's very first chunk contains the correct rotation) into a freshly
+// created rx object. Returns whether the callsign was recovered and every
+// delivered decode (there may be more than one -- the sweep's decision
+// plus any subsequent fallback hits on the trailing margin symbols) was
+// correct.
 static bool roundTrip(const char* callsign, float sigma = 0.0f, unsigned seed = 42)
 {
     rade_text_t tx = rade_text_create();
@@ -107,7 +119,7 @@ static bool roundTrip(const char* callsign, float sigma = 0.0f, unsigned seed = 
     rade_text_set_rx_callback(rx, onTextRx, &state);
 
     rade_text_generate_tx_string(tx, callsign, (int)strlen(callsign));
-    auto syms = pullSymbols(tx, CODEWORD_SYMS);
+    auto syms = pullSymbols(tx, SWEEP_COMPLETE_SYMS);
 
     if (sigma > 0.0f) {
         std::mt19937 rng(seed);
@@ -120,7 +132,11 @@ static bool roundTrip(const char* callsign, float sigma = 0.0f, unsigned seed = 
     rade_text_destroy(tx);
     rade_text_destroy(rx);
 
-    return state.callCount == 1 && state.received == callsign;
+    if (state.callCount < 1) return false;
+    for (auto& r : state.allReceived) {
+        if (r != callsign) return false;
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -174,10 +190,10 @@ static bool test2_lowercase_normalized()
         rade_text_set_rx_callback(rx, onTextRx, &state);
 
         rade_text_generate_tx_string(tx, c.input, (int)strlen(c.input));
-        auto syms = pullSymbols(tx, CODEWORD_SYMS);
+        auto syms = pullSymbols(tx, SWEEP_COMPLETE_SYMS);
         for (float s : syms) rade_text_rx_symbol(rx, s);
 
-        bool passed = (state.callCount == 1 && state.received == c.expected);
+        bool passed = (state.callCount >= 1 && state.received == c.expected);
         printf("  '%s' -> '%s' (expected '%s')  %s\n",
                c.input, state.received.c_str(), c.expected, passed ? "PASS" : "FAIL");
         ok &= passed;
@@ -212,7 +228,7 @@ static bool test3_heavy_noise_no_callback()
         rade_text_set_rx_callback(rx, onTextRx, &state);
 
         rade_text_generate_tx_string(tx, cs, (int)strlen(cs));
-        auto syms = pullSymbols(tx, CODEWORD_SYMS);
+        auto syms = pullSymbols(tx, SWEEP_COMPLETE_SYMS);
 
         std::mt19937 rng(seed * 1234567u);
         addNoiseToSyms(syms, 5.0f, rng);
@@ -256,9 +272,13 @@ static bool test4_crc_blocks_wrong_callsign()
         rade_text_set_rx_callback(rx, onTextRx, &state);
 
         rade_text_generate_tx_string(tx, cs, (int)strlen(cs));
-        auto syms = pullSymbols(tx, CODEWORD_SYMS);
+        auto syms = pullSymbols(tx, SWEEP_COMPLETE_SYMS);
 
-        // Negate one float inside the payload region.
+        // Negate one float inside the payload region. This lands within
+        // the first CODEWORD_SYMS symbols, which is exactly what the
+        // rotation sweep snapshots and tests -- the margin symbols beyond
+        // that are an uncorrupted continuation used only by the fallback
+        // path once the sweep completes.
         syms[flip] = -syms[flip];
 
         for (float s : syms) rade_text_rx_symbol(rx, s);
@@ -480,7 +500,7 @@ static NoiseTrialResult noiseTrials(const char* cs, float sigma,
         rade_text_set_rx_callback(rx, onTextRx, &state);
 
         rade_text_generate_tx_string(tx, cs, (int)strlen(cs));
-        auto syms = pullSymbols(tx, CODEWORD_SYMS);
+        auto syms = pullSymbols(tx, SWEEP_COMPLETE_SYMS);
 
         std::mt19937 rng(base_seed + (unsigned)t * 131071u + 3u);
         addNoiseToSyms(syms, sigma, rng);
@@ -489,8 +509,18 @@ static NoiseTrialResult noiseTrials(const char* cs, float sigma,
 
         if (state.callCount > 0) {
             r.cb_any++;
-            if (state.received == cs) r.correct++;
-            else                       r.cb_wrong++;
+
+            // A trial can now deliver more than once (the sweep's decision
+            // plus any fallback hits on the trailing margin symbols), so
+            // classify by whether *any* delivery in the trial was wrong --
+            // the safety property under test is "never let wrong content
+            // through", not just "what was the last thing delivered".
+            bool anyWrong = false;
+            for (auto& rcv : state.allReceived) {
+                if (rcv != cs) { anyWrong = true; break; }
+            }
+            if (anyWrong) r.cb_wrong++;
+            else           r.correct++;
         }
 
         rade_text_destroy(tx);
@@ -676,17 +706,24 @@ static void test14_noise_sweep_diagnostic()
 }
 
 // ---------------------------------------------------------------------------
-// Test 15: Mid-cycle join decodes on the very first opportunity.
+// Test 15: Mid-cycle join decodes without waiting for a full extra cycle.
 //
 // A receiver that starts listening partway through the repeating codeword
-// (rather than exactly at its start) must still decode as soon as it has
-// collected CODEWORD_SYMS symbols -- not after waiting for the window to
-// naturally slide back into alignment. This directly validates the
-// exhaustive-rotation-on-buffer-fill optimization in rade_text_rx_symbol().
+// (rather than exactly at its start) must still decode well within one
+// extra cycle -- not after waiting up to another full CODEWORD_SYMS-symbol
+// cycle for the window to naturally slide back into alignment. This
+// directly validates the rotation-sweep optimization in
+// rade_text_rx_symbol(), which -- since it spreads its rotation search
+// across several calls rather than testing everything the instant the
+// buffer fills (to bound the real-time cost added to any single modem
+// frame) -- completes slightly after CODEWORD_SYMS symbols rather than
+// exactly at CODEWORD_SYMS. SWEEP_COMPLETE_SYMS gives it enough room to
+// finish regardless of the internal chunk size, without hardcoding that
+// size here.
 // ---------------------------------------------------------------------------
 static bool test15_rotated_first_shot()
 {
-    printf("=== Test 15: mid-cycle join decodes on first opportunity ===\n");
+    printf("=== Test 15: mid-cycle join decodes without a full extra cycle ===\n");
 
     bool ok = true;
     const char* cs = "K6AQ";
@@ -709,17 +746,31 @@ static bool test15_rotated_first_shot()
 
         // Simulate joining `off` symbols into the cycle: feed the
         // cyclically-rotated sequence a real receiver would see instead
-        // of the one starting at the codeword's logical position 0.
-        std::vector<float> rotatedSyms(CODEWORD_SYMS);
-        for (int i = 0; i < CODEWORD_SYMS; i++)
+        // of the one starting at the codeword's logical position 0. Feed
+        // enough total symbols (beyond one cycle) for the rotation sweep
+        // to complete; `syms` is periodic with period CODEWORD_SYMS so
+        // indexing with `% CODEWORD_SYMS` extends it seamlessly.
+        std::vector<float> rotatedSyms(SWEEP_COMPLETE_SYMS);
+        for (int i = 0; i < SWEEP_COMPLETE_SYMS; i++)
             rotatedSyms[i] = syms[(i + off) % CODEWORD_SYMS];
 
         for (float s : rotatedSyms) rade_text_rx_symbol(rx, s);
 
-        // Exactly CODEWORD_SYMS symbols were fed -- the theoretical floor.
-        // A pass here means the decode succeeded with zero extra symbols
-        // beyond that floor, regardless of join offset.
-        bool passed = (state.callCount == 1 && state.received == cs);
+        // A pass here means the decode succeeded well within one extra
+        // cycle of the theoretical CODEWORD_SYMS floor, regardless of join
+        // offset -- i.e. via the rotation sweep, not the natural-alignment
+        // fallback (which could take up to another full cycle on its own).
+        // Feeding SWEEP_MARGIN extra symbols past sweep completion can let
+        // the (now-active) fallback also hit a naturally-aligned window
+        // and deliver a second, redundant-but-correct decode -- that's
+        // expected given this test's earlier-established "fire on every
+        // successful decode" callback policy, not a failure, so this
+        // checks "at least one delivery, all of them correct" rather than
+        // requiring exactly one.
+        bool passed = (state.callCount >= 1);
+        for (auto& r : state.allReceived) {
+            if (r != cs) passed = false;
+        }
         printf("  offset=%-4d  callCount=%d  received='%s'  %s\n",
                off, state.callCount, state.received.c_str(), passed ? "PASS" : "FAIL");
         ok &= passed;

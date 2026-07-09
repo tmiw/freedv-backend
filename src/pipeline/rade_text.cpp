@@ -74,10 +74,22 @@ typedef struct RadeTextImpl
     // transmitter repeats the same codeword back-to-back with no framing,
     // this acts as a sliding decode window -- exactly one out of every
     // LDPC_TOTAL_SIZE_BITS consecutive windows is codeword-aligned, so a
-    // decode is attempted on every new symbol.
+    // decode is attempted on every new symbol once no rotation sweep (see
+    // below) is in progress.
     float rx_circular_buf[LDPC_TOTAL_SIZE_BITS];
     int rx_write_idx;
     int rx_filled;
+
+    // Rotation-sweep state. When the circular buffer first fills, its
+    // contents are frozen into rx_sweep_snapshot and swept for a
+    // codeword-aligned rotation a few candidates at a time across
+    // subsequent calls, rather than testing all LDPC_TOTAL_SIZE_BITS
+    // rotations in one call (see rade_text_rx_symbol()). rx_sweep_next_rot
+    // == LDPC_TOTAL_SIZE_BITS means no sweep is pending or in progress.
+    float rx_sweep_snapshot[LDPC_TOTAL_SIZE_BITS];
+    int rx_sweep_next_rot;
+    int rx_sweep_num_candidates;
+    char rx_sweep_winner[RADE_TEXT_MAX_RAW_LENGTH + 1];
 
     float inbound_pending_syms[LDPC_TOTAL_SIZE_BITS];
     float inbound_pending_amps[LDPC_TOTAL_SIZE_BITS];
@@ -90,10 +102,14 @@ typedef struct RadeTextImpl
         , tx_symbol_index(0)
         , rx_write_idx(0)
         , rx_filled(0)
+        , rx_sweep_next_rot(LDPC_TOTAL_SIZE_BITS)
+        , rx_sweep_num_candidates(0)
         , enableStats(1)
     {
         memset(tx_text, 0, LDPC_TOTAL_SIZE_BITS);
         memset(rx_circular_buf, 0, sizeof(rx_circular_buf));
+        memset(rx_sweep_snapshot, 0, sizeof(rx_sweep_snapshot));
+        memset(rx_sweep_winner, 0, sizeof(rx_sweep_winner));
         memset(inbound_pending_syms, 0, sizeof(float) * LDPC_TOTAL_SIZE_BITS);
         memset(inbound_pending_amps, 0, sizeof(float) * LDPC_TOTAL_SIZE_BITS);
     }
@@ -104,10 +120,14 @@ typedef struct RadeTextImpl
         , tx_symbol_index(rhs.tx_symbol_index)
         , rx_write_idx(rhs.rx_write_idx)
         , rx_filled(rhs.rx_filled)
+        , rx_sweep_next_rot(rhs.rx_sweep_next_rot)
+        , rx_sweep_num_candidates(rhs.rx_sweep_num_candidates)
         , enableStats(rhs.enableStats)
     {
         memcpy(tx_text, rhs.tx_text, LDPC_TOTAL_SIZE_BITS);
         memcpy(rx_circular_buf, rhs.rx_circular_buf, sizeof(rx_circular_buf));
+        memcpy(rx_sweep_snapshot, rhs.rx_sweep_snapshot, sizeof(rx_sweep_snapshot));
+        memcpy(rx_sweep_winner, rhs.rx_sweep_winner, sizeof(rx_sweep_winner));
         memcpy(inbound_pending_syms, rhs.inbound_pending_syms, sizeof(float) * LDPC_TOTAL_SIZE_BITS);
         memcpy(inbound_pending_amps, rhs.inbound_pending_amps, sizeof(float) * LDPC_TOTAL_SIZE_BITS);
     }
@@ -115,6 +135,15 @@ typedef struct RadeTextImpl
     RadeTextImpl(RadeTextImpl&&) noexcept = delete;
 
 } rade_text_impl_t;
+
+// Number of candidate rotations tried per rade_text_rx_symbol() call while a
+// sweep is in progress. At roughly 1ms per LDPC decode attempt, 8 per call
+// bounds the extra work added to a single ~40ms modem-frame callback to
+// roughly 8ms, well short of a real-time budget concern, while still
+// completing a full LDPC_TOTAL_SIZE_BITS-rotation sweep in ~14 frames
+// (~560ms) -- far faster than waiting for the naturally-sliding window to
+// cover the same ground (up to another full ~4.48s cycle).
+static constexpr int ROTATIONS_PER_CALL = 8;
 
 // 6 bit character set for text field use:
 // 0: ASCII null
@@ -453,51 +482,68 @@ void rade_text_rx_symbol(rade_text_t ptr, float sym)
         // codeword continuously with no framing, so this single buffer
         // already holds full information about it -- it's simply a
         // cyclic rotation of the true codeword by however far into the
-        // cycle we happened to start listening. Try every rotation now
-        // (cheap: LDPC_TOTAL_SIZE_BITS tiny LDPC decodes) instead of
-        // waiting up to another full cycle for the "naturally" aligned
-        // window to slide into place.
+        // cycle we happened to start listening. Freeze it and start
+        // sweeping rotations a few at a time on each subsequent call
+        // (see ROTATIONS_PER_CALL) instead of waiting up to another full
+        // cycle for the "naturally" aligned window to slide into place --
+        // and instead of testing all LDPC_TOTAL_SIZE_BITS rotations in
+        // this single call, which would block this real-time callback for
+        // roughly LDPC_TOTAL_SIZE_BITS decode attempts back to back.
+        memcpy(obj->rx_sweep_snapshot, window, sizeof(obj->rx_sweep_snapshot));
+        obj->rx_sweep_next_rot = 0;
+        obj->rx_sweep_num_candidates = 0;
+    }
+
+    if (obj->rx_sweep_next_rot < LDPC_TOTAL_SIZE_BITS)
+    {
+        // A sweep is in progress: test the next chunk of rotations of the
+        // frozen snapshot.
         //
         // Testing this many hypotheses against the same noisy sample set
-        // in one shot measurably raises the chance that CRC's ~1/256
-        // false-accept rate lets a wrong rotation slip through somewhere
-        // in the batch (unlike the fallback below, which only ever tests
-        // one hypothesis at a time). Guard against that by requiring a
-        // *unique* winner across the whole batch -- if the batch is
-        // ambiguous (zero or more than one candidate converges and passes
-        // CRC), don't deliver anything and let the fallback below keep
-        // trying on fresh data from subsequent symbols instead of
-        // guessing.
+        // (just spread out over several calls rather than all at once)
+        // measurably raises the chance that CRC's ~1/256 false-accept rate
+        // lets a wrong rotation slip through somewhere in the sweep
+        // (unlike the fallback below, which only ever tests one hypothesis
+        // at a time on fresh data). Guard against that by requiring a
+        // *unique* winner across the *entire* sweep, not just the current
+        // chunk -- the accept/reject decision is deferred until all
+        // LDPC_TOTAL_SIZE_BITS rotations have been tried.
         float rotated[LDPC_TOTAL_SIZE_BITS];
-        char winnerStr[RADE_TEXT_MAX_RAW_LENGTH + 1];
-        int numCandidates = 0;
+        int chunkEnd = std::min(obj->rx_sweep_next_rot + ROTATIONS_PER_CALL, LDPC_TOTAL_SIZE_BITS);
 
-        for (int rot = 0; rot < LDPC_TOTAL_SIZE_BITS; rot++)
+        for (; obj->rx_sweep_next_rot < chunkEnd; obj->rx_sweep_next_rot++)
         {
+            int rot = obj->rx_sweep_next_rot;
             for (int index = 0; index < LDPC_TOTAL_SIZE_BITS; index++)
             {
-                rotated[index] = window[(index + rot) % LDPC_TOTAL_SIZE_BITS];
+                rotated[index] = obj->rx_sweep_snapshot[(index + rot) % LDPC_TOTAL_SIZE_BITS];
             }
 
             char candidateStr[RADE_TEXT_MAX_RAW_LENGTH + 1];
             if (rade_text_try_decode_(obj, rotated, candidateStr))
             {
-                numCandidates++;
-                memcpy(winnerStr, candidateStr, sizeof(winnerStr));
+                obj->rx_sweep_num_candidates++;
+                memcpy(obj->rx_sweep_winner, candidateStr, sizeof(obj->rx_sweep_winner));
             }
         }
 
-        if (numCandidates == 1 && obj->text_rx_callback)
+        if (obj->rx_sweep_next_rot == LDPC_TOTAL_SIZE_BITS)
         {
-            log_info("decodedStr: %s", winnerStr);
-            obj->text_rx_callback(obj, winnerStr, strlen(winnerStr), obj->callback_state);
+            // Sweep complete -- deliver only if there was a unique winner
+            // across the whole thing.
+            if (obj->rx_sweep_num_candidates == 1 && obj->text_rx_callback)
+            {
+                log_info("decodedStr: %s", obj->rx_sweep_winner);
+                obj->text_rx_callback(obj, obj->rx_sweep_winner, strlen(obj->rx_sweep_winner), obj->callback_state);
+            }
         }
     }
     else
     {
-        // Fallback: keep testing the naturally-sliding window on every
-        // new symbol, in case noise caused every rotation tried above (or
-        // since) to fail to converge/validate.
+        // No sweep pending or in progress: fall back to testing the
+        // naturally-sliding window on every new symbol, in case noise
+        // caused every rotation tried during the sweep (or since) to fail
+        // to converge/validate.
         rade_text_try_decode_and_deliver_(obj, window);
     }
 }
