@@ -40,6 +40,7 @@
 #include <cstring>
 #include <array>
 #include <random>
+#include <string>
 
 // Map codeword bits to BPSK symbols (bit 0 -> +1, bit 1 -> -1).
 static void bits_to_bpsk(const std::array<uint8_t,112>& bits, float syms[112])
@@ -102,13 +103,21 @@ int main()
     }
 
     // --- Test 2: frame error rate sweep over Eb/N0 ---
+    //
+    // Swept down into negative Eb/N0 (i.e. lower SNR / higher noise than the
+    // code was originally characterized at) to find the actual waterfall
+    // floor for BPSK, so it can be compared against the QPSK-era floor.
     printf("=== Test 2: frame error rate vs Eb/N0 ===\n");
     printf("%6s  %6s  %6s  %6s  %6s\n", "Eb/N0", "FER", "iters", "conv", "conv_err");
 
     std::mt19937 rng(1234);
-    const int FRAMES = 200;
+    const int FRAMES = 500;
 
-    for (float ebn0_db : {0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f, 9.0f, 10.0f}) {
+    float waterfall_fer10 = NAN;  // lowest Eb/N0 with FER <= 0.10
+    float waterfall_fer01 = NAN;  // lowest Eb/N0 with FER <= 0.01
+
+    for (float ebn0_db : {-6.0f, -5.0f, -4.0f, -3.0f, -2.0f, -1.0f,
+                           0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f, 9.0f, 10.0f}) {
         // Rate-1/2 BPSK: per-symbol noise variance sigma^2 = 1 / (2 * Eb/N0 * rate)
         float ebn0   = std::pow(10.0f, ebn0_db / 10.0f);
         float sigma2 = 1.0f / (2.0f * ebn0);
@@ -142,12 +151,18 @@ int main()
             }
         }
 
+        float fer = (float)frame_errors / FRAMES;
         printf("%6.1f  %6.3f    %4.1f   %5d  %8d\n",
-               ebn0_db,
-               (float)frame_errors / FRAMES,
-               total_iters / FRAMES,
-               conv, frame_errors_conv);
+               ebn0_db, fer, total_iters / FRAMES, conv, frame_errors_conv);
+
+        if (std::isnan(waterfall_fer10) && fer <= 0.10f) waterfall_fer10 = ebn0_db;
+        if (std::isnan(waterfall_fer01) && fer <= 0.01f) waterfall_fer01 = ebn0_db;
     }
+
+    printf("Lowest Eb/N0 with FER<=0.10: %s\n",
+           std::isnan(waterfall_fer10) ? "none in range" : (std::to_string(waterfall_fer10) + " dB").c_str());
+    printf("Lowest Eb/N0 with FER<=0.01: %s\n\n",
+           std::isnan(waterfall_fer01) ? "none in range" : (std::to_string(waterfall_fer01) + " dB").c_str());
 
     // --- Test 3: LLR sign check for both BPSK constellation points ---
     //
