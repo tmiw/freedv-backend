@@ -322,9 +322,13 @@ static int rade_text_ldpc_decode(rade_text_impl_t *obj, char *dest, const float 
         log_debug("Coded Tbits: %6d Terr: %6d BER: %4.3f", bitsCoded, errorsCoded, coded_ber);
     }
 
-    log_debug("decode converged: %d", decodeResult.converged);
     if (decodeResult.converged)
     {
+        // Only log convergence, not every failed attempt -- with the
+        // exhaustive rotation search trying up to LDPC_TOTAL_SIZE_BITS
+        // candidates in one burst, the vast majority fail to converge and
+        // logging each one would flood the log for no diagnostic value.
+        log_debug("decode converged: %d", decodeResult.converged);
         memset(dest, 0, RADE_TEXT_BYTES_PER_ENCODED_SEGMENT);
 
         for (int bitIndex = 0; bitIndex < 8; bitIndex++)
@@ -340,7 +344,75 @@ static int rade_text_ldpc_decode(rade_text_impl_t *obj, char *dest, const float 
         }
     }
 
-    return decodeResult.converged;
+    // Require fast, clean convergence, not just "converged eventually".
+    // A genuinely aligned codeword at workable SNR typically satisfies all
+    // parity checks within a handful of belief-propagation iterations;
+    // requiring this as well as CRC agreement adds a second, independent
+    // filter against the exhaustive rotation search's larger hypothesis
+    // count occasionally letting a spurious (misaligned or noise-induced)
+    // candidate slip past CRC's ~1-in-256 false-accept rate alone.
+    constexpr int MAX_CONFIDENT_ITERATIONS = 10;
+    return decodeResult.converged && decodeResult.iterations <= MAX_CONFIDENT_ITERATIONS;
+}
+
+// Attempts a decode of a single candidate 112-symbol window (in codeword
+// bit order, i.e. already assumed correctly rotated). Returns true if it
+// converges and passes CRC, filling outStr (caller-supplied buffer of at
+// least RADE_TEXT_MAX_LENGTH+1 bytes) with the decoded content. Does NOT
+// invoke the RX callback -- callers decide whether/when to deliver it.
+static bool rade_text_try_decode_(rade_text_impl_t *obj, float *window, char *outStr)
+{
+    // Deinterleave received symbols.
+    deinterleave_syms(obj->inbound_pending_syms, window, LDPC_TOTAL_SIZE_BITS);
+
+    // Copy over symbols prior to decode.
+    for (int index = 0; index < LDPC_TOTAL_SIZE_BITS; index++)
+    {
+        float *s = &obj->inbound_pending_syms[index];
+        float sym_amp = std::fabs(*s);
+        *s /= sym_amp;
+        obj->inbound_pending_amps[index] = sym_amp;
+    }
+
+    char rawStr[RADE_TEXT_MAX_RAW_LENGTH + 1];
+    memset(rawStr, 0, RADE_TEXT_MAX_RAW_LENGTH + 1);
+
+    if (rade_text_ldpc_decode(obj, rawStr, window) == 0)
+    {
+        return false;
+    }
+
+    char decodedStr[RADE_TEXT_MAX_RAW_LENGTH + 1];
+    memset(decodedStr, 0, RADE_TEXT_MAX_RAW_LENGTH + 1);
+    convert_ota_string_to_callsign_(&rawStr[RADE_TEXT_CRC_LENGTH], &decodedStr[RADE_TEXT_CRC_LENGTH],
+                                    RADE_TEXT_MAX_LENGTH);
+    decodedStr[0] = rawStr[0]; // CRC
+
+    // Get expected and actual CRC.
+    unsigned char receivedCRC = decodedStr[0];
+    unsigned char calcCRC = calculateCRC8_(&rawStr[RADE_TEXT_CRC_LENGTH], RADE_TEXT_MAX_LENGTH);
+
+    if (receivedCRC != calcCRC)
+    {
+        return false;
+    }
+
+    memcpy(outStr, &decodedStr[RADE_TEXT_CRC_LENGTH], RADE_TEXT_MAX_LENGTH + 1);
+    return true;
+}
+
+// Attempts a decode of a single candidate window and delivers it via the
+// RX callback immediately if it converges and passes CRC.
+static void rade_text_try_decode_and_deliver_(rade_text_impl_t *obj, float *window)
+{
+    char decodedStr[RADE_TEXT_MAX_RAW_LENGTH + 1];
+    if (rade_text_try_decode_(obj, window, decodedStr) && obj->text_rx_callback)
+    {
+        log_info("decodedStr: %s", decodedStr);
+
+        // We got a valid string. Call assigned callback.
+        obj->text_rx_callback(obj, decodedStr, strlen(decodedStr), obj->callback_state);
+    }
 }
 
 /* Feed one streamed soft-decision symbol from the RADE decoder. */
@@ -351,9 +423,14 @@ void rade_text_rx_symbol(rade_text_t ptr, float sym)
 
     obj->rx_circular_buf[obj->rx_write_idx] = sym;
     obj->rx_write_idx = (obj->rx_write_idx + 1) % LDPC_TOTAL_SIZE_BITS;
+
+    // Tracks whether this call is the one that completes the buffer for
+    // the first time (rx_filled reaching LDPC_TOTAL_SIZE_BITS).
+    bool justFilled = false;
     if (obj->rx_filled < LDPC_TOTAL_SIZE_BITS)
     {
         obj->rx_filled++;
+        justFilled = (obj->rx_filled == LDPC_TOTAL_SIZE_BITS);
     }
 
     if (obj->rx_filled < LDPC_TOTAL_SIZE_BITS)
@@ -370,46 +447,58 @@ void rade_text_rx_symbol(rade_text_t ptr, float sym)
         window[index] = obj->rx_circular_buf[(obj->rx_write_idx + index) % LDPC_TOTAL_SIZE_BITS];
     }
 
-    // Deinterleave received symbols.
-    deinterleave_syms(obj->inbound_pending_syms, window, LDPC_TOTAL_SIZE_BITS);
-
-    // Copy over symbols prior to decode.
-    for (int index = 0; index < LDPC_TOTAL_SIZE_BITS; index++)
+    if (justFilled)
     {
-        float *s = &obj->inbound_pending_syms[index];
-        float sym_amp = std::fabs(*s);
-        *s /= sym_amp;
-        obj->inbound_pending_amps[index] = sym_amp;
-    }
+        // First opportunity to decode. The transmitter repeats the same
+        // codeword continuously with no framing, so this single buffer
+        // already holds full information about it -- it's simply a
+        // cyclic rotation of the true codeword by however far into the
+        // cycle we happened to start listening. Try every rotation now
+        // (cheap: LDPC_TOTAL_SIZE_BITS tiny LDPC decodes) instead of
+        // waiting up to another full cycle for the "naturally" aligned
+        // window to slide into place.
+        //
+        // Testing this many hypotheses against the same noisy sample set
+        // in one shot measurably raises the chance that CRC's ~1/256
+        // false-accept rate lets a wrong rotation slip through somewhere
+        // in the batch (unlike the fallback below, which only ever tests
+        // one hypothesis at a time). Guard against that by requiring a
+        // *unique* winner across the whole batch -- if the batch is
+        // ambiguous (zero or more than one candidate converges and passes
+        // CRC), don't deliver anything and let the fallback below keep
+        // trying on fresh data from subsequent symbols instead of
+        // guessing.
+        float rotated[LDPC_TOTAL_SIZE_BITS];
+        char winnerStr[RADE_TEXT_MAX_RAW_LENGTH + 1];
+        int numCandidates = 0;
 
-    // Attempt a decode of the current window. Since the transmitter repeats
-    // the same codeword continuously with no framing, this window is only
-    // codeword-aligned once every LDPC_TOTAL_SIZE_BITS attempts; misaligned
-    // windows are expected to simply fail to converge.
-    char decodedStr[RADE_TEXT_MAX_RAW_LENGTH + 1];
-    char rawStr[RADE_TEXT_MAX_RAW_LENGTH + 1];
-    memset(rawStr, 0, RADE_TEXT_MAX_RAW_LENGTH + 1);
-    memset(decodedStr, 0, RADE_TEXT_MAX_RAW_LENGTH + 1);
-
-    if (rade_text_ldpc_decode(obj, rawStr, window) != 0)
-    {
-        // BER is under limits.
-        convert_ota_string_to_callsign_(&rawStr[RADE_TEXT_CRC_LENGTH], &decodedStr[RADE_TEXT_CRC_LENGTH],
-                                        RADE_TEXT_MAX_LENGTH);
-        decodedStr[0] = rawStr[0]; // CRC
-
-        // Get expected and actual CRC.
-        unsigned char receivedCRC = decodedStr[0];
-        unsigned char calcCRC = calculateCRC8_(&rawStr[RADE_TEXT_CRC_LENGTH], RADE_TEXT_MAX_LENGTH);
-
-        if (receivedCRC == calcCRC && obj->text_rx_callback)
+        for (int rot = 0; rot < LDPC_TOTAL_SIZE_BITS; rot++)
         {
-            log_info("rxCRC: %d, calcCRC: %d, decodedStr: %s", receivedCRC, calcCRC, &decodedStr[RADE_TEXT_CRC_LENGTH]);
+            for (int index = 0; index < LDPC_TOTAL_SIZE_BITS; index++)
+            {
+                rotated[index] = window[(index + rot) % LDPC_TOTAL_SIZE_BITS];
+            }
 
-            // We got a valid string. Call assigned callback.
-            obj->text_rx_callback(obj, &decodedStr[RADE_TEXT_CRC_LENGTH], strlen(&decodedStr[RADE_TEXT_CRC_LENGTH]),
-                                  obj->callback_state);
+            char candidateStr[RADE_TEXT_MAX_RAW_LENGTH + 1];
+            if (rade_text_try_decode_(obj, rotated, candidateStr))
+            {
+                numCandidates++;
+                memcpy(winnerStr, candidateStr, sizeof(winnerStr));
+            }
         }
+
+        if (numCandidates == 1 && obj->text_rx_callback)
+        {
+            log_info("decodedStr: %s", winnerStr);
+            obj->text_rx_callback(obj, winnerStr, strlen(winnerStr), obj->callback_state);
+        }
+    }
+    else
+    {
+        // Fallback: keep testing the naturally-sliding window on every
+        // new symbol, in case noise caused every rotation tried above (or
+        // since) to fail to converge/validate.
+        rade_text_try_decode_and_deliver_(obj, window);
     }
 }
 
