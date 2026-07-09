@@ -340,29 +340,29 @@ static int rade_text_ldpc_decode(rade_text_impl_t *obj, char *dest, const float 
 
     auto decodeResult = ldpc_decode(obj->inbound_pending_syms, obj->inbound_pending_amps, sigma2, MAX_CONFIDENT_ITERATIONS);
 
-    if (obj->enableStats)
-    {
-        // Calculate coded BER.
-        int bitsCoded = 0;
-        int errorsCoded = 0;
-        for (int index = 0; index < LDPC_TOTAL_SIZE_BITS / 2; index++)
-        {
-            bitsCoded++;
-            int err = LastLDPCAsBits[index] != decodeResult.message[index];
-            if (err)
-            {
-                errorsCoded++;
-            }
-        }
-
-        log_debug("noise var: %f", sigma2);
-        log_debug("Raw Tbits:   %6d Terr: %6d BER: %4.3f", bitsRaw, errorsRaw, (float)errorsRaw / (bitsRaw + 1E-12));
-        float coded_ber = (float)errorsCoded / (bitsCoded + 1E-12);
-        log_debug("Coded Tbits: %6d Terr: %6d BER: %4.3f", bitsCoded, errorsCoded, coded_ber);
-    }
-
     if (decodeResult.converged)
     {
+        if (obj->enableStats)
+        {
+            // Calculate coded BER.
+            int bitsCoded = 0;
+            int errorsCoded = 0;
+            for (int index = 0; index < LDPC_TOTAL_SIZE_BITS / 2; index++)
+            {
+                bitsCoded++;
+                int err = LastLDPCAsBits[index] != decodeResult.message[index];
+                if (err)
+                {
+                    errorsCoded++;
+                }
+            }
+
+            log_debug("noise var: %f", sigma2);
+            log_debug("Raw Tbits:   %6d Terr: %6d BER: %4.3f", bitsRaw, errorsRaw, (float)errorsRaw / (bitsRaw + 1E-12));
+            float coded_ber = (float)errorsCoded / (bitsCoded + 1E-12);
+            log_debug("Coded Tbits: %6d Terr: %6d BER: %4.3f", bitsCoded, errorsCoded, coded_ber);
+        }
+
         // Only log convergence, not every failed attempt -- with the
         // exhaustive rotation search trying up to LDPC_TOTAL_SIZE_BITS
         // candidates in one burst, the vast majority fail to converge and
