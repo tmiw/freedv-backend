@@ -222,7 +222,7 @@ short* RADEReceiveStep::execute(short* inputSamples, int numInputSamples, int* n
             FREEDV_BEGIN_REALTIME_UNSAFE
 
             // Handle RX of bits from EOO.
-            rade_text_rx(textPtr_, eooOut_, rade_n_eoo_bits(dv_) / 2);
+            rade_text_rx(textPtr_, eooOut_, rade_n_eoo_bits(dv_));
 
             FREEDV_END_REALTIME_UNSAFE
         }
