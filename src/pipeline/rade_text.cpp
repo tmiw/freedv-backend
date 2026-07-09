@@ -64,28 +64,36 @@ typedef struct RadeTextImpl
     on_text_rx_t text_rx_callback;
     void *callback_state;
 
+    // TX streaming state: interleaved codeword bits (0/1), looped
+    // continuously by rade_text_tx_next_symbol() one bit per call.
     char tx_text[LDPC_TOTAL_SIZE_BITS];
-    int tx_text_index;
-    int tx_text_length;
+    int tx_symbol_index;
+
+    // RX streaming state: circular buffer holding the most recent
+    // LDPC_TOTAL_SIZE_BITS soft-decision symbols in arrival order. Since the
+    // transmitter repeats the same codeword back-to-back with no framing,
+    // this acts as a sliding decode window -- exactly one out of every
+    // LDPC_TOTAL_SIZE_BITS consecutive windows is codeword-aligned, so a
+    // decode is attempted on every new symbol.
+    float rx_circular_buf[LDPC_TOTAL_SIZE_BITS];
+    int rx_write_idx;
+    int rx_filled;
 
     float inbound_pending_syms[LDPC_TOTAL_SIZE_BITS];
     float inbound_pending_amps[LDPC_TOTAL_SIZE_BITS];
 
     int enableStats;
 
-    int unusedEooBitCount;
-    int unusedEooErrCount;
-
     RadeTextImpl()
         : text_rx_callback(nullptr)
         , callback_state(nullptr)
-        , tx_text_index(0)
-        , tx_text_length(0)
+        , tx_symbol_index(0)
+        , rx_write_idx(0)
+        , rx_filled(0)
         , enableStats(1)
-        , unusedEooBitCount(0)
-        , unusedEooErrCount(0)
     {
         memset(tx_text, 0, LDPC_TOTAL_SIZE_BITS);
+        memset(rx_circular_buf, 0, sizeof(rx_circular_buf));
         memset(inbound_pending_syms, 0, sizeof(float) * LDPC_TOTAL_SIZE_BITS);
         memset(inbound_pending_amps, 0, sizeof(float) * LDPC_TOTAL_SIZE_BITS);
     }
@@ -93,13 +101,13 @@ typedef struct RadeTextImpl
     RadeTextImpl(const RadeTextImpl& rhs)
         : text_rx_callback(rhs.text_rx_callback)
         , callback_state(rhs.callback_state)
-        , tx_text_index(rhs.tx_text_index)
-        , tx_text_length(rhs.tx_text_length)
+        , tx_symbol_index(rhs.tx_symbol_index)
+        , rx_write_idx(rhs.rx_write_idx)
+        , rx_filled(rhs.rx_filled)
         , enableStats(rhs.enableStats)
-        , unusedEooBitCount(rhs.unusedEooBitCount)
-        , unusedEooErrCount(rhs.unusedEooErrCount)
     {
         memcpy(tx_text, rhs.tx_text, LDPC_TOTAL_SIZE_BITS);
+        memcpy(rx_circular_buf, rhs.rx_circular_buf, sizeof(rx_circular_buf));
         memcpy(inbound_pending_syms, rhs.inbound_pending_syms, sizeof(float) * LDPC_TOTAL_SIZE_BITS);
         memcpy(inbound_pending_amps, rhs.inbound_pending_amps, sizeof(float) * LDPC_TOTAL_SIZE_BITS);
     }
@@ -237,29 +245,49 @@ static void interleave_bits(char* out, char* in, int bits)
     }
 }
 
-static int rade_text_ldpc_decode(rade_text_impl_t *obj, char *dest, float meanAmplitude, float noiseVar)
+// Estimates AWGN noise variance from the spread of received symbol
+// magnitudes around their mean. There are no known pilot/filler symbols in
+// the streaming data channel (unlike the old EOO frame), so this is an
+// approximation rather than a direct measurement; it only needs to be in
+// the right ballpark since belief propagation is fairly tolerant of
+// imprecise LLR scaling, and mis-aligned decode windows (111 out of every
+// 112 attempts) fail the syndrome check regardless of noise_var.
+static float rade_text_estimate_noise_var_(const float *window, int n)
+{
+    float meanAmp = 0.0f;
+    for (int index = 0; index < n; index++)
+    {
+        meanAmp += std::fabs(window[index]);
+    }
+    meanAmp /= n;
+
+    float var = 0.0f;
+    for (int index = 0; index < n; index++)
+    {
+        float d = std::fabs(window[index]) - meanAmp;
+        var += d * d;
+    }
+    var /= std::max(n - 1, 1);
+
+    return var;
+}
+
+static int rade_text_ldpc_decode(rade_text_impl_t *obj, char *dest, const float *window)
 {
     assert(obj != NULL);
     assert(dest != NULL);
+    assert(window != NULL);
 
-    // Calculate raw BER.
+    // Calculate raw BER. Only meaningful when this process also generated
+    // the text being decoded (e.g. self-loopback testing), since
+    // LastEncodedLDPC/LastLDPCAsBits reflect this process's own last TX.
     int bitsRaw = 0;
     int errorsRaw = 0;
     if (obj->enableStats)
     {
-        /*FILE* fp = fopen("tx_bits.f32", "wb");
-        assert(fp != NULL);
-        fwrite(LastEncodedLDPC, sizeof(float), LDPC_TOTAL_SIZE_BITS, fp);
-        fclose(fp);
-        fp = fopen("rx_bits.f32", "wb");
-        assert(fp != NULL);
-        fwrite(obj->inbound_pending_syms, sizeof(float), LDPC_TOTAL_SIZE_BITS, fp);
-        fclose(fp);*/
-
         for (int index = 0; index < LDPC_TOTAL_SIZE_BITS; index++)
         {
             bitsRaw++;
-            //log_info("LastEncodedLDPC[%d] = %f, pendingFloats[%d] = %f", index, LastEncodedLDPC[index], index, obj->inbound_pending_syms[index]);
             int err = (LastEncodedLDPC[index] * obj->inbound_pending_syms[index]) < 0;
             if (err)
             {
@@ -268,10 +296,7 @@ static int rade_text_ldpc_decode(rade_text_impl_t *obj, char *dest, float meanAm
         }
     }
 
-    log_info("mean amplitude: %f", meanAmplitude);
-    log_info("noise var: %f", noiseVar);
-
-    float sigma2 = noiseVar; 
+    float sigma2 = rade_text_estimate_noise_var_(window, LDPC_TOTAL_SIZE_BITS);
     if (sigma2 < 1e-6f) sigma2 = 1e-6f;
 
     auto decodeResult = ldpc_decode(obj->inbound_pending_syms, obj->inbound_pending_amps, sigma2);
@@ -288,17 +313,16 @@ static int rade_text_ldpc_decode(rade_text_impl_t *obj, char *dest, float meanAm
             if (err)
             {
                 errorsCoded++;
-            } 
+            }
         }
 
-        log_info("EOO Tbits:   %6d Terr: %6d BER: %4.3f", bitsRaw + obj->unusedEooBitCount, errorsRaw + obj->unusedEooErrCount, 
-            (float)(errorsRaw + obj->unusedEooErrCount) / (bitsRaw + obj->unusedEooBitCount + 1E-12));
-        log_info("Raw Tbits:   %6d Terr: %6d BER: %4.3f", bitsRaw, errorsRaw, (float)errorsRaw / (bitsRaw + 1E-12));
+        log_debug("noise var: %f", sigma2);
+        log_debug("Raw Tbits:   %6d Terr: %6d BER: %4.3f", bitsRaw, errorsRaw, (float)errorsRaw / (bitsRaw + 1E-12));
         float coded_ber = (float)errorsCoded / (bitsCoded + 1E-12);
-        log_info("Coded Tbits: %6d Terr: %6d BER: %4.3f", bitsCoded, errorsCoded, coded_ber);
+        log_debug("Coded Tbits: %6d Terr: %6d BER: %4.3f", bitsCoded, errorsCoded, coded_ber);
     }
 
-    log_info("decode converged: %d", decodeResult.converged);
+    log_debug("decode converged: %d", decodeResult.converged);
     if (decodeResult.converged)
     {
         memset(dest, 0, RADE_TEXT_BYTES_PER_ENCODED_SEGMENT);
@@ -319,68 +343,55 @@ static int rade_text_ldpc_decode(rade_text_impl_t *obj, char *dest, float meanAm
     return decodeResult.converged;
 }
 
-/* Decode received symbols from RADE decoder. */
-void rade_text_rx(rade_text_t ptr, float *syms, int symSize)
+/* Feed one streamed soft-decision symbol from the RADE decoder. */
+void rade_text_rx_symbol(rade_text_t ptr, float sym)
 {
     rade_text_impl_t *obj = (rade_text_impl_t *)ptr;
     assert(obj != NULL);
 
-    // Deinterleave received symbols.
-    deinterleave_syms(obj->inbound_pending_syms, syms, LDPC_TOTAL_SIZE_BITS);
-
-    // Calculate RMS of all symbols
-    float rms = 0;
-    float ss = 0;
-    int ssCnt = 0;
-    obj->unusedEooBitCount = 0;
-    obj->unusedEooErrCount = 0;
-    for (int index = 0; index < symSize; index++)
+    obj->rx_circular_buf[obj->rx_write_idx] = sym;
+    obj->rx_write_idx = (obj->rx_write_idx + 1) % LDPC_TOTAL_SIZE_BITS;
+    if (obj->rx_filled < LDPC_TOTAL_SIZE_BITS)
     {
-        if (index < LDPC_TOTAL_SIZE_BITS)
-        {
-            float sym = obj->inbound_pending_syms[index];
-            rms += sym * sym;
-        }
-        else
-        {
-            // This is the unused part of the EOO that was filled with a known sequence.
-            float sym = syms[index];
-            float sym_amp = std::fabs(sym);
-            if (sym_amp > 0)
-            {
-                ss += std::pow(1 - sym / sym_amp, 2);
-                ssCnt += 1;
-            }
-            if (obj->enableStats)
-            {
-                obj->unusedEooBitCount += 1;
-
-                // Note: the expected value is always +1 (bit 0).
-                int err = sym < 0;
-                if (err) obj->unusedEooErrCount++;
-            }
-        }
+        obj->rx_filled++;
     }
-    rms = sqrtf(rms / symSize);
+
+    if (obj->rx_filled < LDPC_TOTAL_SIZE_BITS)
+    {
+        // Not enough symbols accumulated yet to attempt a decode.
+        return;
+    }
+
+    // Build the current decode window in arrival order. The oldest symbol
+    // in the window is the one about to be overwritten next.
+    float window[LDPC_TOTAL_SIZE_BITS];
+    for (int index = 0; index < LDPC_TOTAL_SIZE_BITS; index++)
+    {
+        window[index] = obj->rx_circular_buf[(obj->rx_write_idx + index) % LDPC_TOTAL_SIZE_BITS];
+    }
+
+    // Deinterleave received symbols.
+    deinterleave_syms(obj->inbound_pending_syms, window, LDPC_TOTAL_SIZE_BITS);
 
     // Copy over symbols prior to decode.
     for (int index = 0; index < LDPC_TOTAL_SIZE_BITS; index++)
     {
-        float *sym = &obj->inbound_pending_syms[index];
-        float sym_amp = std::fabs(*sym);
-        *sym /= sym_amp;
+        float *s = &obj->inbound_pending_syms[index];
+        float sym_amp = std::fabs(*s);
+        *s /= sym_amp;
         obj->inbound_pending_amps[index] = sym_amp;
-        log_debug("RX symbol: %f, amp: %f", *sym, sym_amp);
     }
 
-    // We have all the bits we need, so we're ready to decode.
+    // Attempt a decode of the current window. Since the transmitter repeats
+    // the same codeword continuously with no framing, this window is only
+    // codeword-aligned once every LDPC_TOTAL_SIZE_BITS attempts; misaligned
+    // windows are expected to simply fail to converge.
     char decodedStr[RADE_TEXT_MAX_RAW_LENGTH + 1];
     char rawStr[RADE_TEXT_MAX_RAW_LENGTH + 1];
     memset(rawStr, 0, RADE_TEXT_MAX_RAW_LENGTH + 1);
     memset(decodedStr, 0, RADE_TEXT_MAX_RAW_LENGTH + 1);
 
-    float noiseVar = ss / std::max(ssCnt - 1, 1);
-    if (rade_text_ldpc_decode(obj, rawStr, rms, noiseVar) != 0)
+    if (rade_text_ldpc_decode(obj, rawStr, window) != 0)
     {
         // BER is under limits.
         convert_ota_string_to_callsign_(&rawStr[RADE_TEXT_CRC_LENGTH], &decodedStr[RADE_TEXT_CRC_LENGTH],
@@ -391,10 +402,10 @@ void rade_text_rx(rade_text_t ptr, float *syms, int symSize)
         unsigned char receivedCRC = decodedStr[0];
         unsigned char calcCRC = calculateCRC8_(&rawStr[RADE_TEXT_CRC_LENGTH], RADE_TEXT_MAX_LENGTH);
 
-        log_info("rxCRC: %d, calcCRC: %d, decodedStr: %s", receivedCRC, calcCRC, &decodedStr[RADE_TEXT_CRC_LENGTH]);
-
         if (receivedCRC == calcCRC && obj->text_rx_callback)
         {
+            log_info("rxCRC: %d, calcCRC: %d, decodedStr: %s", receivedCRC, calcCRC, &decodedStr[RADE_TEXT_CRC_LENGTH]);
+
             // We got a valid string. Call assigned callback.
             obj->text_rx_callback(obj, &decodedStr[RADE_TEXT_CRC_LENGTH], strlen(&decodedStr[RADE_TEXT_CRC_LENGTH]),
                                   obj->callback_state);
@@ -417,7 +428,7 @@ void rade_text_destroy(rade_text_t ptr)
     delete impl;
 }
 
-void rade_text_generate_tx_string(rade_text_t ptr, const char *str, int strlength, float *syms, int symSize)
+void rade_text_generate_tx_string(rade_text_t ptr, const char *str, int strlength)
 {
     rade_text_impl_t *impl = (rade_text_impl_t *)ptr;
     assert(impl != NULL);
@@ -433,8 +444,6 @@ void rade_text_generate_tx_string(rade_text_t ptr, const char *str, int strlengt
     {
         txt_length = RADE_TEXT_MAX_LENGTH;
     }
-    impl->tx_text_length = LDPC_TOTAL_SIZE_BITS;
-    impl->tx_text_index = 0;
     unsigned char crc = calculateCRC8_(&tmp[RADE_TEXT_CRC_LENGTH], txt_length);
     tmp[0] = crc;
 
@@ -479,30 +488,37 @@ void rade_text_generate_tx_string(rade_text_t ptr, const char *str, int strlengt
     // Interleave the bits together to enhance fading performance.
     interleave_bits(&impl->tx_text[0], tmpbits, LDPC_TOTAL_SIZE_BITS);
 
-    // Generate BPSK symbols from the interleaved bits (bit 0 -> +1, bit 1 -> -1).
-    char debugString[256];
-    for (int index = 0; index < LDPC_TOTAL_SIZE_BITS; index++)
-    {
-        syms[index] = impl->tx_text[index] ? -1.0f : 1.0f;
-        debugString[index] = impl->tx_text[index] ? '1' : '0';
-    }
-
     if (impl->enableStats)
     {
         // Copy floats into memory so we can compare them later (for BER calc).
-        memcpy(LastEncodedLDPC, syms, LDPC_TOTAL_SIZE_BITS * sizeof(float));
+        for (int index = 0; index < LDPC_TOTAL_SIZE_BITS; index++)
+        {
+            LastEncodedLDPC[index] = impl->tx_text[index] ? -1.0f : 1.0f;
+        }
     }
 
+    char debugString[LDPC_TOTAL_SIZE_BITS + 1];
+    for (int index = 0; index < LDPC_TOTAL_SIZE_BITS; index++)
+    {
+        debugString[index] = impl->tx_text[index] ? '1' : '0';
+    }
     debugString[LDPC_TOTAL_SIZE_BITS] = 0;
     log_debug("generated bits: %s", debugString);
 
-    if (symSize > LDPC_TOTAL_SIZE_BITS)
-    {
-        for (int index = LDPC_TOTAL_SIZE_BITS; index < symSize; index++)
-        {
-            syms[index] = 1.0f;
-        }
-    }
+    // Restart the streaming cursor so the newly generated text begins
+    // cleanly on the next call to rade_text_tx_next_symbol().
+    impl->tx_symbol_index = 0;
+}
+
+float rade_text_tx_next_symbol(rade_text_t ptr)
+{
+    rade_text_impl_t *impl = (rade_text_impl_t *)ptr;
+    assert(impl != NULL);
+
+    float sym = impl->tx_text[impl->tx_symbol_index] ? -1.0f : 1.0f;
+    impl->tx_symbol_index = (impl->tx_symbol_index + 1) % LDPC_TOTAL_SIZE_BITS;
+
+    return sym;
 }
 
 void rade_text_set_rx_callback(rade_text_t ptr, on_text_rx_t text_rx_fn, void *state)

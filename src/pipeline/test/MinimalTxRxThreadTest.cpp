@@ -471,7 +471,7 @@ int main()
         // Fresh RADE / LPCNet / FARGAN state per test to avoid any
         // carry-over between configurations.
         char modelFile[1] = {0};
-        struct rade* rade = rade_open(modelFile, RADE_USE_C_ENCODER | RADE_USE_C_DECODER);
+        struct rade* rade = rade_open(modelFile, RADE_USE_C_ENCODER | RADE_USE_C_DECODER | RADE_MODE_V2);
         assert(rade != nullptr);
 
         LPCNetEncState* encState = lpcnet_encoder_create();
@@ -488,14 +488,9 @@ int main()
         rade_text_t radeText = rade_text_create();
         assert(radeText != nullptr);
 
-        int nsyms = rade_n_eoo_bits(rade);
-        float* eooSyms = new float[nsyms];
-        assert(eooSyms);
-                
-        rade_text_generate_tx_string(radeText, "K6AQ", 4, eooSyms, nsyms);
-        rade_tx_set_eoo_bits(rade, eooSyms);
+        rade_text_generate_tx_string(radeText, "K6AQ", 4);
 
-        bool radeTextReceived = true;
+        bool radeTextReceived = false;
         rade_text_set_rx_callback(radeText, [](rade_text_t, const char *txt_ptr, int length, void *state) {
             bool* pass = (bool*)state;
             *pass = (strncmp(txt_ptr, "K6AQ", length) == 0);
@@ -510,7 +505,6 @@ int main()
         rade_text_destroy(radeText);
         rade_close(rade);
         lpcnet_encoder_destroy(encState);
-        delete[] eooSyms;
 
         // Evaluate quality with loss.py
         bool passed = pipelineOk && runLossCheck(txFeatPath, rxFeatPath) && radeTextReceived;

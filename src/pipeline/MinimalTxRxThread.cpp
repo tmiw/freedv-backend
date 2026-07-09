@@ -82,7 +82,7 @@ void MinimalTxRxThread::initializePipeline_()
     
     if (m_tx)
     {
-        txStep_ = new RADETransmitStep(rade_, encState_);
+        txStep_ = new RADETransmitStep(rade_, encState_, radeText_);
         auto agcStep = new AgcStep(txStep_->getInputSampleRate());
         auto rnnoiseStep = new RNNoiseStep();
         pipeline_->appendPipelineStep(rnnoiseStep);
