@@ -34,6 +34,7 @@
 
 #include "rade_text.h"
 
+#include <algorithm>
 #include <assert.h>
 #include <ctype.h>
 #include <math.h>
@@ -67,8 +68,8 @@ typedef struct RadeTextImpl
     int tx_text_index;
     int tx_text_length;
 
-    RADE_COMP inbound_pending_syms[LDPC_TOTAL_SIZE_BITS / 2];
-    float inbound_pending_amps[LDPC_TOTAL_SIZE_BITS / 2];
+    float inbound_pending_syms[LDPC_TOTAL_SIZE_BITS];
+    float inbound_pending_amps[LDPC_TOTAL_SIZE_BITS];
 
     int enableStats;
 
@@ -85,8 +86,8 @@ typedef struct RadeTextImpl
         , unusedEooErrCount(0)
     {
         memset(tx_text, 0, LDPC_TOTAL_SIZE_BITS);
-        memset(inbound_pending_syms, 0, sizeof(RADE_COMP) * LDPC_TOTAL_SIZE_BITS / 2);
-        memset(inbound_pending_amps, 0, sizeof(float) * LDPC_TOTAL_SIZE_BITS / 2);
+        memset(inbound_pending_syms, 0, sizeof(float) * LDPC_TOTAL_SIZE_BITS);
+        memset(inbound_pending_amps, 0, sizeof(float) * LDPC_TOTAL_SIZE_BITS);
     }
 
     RadeTextImpl(const RadeTextImpl& rhs)
@@ -99,8 +100,8 @@ typedef struct RadeTextImpl
         , unusedEooErrCount(rhs.unusedEooErrCount)
     {
         memcpy(tx_text, rhs.tx_text, LDPC_TOTAL_SIZE_BITS);
-        memcpy(inbound_pending_syms, rhs.inbound_pending_syms, sizeof(RADE_COMP) * LDPC_TOTAL_SIZE_BITS / 2);
-        memcpy(inbound_pending_amps, rhs.inbound_pending_amps, sizeof(float) * LDPC_TOTAL_SIZE_BITS / 2);
+        memcpy(inbound_pending_syms, rhs.inbound_pending_syms, sizeof(float) * LDPC_TOTAL_SIZE_BITS);
+        memcpy(inbound_pending_amps, rhs.inbound_pending_amps, sizeof(float) * LDPC_TOTAL_SIZE_BITS);
     }
 
     RadeTextImpl(RadeTextImpl&&) noexcept = delete;
@@ -218,23 +219,21 @@ static char calculateCRC8_(char *input, int length)
 }
 
 static constexpr int INTERLEAVER_B = 37;
-static void deinterleave_comp(RADE_COMP* out, RADE_COMP* in, int syms)
+static void deinterleave_syms(float* out, float* in, int syms)
 {
     for (int index = 0; index < syms; index++)
     {
         int newIndex = (INTERLEAVER_B * index) % syms;
-        out[index].real = in[newIndex].real;
-        out[index].imag = in[newIndex].imag;
+        out[index] = in[newIndex];
     }
 }
 
-static void interleave_bits(char* out, char* in, int syms)
+static void interleave_bits(char* out, char* in, int bits)
 {
-    for (int index = 0; index < syms; index++)
+    for (int index = 0; index < bits; index++)
     {
-        int newIndex = (INTERLEAVER_B * index) % syms;
-        out[2 * newIndex] = in[2 * index];
-        out[2 * newIndex + 1] = in[2 * index + 1];
+        int newIndex = (INTERLEAVER_B * index) % bits;
+        out[newIndex] = in[index];
     }
 }
 
@@ -260,9 +259,8 @@ static int rade_text_ldpc_decode(rade_text_impl_t *obj, char *dest, float meanAm
         for (int index = 0; index < LDPC_TOTAL_SIZE_BITS; index++)
         {
             bitsRaw++;
-            float* pendingFloats = (float*)obj->inbound_pending_syms;
-            //log_info("LastEncodedLDPC[%d] = %f, pendingFloats[%d] = %f", index, LastEncodedLDPC[index], index, pendingFloats[index]);
-            int err = (LastEncodedLDPC[index] * pendingFloats[index]) < 0;
+            //log_info("LastEncodedLDPC[%d] = %f, pendingFloats[%d] = %f", index, LastEncodedLDPC[index], index, obj->inbound_pending_syms[index]);
+            int err = (LastEncodedLDPC[index] * obj->inbound_pending_syms[index]) < 0;
             if (err)
             {
                 errorsRaw++;
@@ -327,8 +325,8 @@ void rade_text_rx(rade_text_t ptr, float *syms, int symSize)
     rade_text_impl_t *obj = (rade_text_impl_t *)ptr;
     assert(obj != NULL);
 
-    // Deinterleave received bits.
-    deinterleave_comp(obj->inbound_pending_syms, (RADE_COMP*)syms, LDPC_TOTAL_SIZE_BITS / 2);
+    // Deinterleave received symbols.
+    deinterleave_syms(obj->inbound_pending_syms, syms, LDPC_TOTAL_SIZE_BITS);
 
     // Calculate RMS of all symbols
     float rms = 0;
@@ -338,30 +336,27 @@ void rade_text_rx(rade_text_t ptr, float *syms, int symSize)
     obj->unusedEooErrCount = 0;
     for (int index = 0; index < symSize; index++)
     {
-        if (index < (LDPC_TOTAL_SIZE_BITS / 2))
+        if (index < LDPC_TOTAL_SIZE_BITS)
         {
-            RADE_COMP *sym = &obj->inbound_pending_syms[index];
-            rms += sym->real * sym->real + sym->imag * sym->imag;
+            float sym = obj->inbound_pending_syms[index];
+            rms += sym * sym;
         }
         else
         {
             // This is the unused part of the EOO that was filled with a known sequence.
-            float* sym = &syms[2 * index];
-            float sym_amp = std::sqrt(sym[0] * sym[0] + sym[1] * sym[1]);
+            float sym = syms[index];
+            float sym_amp = std::fabs(sym);
             if (sym_amp > 0)
             {
-                ss += std::pow(1 - sym[0] / sym_amp, 2);
-                ss += std::pow(0 - sym[1] / sym_amp, 2);
-                ssCnt += 2;
+                ss += std::pow(1 - sym / sym_amp, 2);
+                ssCnt += 1;
             }
             if (obj->enableStats)
             {
-                obj->unusedEooBitCount += 2;
+                obj->unusedEooBitCount += 1;
 
-                // Note: the expected sym[0] should always be 0, so
-                // the EOO formula (expected * real < 0) won't take it
-                // into consideration.
-                int err = sym[1] < 0;
+                // Note: the expected value is always +1 (bit 0).
+                int err = sym < 0;
                 if (err) obj->unusedEooErrCount++;
             }
         }
@@ -369,14 +364,13 @@ void rade_text_rx(rade_text_t ptr, float *syms, int symSize)
     rms = sqrtf(rms / symSize);
 
     // Copy over symbols prior to decode.
-    for (int index = 0; index < LDPC_TOTAL_SIZE_BITS / 2; index++)
+    for (int index = 0; index < LDPC_TOTAL_SIZE_BITS; index++)
     {
-        RADE_COMP *sym = &obj->inbound_pending_syms[index];
-        float sym_amp = sqrtf(sym->real * sym->real + sym->imag * sym->imag);
-        sym->real /= sym_amp;
-        sym->imag /= sym_amp;
+        float *sym = &obj->inbound_pending_syms[index];
+        float sym_amp = std::fabs(*sym);
+        *sym /= sym_amp;
         obj->inbound_pending_amps[index] = sym_amp;
-        log_debug("RX symbol: %f, %f, amp: %f", sym->real, sym->imag, sym_amp);
+        log_debug("RX symbol: %f, amp: %f", *sym, sym_amp);
     }
 
     // We have all the bits we need, so we're ready to decode.
@@ -385,7 +379,7 @@ void rade_text_rx(rade_text_t ptr, float *syms, int symSize)
     memset(rawStr, 0, RADE_TEXT_MAX_RAW_LENGTH + 1);
     memset(decodedStr, 0, RADE_TEXT_MAX_RAW_LENGTH + 1);
 
-    float noiseVar = ss / (ssCnt - 1);
+    float noiseVar = ss / std::max(ssCnt - 1, 1);
     if (rade_text_ldpc_decode(obj, rawStr, rms, noiseVar) != 0)
     {
         // BER is under limits.
@@ -483,35 +477,14 @@ void rade_text_generate_tx_string(rade_text_t ptr, const char *str, int strlengt
     memcpy(LastLDPCAsBits, tmpbits, LDPC_TOTAL_SIZE_BITS);
 
     // Interleave the bits together to enhance fading performance.
-    interleave_bits(&impl->tx_text[0], tmpbits, LDPC_TOTAL_SIZE_BITS / 2);
+    interleave_bits(&impl->tx_text[0], tmpbits, LDPC_TOTAL_SIZE_BITS);
 
-    // Generate floats based on the bits.
+    // Generate BPSK symbols from the interleaved bits (bit 0 -> +1, bit 1 -> -1).
     char debugString[256];
-    for (int index = 0; index < LDPC_TOTAL_SIZE_BITS / 2; index++)
+    for (int index = 0; index < LDPC_TOTAL_SIZE_BITS; index++)
     {
-        char *ptr = &impl->tx_text[2 * index];
-        if (*ptr == 0 && *(ptr + 1) == 0)
-        {
-            syms[2 * index] = 1;
-            syms[2 * index + 1] = 0;
-        }
-        else if (*ptr == 0 && *(ptr + 1) == 1)
-        {
-            syms[2 * index] = 0;
-            syms[2 * index + 1] = 1;
-        }
-        else if (*ptr == 1 && *(ptr + 1) == 0)
-        {
-            syms[2 * index] = 0;
-            syms[2 * index + 1] = -1;
-        }
-        else if (*ptr == 1 && *(ptr + 1) == 1)
-        {
-            syms[2 * index] = -1;
-            syms[2 * index + 1] = 0;
-        }
-        debugString[2 * index] = impl->tx_text[2 * index] ? '1' : '0';
-        debugString[2 * index + 1] = impl->tx_text[2 * index + 1] ? '1' : '0';
+        syms[index] = impl->tx_text[index] ? -1.0f : 1.0f;
+        debugString[index] = impl->tx_text[index] ? '1' : '0';
     }
 
     if (impl->enableStats)
@@ -527,7 +500,7 @@ void rade_text_generate_tx_string(rade_text_t ptr, const char *str, int strlengt
     {
         for (int index = LDPC_TOTAL_SIZE_BITS; index < symSize; index++)
         {
-            syms[index] = index % 2 ? 0 : 1;
+            syms[index] = 1.0f;
         }
     }
 }
