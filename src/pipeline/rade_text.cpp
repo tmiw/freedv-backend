@@ -55,6 +55,16 @@
 /* Two bytes of text/CRC equal four bytes of LDPC(112,56). */
 #define RADE_TEXT_BYTES_PER_ENCODED_SEGMENT (8)
 
+// A decode is only ever accepted (see rade_text_ldpc_decode()) if it
+// converges within this many belief-propagation iterations, so this also
+// doubles as the max_iter passed to ldpc_decode() -- there's no point
+// spending cycles on iterations beyond this that would just be discarded
+// anyway. Misaligned rotation candidates dominate the exhaustive rotation
+// search's cost (111 of every 112 tried in a sweep never converge at all),
+// so this directly cuts that dominant cost by 3x versus ldpc_decode()'s
+// default max_iter of 30.
+static constexpr int MAX_CONFIDENT_ITERATIONS = 10;
+
 static float LastEncodedLDPC[LDPC_TOTAL_SIZE_BITS];
 static char LastLDPCAsBits[LDPC_TOTAL_SIZE_BITS];
 
@@ -328,7 +338,7 @@ static int rade_text_ldpc_decode(rade_text_impl_t *obj, char *dest, const float 
     float sigma2 = rade_text_estimate_noise_var_(window, LDPC_TOTAL_SIZE_BITS);
     if (sigma2 < 1e-6f) sigma2 = 1e-6f;
 
-    auto decodeResult = ldpc_decode(obj->inbound_pending_syms, obj->inbound_pending_amps, sigma2);
+    auto decodeResult = ldpc_decode(obj->inbound_pending_syms, obj->inbound_pending_amps, sigma2, MAX_CONFIDENT_ITERATIONS);
 
     if (obj->enableStats)
     {
@@ -379,8 +389,11 @@ static int rade_text_ldpc_decode(rade_text_impl_t *obj, char *dest, const float 
     // requiring this as well as CRC agreement adds a second, independent
     // filter against the exhaustive rotation search's larger hypothesis
     // count occasionally letting a spurious (misaligned or noise-induced)
-    // candidate slip past CRC's ~1-in-256 false-accept rate alone.
-    constexpr int MAX_CONFIDENT_ITERATIONS = 10;
+    // candidate slip past CRC's ~1-in-256 false-accept rate alone. (Since
+    // ldpc_decode() above is already capped at MAX_CONFIDENT_ITERATIONS,
+    // decodeResult.iterations can never exceed it -- this check is really
+    // just "did it converge at all", but is kept explicit/symmetric with
+    // the cap in case that ever changes.)
     return decodeResult.converged && decodeResult.iterations <= MAX_CONFIDENT_ITERATIONS;
 }
 
