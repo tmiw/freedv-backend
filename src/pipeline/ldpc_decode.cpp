@@ -117,18 +117,23 @@ LDPCDecodeResult ldpc_decode(const float* syms,
             const auto& ce = graph.check_edges[i];
             const int   nd = (int)ce.size();
 
+            // phi(|v|) is needed once per edge to build the sum below, and
+            // again per edge afterward as part of phi(sum - phi(|v|)) --
+            // cache it here instead of recomputing the same exp/log twice.
+            float phi_v[112];
             int sign = 1;
             float sum = 0;
             for (int k = 0; k < nd; k++) {
                 const float v = m_vc[ce[k]];
                 sign *= (v >= 0.0f) ? 1 : -1;
-                sum += std::max(0.0f, phi(std::abs(v)));
+                phi_v[k] = std::max(0.0f, phi(std::abs(v)));
+                sum += phi_v[k];
             }
 
             for (int k = 0; k < nd; k++) {
                 const float v = m_vc[ce[k]];
                 int inv_sign = (v >= 0.0f) ? 1 : -1;
-                m_cv[ce[k]] = std::clamp(inv_sign * sign * std::max(0.0f, phi(sum - phi(std::abs(v)))), -LLR_MAX, LLR_MAX);
+                m_cv[ce[k]] = std::clamp(inv_sign * sign * std::max(0.0f, phi(sum - phi_v[k])), -LLR_MAX, LLR_MAX);
             }
         }
 
@@ -155,12 +160,16 @@ LDPCDecodeResult ldpc_decode(const float* syms,
             result.message[j] = (L < 0.0f) ? 1 : 0;
         }
 
-        // bits * H' must equal 0. Check here.
+        // bits * H' must equal 0. Check here. Walk the sparse edge list
+        // (already built for the message-passing steps above) instead of
+        // scanning the dense 56x112 HRA_56_56 matrix -- same result, since
+        // HRA_56_56[i][j] is nonzero exactly on graph.check_edges[i]'s
+        // variables, but touches far fewer entries for a sparse code.
         bool ok = true;
         for (int i = 0; i < 56 && ok; i++) {
             int ctr = 0;
-            for (int j = 0; j < 112; j++) {
-                ctr += HRA_56_56[i][j] * result.message[j];
+            for (int e : graph.check_edges[i]) {
+                ctr += result.message[graph.edges[e].var];
             }
             ok = (ctr % 2) == 0; // non-zero check
         }

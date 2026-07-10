@@ -103,7 +103,6 @@ private:
     RADE_COMP* inputBufCplx_;
     short* inputBuf_;
     float* featuresOut_;
-    float* eooOut_;
     std::unique_ptr<short[]> outputSamples_;
     
     PreAllocatedFIFO<float, NUM_FEATURES_TO_STORE>* utFeatures_;

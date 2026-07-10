@@ -80,9 +80,10 @@ int RADETransmitStep::eooLengthInSamples() const FREEDV_NONBLOCKING
     FREEDV_END_VERIFIED_SAFE
 }
 
-RADETransmitStep::RADETransmitStep(struct rade* dv, LPCNetEncState* encState)
+RADETransmitStep::RADETransmitStep(struct rade* dv, LPCNetEncState* encState, rade_text_t textPtr)
     : dv_(dv)
     , encState_(encState)
+    , textPtr_(textPtr)
     , featureList_(nullptr)
     , featureListIdx_(0)
     , featuresFile_(nullptr)
@@ -211,6 +212,12 @@ short* RADETransmitStep::execute(short* inputSamples, int numInputSamples, int* 
                 // RADE TX handling
                 int numOut = 0;
                 FREEDV_BEGIN_VERIFIED_SAFE
+                    if (textPtr_ != nullptr)
+                    {
+                        // Stream one bit of the (continuously repeating) text
+                        // payload per modem frame (~25 bits/s).
+                        rade_tx_set_data_symbol(dv_, rade_text_tx_next_symbol(textPtr_));
+                    }
                     numOut = rade_tx(dv_, radeOut_, &featureList_[0]);
                 FREEDV_END_VERIFIED_SAFE
 

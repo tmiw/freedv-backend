@@ -46,6 +46,7 @@ extern "C"
 }
 
 #include "IPipelineStep.h"
+#include "rade_text.h"
 #include "../util/GenericFIFO.h"
 #include "../util/Semaphore.h"
 
@@ -64,7 +65,7 @@ extern "C"
 class RADETransmitStep : public IPipelineStep
 {
 public:
-    RADETransmitStep(struct rade* dv, LPCNetEncState* encState);
+    RADETransmitStep(struct rade* dv, LPCNetEncState* encState, rade_text_t textPtr = nullptr);
     virtual ~RADETransmitStep();
     
     virtual int getInputSampleRate() const FREEDV_NONBLOCKING override;
@@ -82,6 +83,7 @@ public:
 private:
     struct rade* dv_;
     LPCNetEncState* encState_;
+    rade_text_t textPtr_;
     PreAllocatedFIFO<short, RADE_SPEECH_SAMPLE_RATE> inputSampleFifo_;
     PreAllocatedFIFO<short, RADE_MODEM_SAMPLE_RATE> outputSampleFifo_;
     float* featureList_;

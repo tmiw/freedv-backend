@@ -138,9 +138,6 @@ RADEReceiveStep::RADEReceiveStep(
     featuresOut_ = new float[rade_n_features_in_out(dv_)];
     assert(featuresOut_ != nullptr);
 
-    eooOut_ = new float[rade_n_eoo_bits(dv_)];
-    assert(eooOut_ != nullptr);
-
     pendingFeatures_ = new float[NB_TOTAL_FEATURES];
     assert(pendingFeatures_ != nullptr);
 
@@ -157,7 +154,6 @@ RADEReceiveStep::~RADEReceiveStep()
     delete[] inputBuf_;
     delete[] inputBufCplx_;
     delete[] featuresOut_;
-    delete[] eooOut_;
     delete[] pendingFeatures_;
     outputSamples_ = nullptr;
 
@@ -214,19 +210,25 @@ short* RADEReceiveStep::execute(short* inputSamples, int numInputSamples, int* n
         int hasEooOut = 0;
 
         FREEDV_BEGIN_VERIFIED_SAFE
-            nout = rade_rx(dv_, featuresOut_, &hasEooOut, eooOut_, rxFdmOffset_);
+            nout = rade_rx(dv_, featuresOut_, &hasEooOut, nullptr, rxFdmOffset_);
         FREEDV_END_VERIFIED_SAFE
 
-        if (hasEooOut && textPtr_ != nullptr)
+        if (nout > 0 && textPtr_ != nullptr)
         {
+            float dataSym = 0.0f;
+            FREEDV_BEGIN_VERIFIED_SAFE
+                dataSym = rade_rx_get_data_symbol(dv_);
+            FREEDV_END_VERIFIED_SAFE
+
             FREEDV_BEGIN_REALTIME_UNSAFE
 
-            // Handle RX of bits from EOO.
-            rade_text_rx(textPtr_, eooOut_, rade_n_eoo_bits(dv_));
+            // Feed the streamed data symbol (~25 bits/s) into the text decoder.
+            rade_text_rx_symbol(textPtr_, dataSym);
 
             FREEDV_END_REALTIME_UNSAFE
         }
-        else if (!hasEooOut)
+
+        if (!hasEooOut)
         {
             if (featuresFile_)
             {
