@@ -102,11 +102,22 @@ endif()
 if(RADAE_PYTHON_EXECUTABLE)
     message(STATUS "MinimalTxRxThreadTest: using Python at ${RADAE_PYTHON_EXECUTABLE}")
 
+    # Populate Python RADE scripts
+    include(ExternalProject)
+    ExternalProject_Add(
+        rade_python
+	URL https://github.com/drowe67/radae/archive/refs/heads/main.zip
+	CONFIGURE_COMMAND ""
+	BUILD_COMMAND ""
+	INSTALL_COMMAND "")
+    ExternalProject_Get_Property(rade_python SOURCE_DIR)
+
     DefineUnitTest(MinimalTxRxThreadTest)
     target_link_libraries(MinimalTxRxThreadTest PRIVATE rade opus samplerate)
     target_compile_definitions(MinimalTxRxThreadTest PRIVATE
-        RADE_SRC_DIR="${rade_SOURCE_DIR}"
+	    RADE_SRC_DIR="${SOURCE_DIR}"
         PYTHON_EXECUTABLE="${RADAE_PYTHON_EXECUTABLE}")
+
     # Allow up to 1 hour: 6 rate combinations × ~10 min each (RADE NN inference
     # on CPU can be significantly slower than real-time).
     set_tests_properties(pipeline_MinimalTxRxThreadTest PROPERTIES TIMEOUT 3600)
