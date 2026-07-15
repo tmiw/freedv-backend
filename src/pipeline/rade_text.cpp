@@ -35,7 +35,9 @@
 #include "rade_text.h"
 
 #include <algorithm>
+#include <array>
 #include <assert.h>
+#include <cstdint>
 #include <ctype.h>
 #include <math.h>
 #include <stdio.h>
@@ -46,14 +48,60 @@
 #include "ldpc_decode.h"
 #include "../util/logging/ulog.h"
 
-#define LDPC_TOTAL_SIZE_BITS (112)
+static constexpr int LDPC_TOTAL_SIZE_BITS = 112;
+static constexpr int LDPC_PAYLOAD_BITS = LDPC_TOTAL_SIZE_BITS / 2; // 56
 
-#define RADE_TEXT_MAX_LENGTH (8)
-#define RADE_TEXT_CRC_LENGTH (1)
-#define RADE_TEXT_MAX_RAW_LENGTH (RADE_TEXT_MAX_LENGTH + RADE_TEXT_CRC_LENGTH)
+// ---------------------------------------------------------------------------
+// 56-bit LDPC payload layout
+//
+// [ CRC-8 (8 bits) | last_block (1 bit) | block_index (2 bits) | packed
+//   characters (42 bits) | reserved (3 bits) ]
+//
+// A message longer than one block's RADE_TEXT_CHARS_PER_BLOCK characters
+// (e.g. a compound callsign like VE3/KG6AOV/MM) is split across up to
+// RADE_TEXT_MAX_BLOCKS blocks, cycled in order by the transmitter. Each
+// block is still an independent LDPC(112,56) codeword -- the rotation-sweep
+// sync logic in rade_text_rx_symbol() doesn't need to know or care that
+// consecutive codewords now carry different payloads, since it only ever
+// looks for one codeword-aligned window at a time. block_index/last_block
+// let the receiver reassemble blocks that may arrive out of order (it can
+// join mid-cycle), and CRC covers the framing bits as well as the
+// characters so a corrupted block_index can't silently misfile content.
+//
+// Characters are packed as a single base-38 integer (acc = acc*38 + c)
+// rather than 6 fixed bits/char: log2(38) =~ 5.25 bits/char, so 8 characters
+// cost 42 bits instead of 48 -- enough to recover the character the framing
+// overhead would otherwise cost, letting a single block still carry 8
+// characters exactly as the original single-block design did.
+// ---------------------------------------------------------------------------
 
-/* Two bytes of text/CRC equal four bytes of LDPC(112,56). */
-#define RADE_TEXT_BYTES_PER_ENCODED_SEGMENT (8)
+// 38-symbol alphabet: 0 = null (terminator/padding), 1-10 = '0'-'9',
+// 11-36 = 'A'-'Z', 37 = '/'. Restricted to what a callsign (including
+// compound prefix/suffix pieces) can contain.
+static constexpr int RADE_TEXT_ALPHABET_SIZE = 38;
+static constexpr int RADE_TEXT_CHARS_PER_BLOCK = 8;
+
+// ceil(log2(RADE_TEXT_ALPHABET_SIZE ^ RADE_TEXT_CHARS_PER_BLOCK)).
+static constexpr int RADE_TEXT_PACKED_CHAR_BITS = 42;
+
+static constexpr int RADE_TEXT_CRC_BITS = 8;
+static constexpr int RADE_TEXT_LAST_BLOCK_BITS = 1;
+static constexpr int RADE_TEXT_BLOCK_INDEX_BITS = 2;
+
+static constexpr int RADE_TEXT_CRC_BIT_OFFSET = 0;
+static constexpr int RADE_TEXT_LAST_BLOCK_BIT_OFFSET = RADE_TEXT_CRC_BIT_OFFSET + RADE_TEXT_CRC_BITS;
+static constexpr int RADE_TEXT_BLOCK_INDEX_BIT_OFFSET = RADE_TEXT_LAST_BLOCK_BIT_OFFSET + RADE_TEXT_LAST_BLOCK_BITS;
+static constexpr int RADE_TEXT_CHARS_BIT_OFFSET = RADE_TEXT_BLOCK_INDEX_BIT_OFFSET + RADE_TEXT_BLOCK_INDEX_BITS;
+
+static_assert(RADE_TEXT_CHARS_BIT_OFFSET + RADE_TEXT_PACKED_CHAR_BITS <= LDPC_PAYLOAD_BITS,
+              "block framing + packed characters must fit within the LDPC payload");
+
+// 2-bit block_index supports up to 4 blocks "for free" (a 1- or 2-block
+// message costs the same 2 bits as a 4-block one), so there's no reason to
+// support fewer. RADE_TEXT_MAX_LENGTH (32 chars) comfortably covers any
+// realistic compound callsign.
+static constexpr int RADE_TEXT_MAX_BLOCKS = 4;
+static constexpr int RADE_TEXT_MAX_LENGTH = RADE_TEXT_CHARS_PER_BLOCK * RADE_TEXT_MAX_BLOCKS;
 
 // A decode is only ever accepted (see rade_text_ldpc_decode()) if it
 // converges within this many belief-propagation iterations, so this also
@@ -65,6 +113,18 @@
 // default max_iter of 30.
 static constexpr int MAX_CONFIDENT_ITERATIONS = 10;
 
+// Fields extracted from one decoded, CRC-valid 56-bit LDPC payload.
+struct RadeTextBlockFields
+{
+    uint8_t blockIndex;
+    bool lastBlock;
+    uint8_t chars[RADE_TEXT_CHARS_PER_BLOCK];
+};
+
+// Represents the most recently generated block's data for BER logging (see
+// rade_text_ldpc_decode()) -- a same-process loopback diagnostic only, so
+// for a multi-block message it's only representative while the window being
+// decoded happens to be that last block.
 static float LastEncodedLDPC[LDPC_TOTAL_SIZE_BITS];
 static char LastLDPCAsBits[LDPC_TOTAL_SIZE_BITS];
 
@@ -74,18 +134,22 @@ typedef struct RadeTextImpl
     on_text_rx_t text_rx_callback;
     void *callback_state;
 
-    // TX streaming state: interleaved codeword bits (0/1), looped
-    // continuously by rade_text_tx_next_symbol() one bit per call.
-    char tx_text[LDPC_TOTAL_SIZE_BITS];
+    // TX streaming state: up to RADE_TEXT_MAX_BLOCKS interleaved codewords,
+    // cycled in block-index order by rade_text_tx_next_symbol() one bit per
+    // call. tx_num_blocks is how many of them are actually part of the
+    // current message (1 for anything that fits in a single block).
+    char tx_text[RADE_TEXT_MAX_BLOCKS][LDPC_TOTAL_SIZE_BITS];
+    int tx_num_blocks;
+    int tx_block_index;
     int tx_symbol_index;
 
     // RX streaming state: circular buffer holding the most recent
     // LDPC_TOTAL_SIZE_BITS soft-decision symbols in arrival order. Since the
-    // transmitter repeats the same codeword back-to-back with no framing,
-    // this acts as a sliding decode window -- exactly one out of every
-    // LDPC_TOTAL_SIZE_BITS consecutive windows is codeword-aligned, so a
-    // decode is attempted on every new symbol once no rotation sweep (see
-    // below) is in progress.
+    // transmitter repeats its block sequence back-to-back with no framing
+    // between codewords, this acts as a sliding decode window -- exactly one
+    // out of every LDPC_TOTAL_SIZE_BITS consecutive windows is
+    // codeword-aligned, so a decode is attempted on every new symbol once no
+    // rotation sweep (see below) is in progress.
     float rx_circular_buf[LDPC_TOTAL_SIZE_BITS];
     int rx_write_idx;
     int rx_filled;
@@ -99,47 +163,69 @@ typedef struct RadeTextImpl
     float rx_sweep_snapshot[LDPC_TOTAL_SIZE_BITS];
     int rx_sweep_next_rot;
     int rx_sweep_num_candidates;
-    char rx_sweep_winner[RADE_TEXT_MAX_RAW_LENGTH + 1];
+    RadeTextBlockFields rx_sweep_winner;
 
     float inbound_pending_syms[LDPC_TOTAL_SIZE_BITS];
     float inbound_pending_amps[LDPC_TOTAL_SIZE_BITS];
+
+    // Multi-block reassembly state for the message currently being
+    // received. block_index == 0 always marks the start of a (possibly new)
+    // message cycle, since that's the only signal available that a fresh
+    // pass through the transmitter's cycle has begun -- so it resets this
+    // state rather than merging with a previous, possibly stale, cycle.
+    uint8_t rx_asm_chars[RADE_TEXT_MAX_BLOCKS][RADE_TEXT_CHARS_PER_BLOCK];
+    bool rx_asm_received[RADE_TEXT_MAX_BLOCKS];
+    int rx_asm_total_blocks; // -1 until a last_block-flagged block is seen
+    bool rx_asm_delivered;   // whether this cycle's message has already fired the callback
 
     int enableStats;
 
     RadeTextImpl()
         : text_rx_callback(nullptr)
         , callback_state(nullptr)
+        , tx_num_blocks(1)
+        , tx_block_index(0)
         , tx_symbol_index(0)
         , rx_write_idx(0)
         , rx_filled(0)
         , rx_sweep_next_rot(LDPC_TOTAL_SIZE_BITS)
         , rx_sweep_num_candidates(0)
+        , rx_sweep_winner{}
+        , rx_asm_total_blocks(-1)
+        , rx_asm_delivered(false)
         , enableStats(1)
     {
-        memset(tx_text, 0, LDPC_TOTAL_SIZE_BITS);
+        memset(tx_text, 0, sizeof(tx_text));
         memset(rx_circular_buf, 0, sizeof(rx_circular_buf));
         memset(rx_sweep_snapshot, 0, sizeof(rx_sweep_snapshot));
-        memset(rx_sweep_winner, 0, sizeof(rx_sweep_winner));
         memset(inbound_pending_syms, 0, sizeof(float) * LDPC_TOTAL_SIZE_BITS);
         memset(inbound_pending_amps, 0, sizeof(float) * LDPC_TOTAL_SIZE_BITS);
+        memset(rx_asm_chars, 0, sizeof(rx_asm_chars));
+        memset(rx_asm_received, 0, sizeof(rx_asm_received));
     }
 
     RadeTextImpl(const RadeTextImpl& rhs)
         : text_rx_callback(rhs.text_rx_callback)
         , callback_state(rhs.callback_state)
+        , tx_num_blocks(rhs.tx_num_blocks)
+        , tx_block_index(rhs.tx_block_index)
         , tx_symbol_index(rhs.tx_symbol_index)
         , rx_write_idx(rhs.rx_write_idx)
         , rx_filled(rhs.rx_filled)
         , rx_sweep_next_rot(rhs.rx_sweep_next_rot)
         , rx_sweep_num_candidates(rhs.rx_sweep_num_candidates)
+        , rx_sweep_winner(rhs.rx_sweep_winner)
+        , rx_asm_total_blocks(rhs.rx_asm_total_blocks)
+        , rx_asm_delivered(rhs.rx_asm_delivered)
         , enableStats(rhs.enableStats)
     {
-        memcpy(tx_text, rhs.tx_text, LDPC_TOTAL_SIZE_BITS);
+        memcpy(tx_text, rhs.tx_text, sizeof(tx_text));
         memcpy(rx_circular_buf, rhs.rx_circular_buf, sizeof(rx_circular_buf));
         memcpy(rx_sweep_snapshot, rhs.rx_sweep_snapshot, sizeof(rx_sweep_snapshot));
-        memcpy(rx_sweep_winner, rhs.rx_sweep_winner, sizeof(rx_sweep_winner));
         memcpy(inbound_pending_syms, rhs.inbound_pending_syms, sizeof(float) * LDPC_TOTAL_SIZE_BITS);
         memcpy(inbound_pending_amps, rhs.inbound_pending_amps, sizeof(float) * LDPC_TOTAL_SIZE_BITS);
+        memcpy(rx_asm_chars, rhs.rx_asm_chars, sizeof(rx_asm_chars));
+        memcpy(rx_asm_received, rhs.rx_asm_received, sizeof(rx_asm_received));
     }
 
     RadeTextImpl(RadeTextImpl&&) noexcept = delete;
@@ -155,74 +241,65 @@ typedef struct RadeTextImpl
 // cover the same ground (up to another full ~4.48s cycle).
 static constexpr int ROTATIONS_PER_CALL = 8;
 
-// 6 bit character set for text field use:
-// 0: ASCII null
-// 1-9: ASCII 38-46
-// 10-19: ASCII '0'-'9'
-// 20-45: ASCII 'A'-'Z'
-// 46: ASCII '/'
-// 47: ASCII ' '
-static void convert_callsign_to_ota_string_(const char *input, char *output, int maxLength)
+// Converts ASCII input to the 38-symbol OTA alphabet (0=null, 1-10='0'-'9',
+// 11-36='A'-'Z', 37='/'), dropping any unsupported characters. Scans at most
+// inputLength characters and writes at most maxOutLength symbols. Returns
+// the number of symbols written.
+static int convert_string_to_ota_chars_(const char *input, int inputLength, uint8_t *output, int maxOutLength)
 {
     assert(input != NULL);
     assert(output != NULL);
-    assert(maxLength >= 0);
 
     int outidx = 0;
-    for (size_t index = 0; index < (size_t)maxLength; index++)
+    for (int index = 0; index < inputLength && outidx < maxOutLength; index++)
     {
-        if (input[index] == 0)
-            break;
-
-        if (input[index] >= 38 && input[index] <= 46)
+        char c = input[index];
+        if (c >= '0' && c <= '9')
         {
-            output[outidx++] = input[index] - 37;
+            output[outidx++] = (uint8_t)(c - '0' + 1);
         }
-        else if (input[index] == '/')
+        else if (c >= 'A' && c <= 'Z')
         {
-            output[outidx++] = 46;
+            output[outidx++] = (uint8_t)(c - 'A' + 11);
         }
-        else if (input[index] >= '0' && input[index] <= '9')
+        else if (c >= 'a' && c <= 'z')
         {
-            output[outidx++] = input[index] - '0' + 10;
+            output[outidx++] = (uint8_t)(toupper(c) - 'A' + 11);
         }
-        else if (input[index] >= 'A' && input[index] <= 'Z')
+        else if (c == '/')
         {
-            output[outidx++] = input[index] - 'A' + 20;
+            output[outidx++] = 37;
         }
-        else if (input[index] >= 'a' && input[index] <= 'z')
-        {
-            output[outidx++] = toupper(input[index]) - 'A' + 20;
-        }
+        // Any other character is silently dropped -- not part of the
+        // callsign-oriented alphabet.
     }
-    output[outidx] = 0;
+    return outidx;
 }
 
-static void convert_ota_string_to_callsign_(const char *input, char *output, int maxLength)
+// Converts up to inputLength OTA alphabet symbols back to ASCII, stopping
+// at the first null (0) symbol (used as terminator/padding). output must be
+// at least inputLength+1 bytes.
+static void convert_ota_chars_to_string_(const uint8_t *input, int inputLength, char *output)
 {
     assert(input != NULL);
     assert(output != NULL);
-    assert(maxLength >= 0);
 
     int outidx = 0;
-    for (size_t index = 0; index < (size_t)maxLength; index++)
+    for (int index = 0; index < inputLength; index++)
     {
-        if (input[index] == 0)
+        uint8_t v = input[index];
+        if (v == 0)
             break;
 
-        if (input[index] >= 1 && input[index] <= 9)
+        if (v >= 1 && v <= 10)
         {
-            output[outidx++] = input[index] + 37;
+            output[outidx++] = (char)('0' + (v - 1));
         }
-        else if (input[index] >= 10 && input[index] <= 19)
+        else if (v >= 11 && v <= 36)
         {
-            output[outidx++] = input[index] - 10 + '0';
+            output[outidx++] = (char)('A' + (v - 11));
         }
-        else if (input[index] >= 20 && input[index] <= 45)
-        {
-            output[outidx++] = input[index] - 20 + 'A';
-        }
-        else if (input[index] == 46)
+        else if (v == 37)
         {
             output[outidx++] = '/';
         }
@@ -230,30 +307,80 @@ static void convert_ota_string_to_callsign_(const char *input, char *output, int
     output[outidx] = 0;
 }
 
-static char calculateCRC8_(char *input, int length)
+// Packs RADE_TEXT_CHARS_PER_BLOCK OTA alphabet symbols (each 0..37) into a
+// single base-38 integer -- denser than fixed-width bit packing since
+// log2(38) is not a whole number of bits (see payload layout comment above).
+static uint64_t pack_chars_base38_(const uint8_t chars[RADE_TEXT_CHARS_PER_BLOCK])
 {
-    assert(input != NULL);
-    assert(length >= 0);
-
-    unsigned char generator = 0x1D;
-    unsigned char crc = 0x00; /* start with 0 so first byte can be 'xored' in */
-
-    while (length > 0)
+    uint64_t acc = 0;
+    for (int i = 0; i < RADE_TEXT_CHARS_PER_BLOCK; i++)
     {
-        unsigned char ch = *input++;
-        length--;
+        acc = acc * RADE_TEXT_ALPHABET_SIZE + chars[i];
+    }
+    return acc;
+}
 
-        // Break out if we see a null.
-        if (ch == 0)
-            break;
+// Reverses pack_chars_base38_(). Well-defined for any 42-bit value, not just
+// ones produced by pack_chars_base38_ -- each extracted digit comes from a
+// modulo-38 operation, so it's always in range even if the packed value
+// arrived via a corrupted (but CRC-accepted) decode.
+static void unpack_chars_base38_(uint64_t acc, uint8_t chars[RADE_TEXT_CHARS_PER_BLOCK])
+{
+    for (int i = RADE_TEXT_CHARS_PER_BLOCK - 1; i >= 0; i--)
+    {
+        chars[i] = (uint8_t)(acc % RADE_TEXT_ALPHABET_SIZE);
+        acc /= RADE_TEXT_ALPHABET_SIZE;
+    }
+}
 
-        crc ^= ch; /* XOR-in the next input byte */
+// Sets numBits bits of value (LSB first) into bitArray starting at startBit.
+// bitArray holds one 0/1 value per element (as used by ldpc_encode's input
+// and ldpc_decode's message output), not packed bytes.
+static void set_bits_lsb_first_(uint8_t *bitArray, int startBit, int numBits, uint64_t value)
+{
+    for (int i = 0; i < numBits; i++)
+    {
+        bitArray[startBit + i] = (value >> i) & 1;
+    }
+}
 
-        for (int i = 0; i < 8; i++)
+static uint64_t get_bits_lsb_first_(const uint8_t *bitArray, int startBit, int numBits)
+{
+    uint64_t value = 0;
+    for (int i = 0; i < numBits; i++)
+    {
+        if (bitArray[startBit + i])
+        {
+            value |= (uint64_t)1 << i;
+        }
+    }
+    return value;
+}
+
+// CRC-8 (poly 0x1D) over a block's framing (block index + last_block flag)
+// and character content, so a bit error that flips block_index/last_block
+// is caught rather than silently misfiling the block during reassembly.
+// Unlike callsign strings, this fixed 9-byte buffer has no "stop at the
+// first zero byte" terminator convention -- block_index 0 combined with
+// last_block false is a legitimate all-zero framing byte, so an early exit
+// on zero would wrongly skip the character bytes that follow it.
+static uint8_t calculateBlockCRC_(const uint8_t chars[RADE_TEXT_CHARS_PER_BLOCK], uint8_t blockIndex, bool lastBlock)
+{
+    uint8_t buf[1 + RADE_TEXT_CHARS_PER_BLOCK];
+    buf[0] = (uint8_t)(blockIndex | (lastBlock ? 0x4 : 0));
+    memcpy(&buf[1], chars, RADE_TEXT_CHARS_PER_BLOCK);
+
+    uint8_t generator = 0x1D;
+    uint8_t crc = 0x00;
+
+    for (size_t i = 0; i < sizeof(buf); i++)
+    {
+        crc ^= buf[i];
+        for (int b = 0; b < 8; b++)
         {
             if ((crc & 0x80) != 0)
             {
-                crc = (unsigned char)((crc << 1) ^ generator);
+                crc = (uint8_t)((crc << 1) ^ generator);
             }
             else
             {
@@ -311,10 +438,12 @@ static float rade_text_estimate_noise_var_(const float *window, int n)
     return var;
 }
 
-static int rade_text_ldpc_decode(rade_text_impl_t *obj, char *dest, const float *window)
+// Attempts an LDPC decode of the current inbound_pending_syms/amps window,
+// filling dest with the raw 56-bit payload (message bits, not yet
+// interpreted as CRC/framing/characters) on success.
+static bool rade_text_ldpc_decode(rade_text_impl_t *obj, std::array<uint8_t, LDPC_PAYLOAD_BITS> &dest, const float *window)
 {
     assert(obj != NULL);
-    assert(dest != NULL);
     assert(window != NULL);
 
     // Calculate raw BER. Only meaningful when this process also generated
@@ -347,7 +476,7 @@ static int rade_text_ldpc_decode(rade_text_impl_t *obj, char *dest, const float 
             // Calculate coded BER.
             int bitsCoded = 0;
             int errorsCoded = 0;
-            for (int index = 0; index < LDPC_TOTAL_SIZE_BITS / 2; index++)
+            for (int index = 0; index < LDPC_PAYLOAD_BITS; index++)
             {
                 bitsCoded++;
                 int err = LastLDPCAsBits[index] != decodeResult.message[index];
@@ -368,18 +497,10 @@ static int rade_text_ldpc_decode(rade_text_impl_t *obj, char *dest, const float 
         // candidates in one burst, the vast majority fail to converge and
         // logging each one would flood the log for no diagnostic value.
         log_debug("decode converged: %d", decodeResult.converged);
-        memset(dest, 0, RADE_TEXT_BYTES_PER_ENCODED_SEGMENT);
 
-        for (int bitIndex = 0; bitIndex < 8; bitIndex++)
+        for (int index = 0; index < LDPC_PAYLOAD_BITS; index++)
         {
-            if (decodeResult.message[bitIndex])
-                dest[0] |= 1 << bitIndex;
-        }
-        for (int bitIndex = 8; bitIndex < (LDPC_TOTAL_SIZE_BITS / 2); bitIndex++)
-        {
-            int bitsSinceCrc = bitIndex - 8;
-            if (decodeResult.message[bitIndex])
-                dest[1 + (bitsSinceCrc / 6)] |= (1 << (bitsSinceCrc % 6));
+            dest[index] = decodeResult.message[index];
         }
     }
 
@@ -399,10 +520,10 @@ static int rade_text_ldpc_decode(rade_text_impl_t *obj, char *dest, const float 
 
 // Attempts a decode of a single candidate 112-symbol window (in codeword
 // bit order, i.e. already assumed correctly rotated). Returns true if it
-// converges and passes CRC, filling outStr (caller-supplied buffer of at
-// least RADE_TEXT_MAX_LENGTH+1 bytes) with the decoded content. Does NOT
-// invoke the RX callback -- callers decide whether/when to deliver it.
-static bool rade_text_try_decode_(rade_text_impl_t *obj, float *window, char *outStr)
+// converges and passes CRC, filling outFields with the decoded block's
+// index/last-block flag/characters. Does NOT touch reassembly state or
+// invoke the RX callback -- callers decide whether/when to deliver.
+static bool rade_text_try_decode_block_(rade_text_impl_t *obj, float *window, RadeTextBlockFields *outFields)
 {
     // Deinterleave received symbols.
     deinterleave_syms(obj->inbound_pending_syms, window, LDPC_TOTAL_SIZE_BITS);
@@ -416,44 +537,105 @@ static bool rade_text_try_decode_(rade_text_impl_t *obj, float *window, char *ou
         obj->inbound_pending_amps[index] = sym_amp;
     }
 
-    char rawStr[RADE_TEXT_MAX_RAW_LENGTH + 1];
-    memset(rawStr, 0, RADE_TEXT_MAX_RAW_LENGTH + 1);
-
-    if (rade_text_ldpc_decode(obj, rawStr, window) == 0)
+    std::array<uint8_t, LDPC_PAYLOAD_BITS> message{};
+    if (rade_text_ldpc_decode(obj, message, window) == 0)
     {
         return false;
     }
 
-    char decodedStr[RADE_TEXT_MAX_RAW_LENGTH + 1];
-    memset(decodedStr, 0, RADE_TEXT_MAX_RAW_LENGTH + 1);
-    convert_ota_string_to_callsign_(&rawStr[RADE_TEXT_CRC_LENGTH], &decodedStr[RADE_TEXT_CRC_LENGTH],
-                                    RADE_TEXT_MAX_LENGTH);
-    decodedStr[0] = rawStr[0]; // CRC
+    uint8_t crc = (uint8_t)get_bits_lsb_first_(message.data(), RADE_TEXT_CRC_BIT_OFFSET, RADE_TEXT_CRC_BITS);
+    bool lastBlock = message[RADE_TEXT_LAST_BLOCK_BIT_OFFSET] != 0;
+    uint8_t blockIndex = (uint8_t)get_bits_lsb_first_(message.data(), RADE_TEXT_BLOCK_INDEX_BIT_OFFSET, RADE_TEXT_BLOCK_INDEX_BITS);
+    uint64_t packedChars = get_bits_lsb_first_(message.data(), RADE_TEXT_CHARS_BIT_OFFSET, RADE_TEXT_PACKED_CHAR_BITS);
 
-    // Get expected and actual CRC.
-    unsigned char receivedCRC = decodedStr[0];
-    unsigned char calcCRC = calculateCRC8_(&rawStr[RADE_TEXT_CRC_LENGTH], RADE_TEXT_MAX_LENGTH);
+    uint8_t chars[RADE_TEXT_CHARS_PER_BLOCK];
+    unpack_chars_base38_(packedChars, chars);
 
-    if (receivedCRC != calcCRC)
+    uint8_t calcCrc = calculateBlockCRC_(chars, blockIndex, lastBlock);
+    if (crc != calcCrc)
     {
         return false;
     }
 
-    memcpy(outStr, &decodedStr[RADE_TEXT_CRC_LENGTH], RADE_TEXT_MAX_LENGTH + 1);
+    outFields->blockIndex = blockIndex;
+    outFields->lastBlock = lastBlock;
+    memcpy(outFields->chars, chars, RADE_TEXT_CHARS_PER_BLOCK);
     return true;
 }
 
-// Attempts a decode of a single candidate window and delivers it via the
-// RX callback immediately if it converges and passes CRC.
-static void rade_text_try_decode_and_deliver_(rade_text_impl_t *obj, float *window)
+// Folds a newly-decoded, CRC-valid block into the in-progress multi-block
+// reassembly, delivering the full message via the RX callback once every
+// block up to the one flagged last_block has been seen. block_index == 0
+// always (re)starts a fresh reassembly (see rx_asm_* fields' comment in
+// RadeTextImpl) -- the only signal available that a new pass through the
+// transmitter's cycle has begun, since blocks may otherwise arrive out of
+// order when a receiver joins mid-cycle.
+static void rade_text_ingest_block_(rade_text_impl_t *obj, const RadeTextBlockFields &fields)
 {
-    char decodedStr[RADE_TEXT_MAX_RAW_LENGTH + 1];
-    if (rade_text_try_decode_(obj, window, decodedStr) && obj->text_rx_callback)
+    if (fields.blockIndex >= RADE_TEXT_MAX_BLOCKS)
+    {
+        return;
+    }
+
+    if (fields.blockIndex == 0)
+    {
+        memset(obj->rx_asm_received, 0, sizeof(obj->rx_asm_received));
+        obj->rx_asm_total_blocks = -1;
+        obj->rx_asm_delivered = false;
+    }
+
+    memcpy(obj->rx_asm_chars[fields.blockIndex], fields.chars, RADE_TEXT_CHARS_PER_BLOCK);
+    obj->rx_asm_received[fields.blockIndex] = true;
+    if (fields.lastBlock)
+    {
+        obj->rx_asm_total_blocks = fields.blockIndex + 1;
+    }
+
+    // Total block count isn't known until a last_block-flagged block has
+    // been seen, and a message already delivered this cycle shouldn't
+    // re-fire on every subsequent block decode within the same cycle (only
+    // once per fresh pass through the cycle, triggered again by the next
+    // block_index == 0 reset above).
+    if (obj->rx_asm_total_blocks < 0 || obj->rx_asm_delivered)
+    {
+        return;
+    }
+
+    for (int b = 0; b < obj->rx_asm_total_blocks; b++)
+    {
+        if (!obj->rx_asm_received[b])
+        {
+            return;
+        }
+    }
+
+    uint8_t allChars[RADE_TEXT_MAX_LENGTH];
+    for (int b = 0; b < obj->rx_asm_total_blocks; b++)
+    {
+        memcpy(&allChars[b * RADE_TEXT_CHARS_PER_BLOCK], obj->rx_asm_chars[b], RADE_TEXT_CHARS_PER_BLOCK);
+    }
+
+    char decodedStr[RADE_TEXT_MAX_LENGTH + 1];
+    convert_ota_chars_to_string_(allChars, obj->rx_asm_total_blocks * RADE_TEXT_CHARS_PER_BLOCK, decodedStr);
+
+    obj->rx_asm_delivered = true;
+
+    if (obj->text_rx_callback)
     {
         log_info("decodedStr: %s", decodedStr);
-
-        // We got a valid string. Call assigned callback.
         obj->text_rx_callback(obj, decodedStr, strlen(decodedStr), obj->callback_state);
+    }
+}
+
+// Attempts a decode of a single candidate window and, if it converges and
+// passes CRC, folds it into the reassembly (which may or may not result in
+// an RX callback -- see rade_text_ingest_block_()).
+static void rade_text_try_decode_block_and_ingest_(rade_text_impl_t *obj, float *window)
+{
+    RadeTextBlockFields fields;
+    if (rade_text_try_decode_block_(obj, window, &fields))
+    {
+        rade_text_ingest_block_(obj, fields);
     }
 }
 
@@ -491,17 +673,18 @@ void rade_text_rx_symbol(rade_text_t ptr, float sym)
 
     if (justFilled)
     {
-        // First opportunity to decode. The transmitter repeats the same
-        // codeword continuously with no framing, so this single buffer
-        // already holds full information about it -- it's simply a
-        // cyclic rotation of the true codeword by however far into the
-        // cycle we happened to start listening. Freeze it and start
-        // sweeping rotations a few at a time on each subsequent call
-        // (see ROTATIONS_PER_CALL) instead of waiting up to another full
-        // cycle for the "naturally" aligned window to slide into place --
-        // and instead of testing all LDPC_TOTAL_SIZE_BITS rotations in
-        // this single call, which would block this real-time callback for
-        // roughly LDPC_TOTAL_SIZE_BITS decode attempts back to back.
+        // First opportunity to decode. The transmitter repeats its block
+        // sequence continuously with no framing between codewords, so this
+        // single buffer already holds full information about whichever
+        // block it landed on -- it's simply a cyclic rotation of that
+        // block's true codeword by however far into it we happened to
+        // start listening. Freeze it and start sweeping rotations a few at
+        // a time on each subsequent call (see ROTATIONS_PER_CALL) instead
+        // of waiting up to another full cycle for the "naturally" aligned
+        // window to slide into place -- and instead of testing all
+        // LDPC_TOTAL_SIZE_BITS rotations in this single call, which would
+        // block this real-time callback for roughly LDPC_TOTAL_SIZE_BITS
+        // decode attempts back to back.
         memcpy(obj->rx_sweep_snapshot, window, sizeof(obj->rx_sweep_snapshot));
         obj->rx_sweep_next_rot = 0;
         obj->rx_sweep_num_candidates = 0;
@@ -532,22 +715,21 @@ void rade_text_rx_symbol(rade_text_t ptr, float sym)
                 rotated[index] = obj->rx_sweep_snapshot[(index + rot) % LDPC_TOTAL_SIZE_BITS];
             }
 
-            char candidateStr[RADE_TEXT_MAX_RAW_LENGTH + 1];
-            if (rade_text_try_decode_(obj, rotated, candidateStr))
+            RadeTextBlockFields candidate;
+            if (rade_text_try_decode_block_(obj, rotated, &candidate))
             {
                 obj->rx_sweep_num_candidates++;
-                memcpy(obj->rx_sweep_winner, candidateStr, sizeof(obj->rx_sweep_winner));
+                obj->rx_sweep_winner = candidate;
             }
         }
 
         if (obj->rx_sweep_next_rot == LDPC_TOTAL_SIZE_BITS)
         {
-            // Sweep complete -- deliver only if there was a unique winner
+            // Sweep complete -- ingest only if there was a unique winner
             // across the whole thing.
-            if (obj->rx_sweep_num_candidates == 1 && obj->text_rx_callback)
+            if (obj->rx_sweep_num_candidates == 1)
             {
-                log_info("decodedStr: %s", obj->rx_sweep_winner);
-                obj->text_rx_callback(obj, obj->rx_sweep_winner, strlen(obj->rx_sweep_winner), obj->callback_state);
+                rade_text_ingest_block_(obj, obj->rx_sweep_winner);
             }
         }
     }
@@ -557,7 +739,7 @@ void rade_text_rx_symbol(rade_text_t ptr, float sym)
         // naturally-sliding window on every new symbol, in case noise
         // caused every rotation tried during the sweep (or since) to fail
         // to converge/validate.
-        rade_text_try_decode_and_deliver_(obj, window);
+        rade_text_try_decode_block_and_ingest_(obj, window);
     }
 }
 
@@ -581,80 +763,74 @@ void rade_text_generate_tx_string(rade_text_t ptr, const char *str, int strlengt
     rade_text_impl_t *impl = (rade_text_impl_t *)ptr;
     assert(impl != NULL);
 
-    char tmp[RADE_TEXT_MAX_RAW_LENGTH + 1];
-    memset(tmp, 0, RADE_TEXT_MAX_RAW_LENGTH + 1);
+    uint8_t otaChars[RADE_TEXT_MAX_LENGTH];
+    int otaLen = convert_string_to_ota_chars_(str, strlength, otaChars, RADE_TEXT_MAX_LENGTH);
 
-    convert_callsign_to_ota_string_(str, &tmp[RADE_TEXT_CRC_LENGTH],
-                                    strlength < RADE_TEXT_MAX_LENGTH ? strlength : RADE_TEXT_MAX_LENGTH);
+    int numBlocks = std::max(1, (otaLen + RADE_TEXT_CHARS_PER_BLOCK - 1) / RADE_TEXT_CHARS_PER_BLOCK);
+    numBlocks = std::min(numBlocks, RADE_TEXT_MAX_BLOCKS);
+    impl->tx_num_blocks = numBlocks;
 
-    int txt_length = strlen(&tmp[RADE_TEXT_CRC_LENGTH]);
-    if (txt_length >= RADE_TEXT_MAX_LENGTH)
+    for (int block = 0; block < numBlocks; block++)
     {
-        txt_length = RADE_TEXT_MAX_LENGTH;
-    }
-    unsigned char crc = calculateCRC8_(&tmp[RADE_TEXT_CRC_LENGTH], txt_length);
-    tmp[0] = crc;
-
-    // Encode block of text using LDPC(112,56).
-    std::array<uint8_t, LDPC_TOTAL_SIZE_BITS / 2> ibits{};  // zero-initialize; bits not explicitly set below must be 0
-    unsigned char pbits[LDPC_TOTAL_SIZE_BITS / 2];
-    memset(pbits, 0, LDPC_TOTAL_SIZE_BITS / 2);
-    for (int index = 0; index < 8; index++)
-    {
-        ibits[index] = 0;
-        if (tmp[0] & (1 << index))
-            ibits[index] = 1;
-    }
-
-    // Pack 6 bit characters into single LDPC block.
-    for (int ibitsBitIndex = 8; ibitsBitIndex < (LDPC_TOTAL_SIZE_BITS / 2); ibitsBitIndex++)
-    {
-        int bitsFromCrc = ibitsBitIndex - 8;
-        unsigned int byte = tmp[RADE_TEXT_CRC_LENGTH + bitsFromCrc / 6];
-        unsigned int bitToCheck = bitsFromCrc % 6;
-        // fprintf(stderr, "bit index: %d, byte: %x, bit to check: %d, result:
-        // %d\n", ibitsBitIndex, byte, bitToCheck, (byte & (1 << bitToCheck)) != 0);
-
-        if (byte & (1 << bitToCheck))
+        uint8_t blockChars[RADE_TEXT_CHARS_PER_BLOCK] = {0};
+        for (int i = 0; i < RADE_TEXT_CHARS_PER_BLOCK; i++)
         {
-            ibits[ibitsBitIndex] = 1;
+            int srcIndex = block * RADE_TEXT_CHARS_PER_BLOCK + i;
+            if (srcIndex < otaLen)
+            {
+                blockChars[i] = otaChars[srcIndex];
+            }
         }
-    }
 
-    auto totalBits = ldpc_encode(ibits);
-    memcpy(pbits, &totalBits[LDPC_TOTAL_SIZE_BITS / 2], LDPC_TOTAL_SIZE_BITS / 2);
+        bool lastBlock = (block == numBlocks - 1);
+        uint8_t crc = calculateBlockCRC_(blockChars, (uint8_t)block, lastBlock);
 
-    // Split LDPC encoded bits into individual bits, with the first
-    // RADE_TEXT_UW_LENGTH_BITS being UW.
-    char tmpbits[LDPC_TOTAL_SIZE_BITS];
+        // Encode block of text using LDPC(112,56).
+        std::array<uint8_t, LDPC_PAYLOAD_BITS> ibits{}; // zero-initialize; bits not explicitly set below (the 3 reserved bits) must be 0
+        set_bits_lsb_first_(ibits.data(), RADE_TEXT_CRC_BIT_OFFSET, RADE_TEXT_CRC_BITS, crc);
+        ibits[RADE_TEXT_LAST_BLOCK_BIT_OFFSET] = lastBlock ? 1 : 0;
+        set_bits_lsb_first_(ibits.data(), RADE_TEXT_BLOCK_INDEX_BIT_OFFSET, RADE_TEXT_BLOCK_INDEX_BITS, (uint64_t)block);
+        set_bits_lsb_first_(ibits.data(), RADE_TEXT_CHARS_BIT_OFFSET, RADE_TEXT_PACKED_CHAR_BITS, pack_chars_base38_(blockChars));
 
-    memset(impl->tx_text, 0, LDPC_TOTAL_SIZE_BITS);
-    memcpy(&tmpbits[0], &ibits[0], LDPC_TOTAL_SIZE_BITS / 2);
-    memcpy(&tmpbits[LDPC_TOTAL_SIZE_BITS / 2], &pbits[0], LDPC_TOTAL_SIZE_BITS / 2);
-    memcpy(LastLDPCAsBits, tmpbits, LDPC_TOTAL_SIZE_BITS);
+        // ldpc_encode() is systematic ([s|p] with s == input), so the
+        // returned codeword already has ibits verbatim in its first half.
+        auto totalBits = ldpc_encode(ibits);
 
-    // Interleave the bits together to enhance fading performance.
-    interleave_bits(&impl->tx_text[0], tmpbits, LDPC_TOTAL_SIZE_BITS);
-
-    if (impl->enableStats)
-    {
-        // Copy floats into memory so we can compare them later (for BER calc).
+        char tmpbits[LDPC_TOTAL_SIZE_BITS];
         for (int index = 0; index < LDPC_TOTAL_SIZE_BITS; index++)
         {
-            LastEncodedLDPC[index] = impl->tx_text[index] ? -1.0f : 1.0f;
+            tmpbits[index] = (char)totalBits[index];
         }
+
+        if (block == numBlocks - 1)
+        {
+            memcpy(LastLDPCAsBits, tmpbits, LDPC_TOTAL_SIZE_BITS);
+        }
+
+        // Interleave the bits together to enhance fading performance.
+        interleave_bits(&impl->tx_text[block][0], tmpbits, LDPC_TOTAL_SIZE_BITS);
+
+        if (impl->enableStats && block == numBlocks - 1)
+        {
+            // Copy floats into memory so we can compare them later (for BER calc).
+            for (int index = 0; index < LDPC_TOTAL_SIZE_BITS; index++)
+            {
+                LastEncodedLDPC[index] = impl->tx_text[block][index] ? -1.0f : 1.0f;
+            }
+        }
+
+        char debugString[LDPC_TOTAL_SIZE_BITS + 1];
+        for (int index = 0; index < LDPC_TOTAL_SIZE_BITS; index++)
+        {
+            debugString[index] = impl->tx_text[block][index] ? '1' : '0';
+        }
+        debugString[LDPC_TOTAL_SIZE_BITS] = 0;
+        log_debug("generated bits (block %d/%d): %s", block, numBlocks, debugString);
     }
 
-    char debugString[LDPC_TOTAL_SIZE_BITS + 1];
-    for (int index = 0; index < LDPC_TOTAL_SIZE_BITS; index++)
-    {
-        debugString[index] = impl->tx_text[index] ? '1' : '0';
-    }
-    debugString[LDPC_TOTAL_SIZE_BITS] = 0;
-    log_debug("generated bits: %s", debugString);
-
-    // Restart the streaming cursor so the newly generated text begins
-    // cleanly on the next call to rade_text_tx_next_symbol().
+    // Restart the streaming cursor so the newly generated message begins
+    // cleanly (at block 0) on the next call to rade_text_tx_next_symbol().
+    impl->tx_block_index = 0;
     impl->tx_symbol_index = 0;
 }
 
@@ -663,8 +839,14 @@ float rade_text_tx_next_symbol(rade_text_t ptr)
     rade_text_impl_t *impl = (rade_text_impl_t *)ptr;
     assert(impl != NULL);
 
-    float sym = impl->tx_text[impl->tx_symbol_index] ? -1.0f : 1.0f;
-    impl->tx_symbol_index = (impl->tx_symbol_index + 1) % LDPC_TOTAL_SIZE_BITS;
+    float sym = impl->tx_text[impl->tx_block_index][impl->tx_symbol_index] ? -1.0f : 1.0f;
+
+    impl->tx_symbol_index++;
+    if (impl->tx_symbol_index >= LDPC_TOTAL_SIZE_BITS)
+    {
+        impl->tx_symbol_index = 0;
+        impl->tx_block_index = (impl->tx_block_index + 1) % impl->tx_num_blocks;
+    }
 
     return sym;
 }

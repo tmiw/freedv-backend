@@ -88,6 +88,27 @@ static std::vector<float> pullSymbols(rade_text_t tx, int count)
     return syms;
 }
 
+// Number of RADE_TEXT_CHARS_PER_BLOCK=8-character blocks a callsign needs
+// (matches rade_text.cpp's chunking; every character used in these tests is
+// in the supported alphabet, so length maps 1:1 to OTA symbol count).
+static int expectedBlocks(const char* callsign)
+{
+    int len = (int)strlen(callsign);
+    int blocks = std::max(1, (len + 7) / 8);
+    return std::min(blocks, 4); // matches RADE_TEXT_MAX_BLOCKS in rade_text.cpp
+}
+
+// Symbol budget for a full round trip of a callsign that may span multiple
+// blocks: one extra full multi-block cycle beyond the initial fill/sweep is
+// enough to guarantee every block has been seen at least once via the
+// naturally-sliding fallback, even in the worst case where the rotation
+// sweep first locks onto the last block in the sequence.
+static int symbolsNeededFor(const char* callsign)
+{
+    int numBlocks = expectedBlocks(callsign);
+    return CODEWORD_SYMS * (numBlocks + 1) + SWEEP_MARGIN;
+}
+
 // Add Gaussian noise to a float symbol array.
 static void addNoiseToSyms(std::vector<float>& syms, float sigma, std::mt19937& rng)
 {
@@ -107,7 +128,7 @@ static void addNoiseToSyms(std::vector<float>& syms, float sigma, std::mt19937& 
 // delivered decode (there may be more than one -- the sweep's decision
 // plus any subsequent fallback hits on the trailing margin symbols) was
 // correct.
-static bool roundTrip(const char* callsign, float sigma = 0.0f, unsigned seed = 42)
+static bool roundTrip(const char* callsign, float sigma = 0.0f, unsigned seed = 42, int totalSyms = SWEEP_COMPLETE_SYMS)
 {
     rade_text_t tx = rade_text_create();
     rade_text_t rx = rade_text_create();
@@ -119,7 +140,7 @@ static bool roundTrip(const char* callsign, float sigma = 0.0f, unsigned seed = 
     rade_text_set_rx_callback(rx, onTextRx, &state);
 
     rade_text_generate_tx_string(tx, callsign, (int)strlen(callsign));
-    auto syms = pullSymbols(tx, SWEEP_COMPLETE_SYMS);
+    auto syms = pullSymbols(tx, totalSyms);
 
     if (sigma > 0.0f) {
         std::mt19937 rng(seed);
@@ -375,15 +396,11 @@ static bool test7_character_encoding_coverage()
 {
     printf("=== Test 7: character encoding coverage ===\n");
 
-    // Characters in the 6-bit OTA alphabet:
-    //   ASCII 38-46 ('&','\'','(',')','*','+',',','-','.') -> OTA 1-9  (skip 0=null)
-    //   ASCII '0'-'9'                                       -> OTA 10-19
-    //   ASCII 'A'-'Z'                                      -> OTA 20-45
-    //   ASCII '/'                                          -> OTA 46
-    //
-    // We test a sample from each range as part of the callsign.
-    // (Real callsigns only use letters and digits but the code supports the
-    // full 6-bit character set, so we exercise that here.)
+    // Characters in the 38-symbol OTA alphabet:
+    //   ASCII '0'-'9' -> OTA 1-10
+    //   ASCII 'A'-'Z' -> OTA 11-36
+    //   ASCII '/'     -> OTA 37
+    // (0 = null, used only as terminator/padding, not an enterable character.)
     struct { const char* label; const char* cs; } cases[] = {
         {"digits only",   "1234567"},
         {"letters only",  "ABCDEFG"},
@@ -400,12 +417,11 @@ static bool test7_character_encoding_coverage()
         ok &= passed;
     }
 
-    // Exhaustively test every individual character in the 6-bit OTA alphabet
-    // (ASCII 38-46 punctuation, '0'-'9', 'A'-'Z', and '/') round-trips on its
-    // own as a single-character string.
+    // Exhaustively test every individual character in the 38-symbol OTA
+    // alphabet ('0'-'9', 'A'-'Z', and '/') round-trips on its own as a
+    // single-character string.
     printf("  -- exhaustive single-character sweep --\n");
     std::string allChars;
-    for (char ch = 38; ch <= 46; ch++) allChars.push_back(ch);
     for (char ch = '0'; ch <= '9'; ch++) allChars.push_back(ch);
     for (char ch = 'A'; ch <= 'Z'; ch++) allChars.push_back(ch);
     allChars.push_back('/');
@@ -424,15 +440,15 @@ static bool test7_character_encoding_coverage()
            (int)allChars.size() - single_fail, allChars.size(), singleOk ? "PASS" : "FAIL");
     ok &= singleOk;
 
-    // Group every valid character into 8-char (max-length) strings to also
-    // exercise multi-character combinations of punctuation, digits, letters,
-    // and '/' together.
+    // Group every valid character into 8-char (one block's worth) strings to
+    // also exercise multi-character combinations of digits, letters, and '/'
+    // together.
     printf("  -- grouped 8-character sweep --\n");
-    constexpr size_t MAX_CALLSIGN_LEN = 8;  // matches RADE_TEXT_MAX_LENGTH in rade_text.cpp
+    constexpr size_t CHARS_PER_BLOCK = 8;  // matches RADE_TEXT_CHARS_PER_BLOCK in rade_text.cpp
     int group_fail = 0;
     int group_total = 0;
-    for (size_t i = 0; i < allChars.size(); i += MAX_CALLSIGN_LEN) {
-        std::string chunk = allChars.substr(i, MAX_CALLSIGN_LEN);
+    for (size_t i = 0; i < allChars.size(); i += CHARS_PER_BLOCK) {
+        std::string chunk = allChars.substr(i, CHARS_PER_BLOCK);
         group_total++;
         bool passed = roundTrip(chunk.c_str());
         printf("  %-10s  %s\n", chunk.c_str(), passed ? "PASS" : "FAIL");
@@ -784,6 +800,120 @@ static bool test15_rotated_first_shot()
 }
 
 // ---------------------------------------------------------------------------
+// Test 16: Multi-block round-trip for compound callsigns (prefix/suffix
+//          combinations longer than one block's 8 characters), plus the
+//          32-character (RADE_TEXT_MAX_LENGTH) boundary and truncation
+//          beyond it.
+// ---------------------------------------------------------------------------
+static bool test16_multi_block_compound_callsigns()
+{
+    printf("=== Test 16: multi-block round-trip for compound callsigns ===\n");
+
+    const char* callsigns[] = {
+        "VE3/KG6AOV",                          // 10 chars, 2 blocks -- country prefix
+        "KG6AOV/MM",                           // 9 chars, 2 blocks -- maritime mobile suffix
+        "VE3/KG6AOV/MM",                       // 13 chars, 2 blocks -- prefix and suffix stacked
+        "F/G3ABC/P",                           // 9 chars, 2 blocks
+        "AAAAAAAABBBBBBBBCCCCCCCCDDDDDDDD",    // 32 chars, exactly 4 full blocks (RADE_TEXT_MAX_LENGTH)
+        "AAAAAAAABBBBBBBBCCCCCCCCDDDDDDDDE",   // 33 chars -- one past max, must truncate to 32
+    };
+
+    bool ok = true;
+    for (const char* cs : callsigns) {
+        int numBlocks = expectedBlocks(cs);
+        int totalSyms = symbolsNeededFor(cs);
+
+        std::string expected(cs);
+        if (expected.size() > 32) expected.resize(32);
+
+        rade_text_t tx = rade_text_create();
+        rade_text_t rx = rade_text_create();
+        rade_text_enable_stats_output(tx, 0);
+        rade_text_enable_stats_output(rx, 0);
+
+        RxState state;
+        rade_text_set_rx_callback(rx, onTextRx, &state);
+
+        rade_text_generate_tx_string(tx, cs, (int)strlen(cs));
+        auto syms = pullSymbols(tx, totalSyms);
+        for (float s : syms) rade_text_rx_symbol(rx, s);
+
+        bool passed = (state.callCount >= 1);
+        for (auto& r : state.allReceived) {
+            if (r != expected) passed = false;
+        }
+        printf("  %-36s (%d blocks)  received='%s'  %s\n",
+               cs, numBlocks, state.received.c_str(), passed ? "PASS" : "FAIL");
+        ok &= passed;
+
+        rade_text_destroy(tx);
+        rade_text_destroy(rx);
+    }
+
+    printf("Multi-block compound callsigns: %s\n\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Test 17: Multi-block reassembly across mid-cycle join offsets.
+//
+// A receiver joining partway through a multi-block cycle may have its
+// rotation sweep lock onto any block in the sequence first (not
+// necessarily block 0), so reassembly must handle blocks arriving out of
+// order -- this validates rade_text_ingest_block_()'s out-of-order handling
+// directly, complementing test15's single-block coverage of the rotation
+// sweep itself.
+// ---------------------------------------------------------------------------
+static bool test17_multi_block_mid_cycle_join()
+{
+    printf("=== Test 17: multi-block reassembly across mid-cycle join offsets ===\n");
+
+    bool ok = true;
+    const char* cs = "VE3/KG6AOV"; // 10 chars -> 2 blocks
+    int numBlocks = expectedBlocks(cs);
+    int cycleLen = CODEWORD_SYMS * numBlocks;
+
+    // Offsets spanning the first block, the second block, and the seam
+    // between them, so the rotation sweep's first lock can land on either
+    // block depending on where in the cycle the receiver joins.
+    int offsets[] = {0, 1, CODEWORD_SYMS - 1, CODEWORD_SYMS, CODEWORD_SYMS + 1, cycleLen - 1};
+
+    for (int off : offsets) {
+        rade_text_t tx = rade_text_create();
+        rade_text_t rx = rade_text_create();
+        rade_text_enable_stats_output(tx, 0);
+        rade_text_enable_stats_output(rx, 0);
+
+        RxState state;
+        rade_text_set_rx_callback(rx, onTextRx, &state);
+
+        rade_text_generate_tx_string(tx, cs, (int)strlen(cs));
+        auto syms = pullSymbols(tx, cycleLen);
+
+        int totalSyms = symbolsNeededFor(cs);
+        std::vector<float> rotatedSyms(totalSyms);
+        for (int i = 0; i < totalSyms; i++)
+            rotatedSyms[i] = syms[(i + off) % cycleLen];
+
+        for (float s : rotatedSyms) rade_text_rx_symbol(rx, s);
+
+        bool passed = (state.callCount >= 1);
+        for (auto& r : state.allReceived) {
+            if (r != cs) passed = false;
+        }
+        printf("  offset=%-4d  callCount=%d  received='%s'  %s\n",
+               off, state.callCount, state.received.c_str(), passed ? "PASS" : "FAIL");
+        ok &= passed;
+
+        rade_text_destroy(tx);
+        rade_text_destroy(rx);
+    }
+
+    printf("Multi-block mid-cycle join: %s\n\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 int main()
@@ -805,6 +935,8 @@ int main()
     success &= test13_high_noise_no_false_positive();
     test14_noise_sweep_diagnostic();   // informational, not in success
     success &= test15_rotated_first_shot();
+    success &= test16_multi_block_compound_callsigns();
+    success &= test17_multi_block_mid_cycle_join();
 
     printf("=== Overall: %s ===\n", success ? "PASS" : "FAIL");
     return success ? 0 : 1;
