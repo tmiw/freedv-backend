@@ -8,8 +8,8 @@ include(ExternalProject)
 ExternalProject_Add(build_rade
    SOURCE_DIR rade_src
    BINARY_DIR rade_build
-   GIT_REPOSITORY https://github.com/drowe67/radae_nopy
-   GIT_TAG dr-radev2
+   GIT_REPOSITORY https://github.com/freedv/rade_c
+   GIT_TAG main
    GIT_SUBMODULES ""
    GIT_SUBMODULES_RECURSE NO
    CMAKE_ARGS ${RADE_CMAKE_ARGS}
