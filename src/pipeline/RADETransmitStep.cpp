@@ -60,7 +60,7 @@ using namespace std::chrono_literals;
 
 #define FEATURE_FIFO_SIZE ((RADE_SPEECH_SAMPLE_RATE / LPCNET_FRAME_SIZE) * rade_n_features_in_out(dv_))
 
-const int RADE_SCALING_FACTOR = 16383;
+const int RADE_SCALING_FACTOR = 16384;
 
 // Additional silence added at the end of the EOO block to ensure that it actually gets
 // transmitted out over the air. This was determined experimentally using the FlexRadio
