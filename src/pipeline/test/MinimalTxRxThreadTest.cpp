@@ -154,7 +154,7 @@ static bool runLossCheck(const char* txFeat, const char* rxFeat)
         RADE_SRC_DIR + "/loss.py " +
         txFeat + " " +
         rxFeat +
-        " --loss_test 0.15 2>&1";
+        " --loss_test 0.0895 --clip_start 100 --clip_end 300 2>&1";
 
     log_info("Running: %s", cmd.c_str());
 
