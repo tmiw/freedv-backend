@@ -228,12 +228,14 @@ static bool runPipeline(
     auto txThread  = std::make_unique<MinimalTxRxThread>(
         true, speechRate, modemRate,
         txHelper, rade, encState, fargan, radeText, &cbData);
+    txThread->disableProcessing();
 
     // Create RX thread (modemRate in → speechRate out)
     auto rxHelper = std::make_shared<MinimalRealtimeHelper>();
     auto rxThread  = std::make_unique<MinimalTxRxThread>(
         false, modemRate, speechRate,
         rxHelper, rade, encState, fargan, radeText, &cbData);
+    rxThread->disableProcessing();
 
     // Start both threads and let them initialise
     txThread->start(); rxThread->start();
