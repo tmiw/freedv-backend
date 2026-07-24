@@ -199,7 +199,7 @@ short* RADEReceiveStep::execute(short* inputSamples, int numInputSamples, int* n
         // demod per frame processing
         for(int i=0; i<nin; i++)
         {
-            inputBufCplx_[i].real = inputBuf_[i] * RADE_INT16_SCALE;
+            inputBufCplx_[i].real = inputBuf_[i] / RADE_INT16_SCALE;
             inputBufCplx_[i].imag = 0.0;
         }
 
