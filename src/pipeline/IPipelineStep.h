@@ -63,11 +63,11 @@ public:
 
 protected:
     // Helper method that converts integer samples to floating point samples
-    template<typename DstType, typename SrcType, SrcType SampleDivisor = std::numeric_limits<SrcType>::max()>
+    template<typename DstType, typename SrcType, SrcType SampleDivisor = std::numeric_limits<SrcType>::max() / 2>
     static void ConvertToFloatSampleType_(SrcType* sourceSamples, DstType* destSamples, std::size_t numSamples);
 
     // Helper method that converts floating point samples to integer samples
-    template<typename DstType, typename SrcType, DstType SampleMultiplier = std::numeric_limits<DstType>::max()>
+    template<typename DstType, typename SrcType, DstType SampleMultiplier = std::numeric_limits<DstType>::max() / 2>
     static void ConvertToIntSampleType_(SrcType* sourceSamples, DstType* destSamples, std::size_t numSamples);
 };
 
