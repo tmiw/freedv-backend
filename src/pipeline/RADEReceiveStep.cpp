@@ -87,7 +87,10 @@ static void freq_shift_coh(RADE_COMP rx_fdm_fcorr[], RADE_COMP rx_fdm[], float f
     foff_rect.imag = sinf(2.0*M_PI*foff/Fs);
     for(i=0; i<nin; i++) {
         *foff_phase_rect = cmult(*foff_phase_rect, foff_rect);
-        rx_fdm_fcorr[i] = cmult(rx_fdm[i], *foff_phase_rect);
+        if (foff != 0.f)
+            rx_fdm_fcorr[i] = cmult(rx_fdm[i], *foff_phase_rect);
+        else
+            rx_fdm_fcorr[i] = rx_fdm[i];
     }
 
     /* normalise digital oscillator as the magnitude can drift over time */
@@ -205,8 +208,7 @@ short* RADEReceiveStep::execute(short* inputSamples, int numInputSamples, int* n
 
         // Optional frequency shifting
         auto offset = freqOffsetFn_();
-        if (offset != 0.f)
-            freq_shift_coh(rxFdmOffset_, inputBufCplx_, offset, RADE_MODEM_SAMPLE_RATE, &rxFreqOffsetPhaseRectObjs_, nin);
+        freq_shift_coh(rxFdmOffset_, inputBufCplx_, offset, RADE_MODEM_SAMPLE_RATE, &rxFreqOffsetPhaseRectObjs_, nin);
         
         // RADE processing (input signal->features).
         int hasEooOut = 0;
