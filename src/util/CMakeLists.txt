@@ -54,5 +54,6 @@ macro(DefineUnitTest utName)
 endmacro()
 
 DefineUnitTest(ThreadedTimerTest)
+DefineUnitTest(GenericFIFOTest)
 endif(BUILD_BACKEND_UNITTESTS)
 
