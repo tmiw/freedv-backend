@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cassert>
+#include <cstdint>
 #include <algorithm>
 #include <atomic>
 
@@ -46,54 +47,92 @@ public:
     GenericFIFO(const GenericFIFO<T>& rhs) = delete;
     GenericFIFO(GenericFIFO<T>&& rhs) noexcept;
     virtual ~GenericFIFO() noexcept;
-    
+
     int write(T* data, int len) noexcept;
     int read(T* result, int len) noexcept;
-    
+
     int numUsed() const noexcept;
     int numFree() const noexcept;
     int capacity() const noexcept;
 
     void reset() noexcept;
-    
+
 private:
     T* buf;
+
+    // pin/pout each pack a 32-bit ring index together with a 32-bit
+    // generation number into a single atomic word. reset() bumps the
+    // generation as part of the same update that rewinds both indices to 0.
+    // This lets write()/read() commit with a single compare_exchange that
+    // verifies *both* "the index I started from is unchanged" and "no
+    // reset() happened in the meantime" atomically -- a plain pointer/index
+    // CAS alone can't distinguish "nothing changed" from "a reset happened
+    // and coincidentally left the index at the same value", since reset()
+    // always rewinds to the same index (0). The generation half of the
+    // packed value only ever increases, so that coincidence can no longer
+    // fool the commit.
+    using Pos = std::uint64_t;
+    static Pos makePos_(std::uint32_t generation, std::uint32_t index) noexcept
+    {
+        return (static_cast<Pos>(generation) << 32) | static_cast<Pos>(index);
+    }
+    static std::uint32_t indexOf_(Pos p) noexcept { return static_cast<std::uint32_t>(p & 0xFFFFFFFFu); }
+    static std::uint32_t generationOf_(Pos p) noexcept { return static_cast<std::uint32_t>(p >> 32); }
+
+    // Returns false (and leaves `used` untouched) if `pinVal`/`poutVal` come
+    // from different generations -- meaning a reset() landed between the two
+    // independent loads that produced them, so any "used" count computed
+    // from them would be meaningless. Callers must treat that as "reload
+    // and try again", never as "0 used".
+    bool computeUsed_(Pos pinVal, Pos poutVal, unsigned int& used) const noexcept
+    {
+        if (generationOf_(pinVal) != generationOf_(poutVal))
+        {
+            return false;
+        }
+
+        int in = static_cast<int>(indexOf_(pinVal));
+        int out = static_cast<int>(indexOf_(poutVal));
+        int diff = in - out;
+        if (diff < 0)
+        {
+            diff += nelem;
+        }
+        used = static_cast<unsigned int>(diff);
+        return true;
+    }
 
 #if !defined(__clang__) && defined(__cpp_lib_hardware_interference_size)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Winterference-size"
 #endif // !defined(__clang__)
-    alignas(hardware_destructive_interference_size) std::atomic<T*> pin;
-    T* poutCache;
-    std::atomic<bool> resetOutCache;
-    alignas(hardware_destructive_interference_size) std::atomic<T*> pout;
-    T* pinCache;
-    std::atomic<bool> resetInCache;
+    alignas(hardware_destructive_interference_size) std::atomic<Pos> pin_;
+    Pos poutCache_;
+    alignas(hardware_destructive_interference_size) std::atomic<Pos> pout_;
+    Pos pinCache_;
 
     int nelem;
     bool ownBuffer_;
 
-    // Serializes concurrent reset() calls and signals canWrite_()/canRead_()
-    // to bail out early rather than racing against a partially-reset FIFO.
-    // Kept on its own cache line to avoid false-sharing with pin/pout.
+    // Serializes concurrent reset() calls so two threads calling reset()
+    // simultaneously can't interleave their independent stores.
+    // Kept on its own cache line to avoid false-sharing with pin_/pout_.
     alignas(hardware_destructive_interference_size) std::atomic<bool> resetting_;
 #if !defined(__clang__)
 #pragma GCC diagnostic pop
 #endif // !defined(__clang__) && defined(__cpp_lib_hardware_interference_size)
 
-    T* canWrite_(int len) noexcept;
-    T* canRead_(int len) noexcept;
+    bool canWrite_(int len, Pos& outStart) noexcept;
+    bool canRead_(int len, Pos& outStart) noexcept;
 };
 
 template<typename T>
 GenericFIFO<T>::GenericFIFO(int len, T* inBuf)
     : buf(inBuf)
-    , pin(nullptr)
-    , poutCache(nullptr)
-    , resetOutCache(false)
-    , pout(nullptr)
-    , pinCache(nullptr)
-    , resetInCache(false)
+    , pin_(makePos_(0, 0))
+    , poutCache_(makePos_(0, 0))
+    , pout_(makePos_(0, 0))
+    , pinCache_(makePos_(0, 0))
     , nelem(len)
     , ownBuffer_(inBuf == nullptr ? true : false)
     , resetting_(false)
@@ -103,11 +142,6 @@ GenericFIFO<T>::GenericFIFO(int len, T* inBuf)
         buf = new T[nelem];
         assert(buf != nullptr);
     }
-    
-    pin = buf;
-    poutCache = buf;
-    pout = buf;
-    pinCache = buf;
 }
 
 template<typename T>
@@ -122,28 +156,26 @@ GenericFIFO<T>::~GenericFIFO() noexcept
 template<typename T>
 GenericFIFO<T>::GenericFIFO(GenericFIFO<T>&& rhs) noexcept
     : buf(rhs.buf)
-    , pin(rhs.pin.load())
-    , poutCache(rhs.poutCache)
-    , pout(rhs.pout.load())
-    , pinCache(rhs.pinCache)
+    , pin_(rhs.pin_.load())
+    , poutCache_(rhs.poutCache_)
+    , pout_(rhs.pout_.load())
+    , pinCache_(rhs.pinCache_)
     , nelem(rhs.nelem)
+    , ownBuffer_(rhs.ownBuffer_)
     , resetting_(false)
 {
     rhs.buf = nullptr;
-    rhs.pin = nullptr;
-    rhs.poutCache = nullptr;
-    rhs.pout = nullptr;
-    rhs.pinCache = nullptr;
+    rhs.pin_ = makePos_(0, 0);
+    rhs.poutCache_ = makePos_(0, 0);
+    rhs.pout_ = makePos_(0, 0);
+    rhs.pinCache_ = makePos_(0, 0);
     rhs.nelem = 0;
 }
 
 template<typename T>
 void GenericFIFO<T>::reset() noexcept
 {
-    // Serialise concurrent reset() calls.  Two threads calling reset()
-    // simultaneously would interleave their four independent stores, which can
-    // leave the FIFO in a state where one pointer has been reset while the
-    // other still holds an old value.
+    // Serialise concurrent reset() calls.
     bool expected = false;
     while (!resetting_.compare_exchange_weak(
                expected, true,
@@ -153,95 +185,65 @@ void GenericFIFO<T>::reset() noexcept
         expected = false;
     }
 
-    // Invalidate both caches BEFORE resetting the pointers.
-    //
-    // If canWrite_() or canRead_() runs between the pointer reset and the flag
-    // set it would pair a freshly-reset pointer against a stale cache value,
-    // producing a nonsensical "used" count.  Setting the flags first forces
-    // both sides to reload from the atomic pin/pout after the pointers land.
-    resetOutCache.store(true, std::memory_order_seq_cst);
-    resetInCache.store(true,  std::memory_order_seq_cst);
+    // Bump the generation as part of rewinding both indices to 0. Any
+    // writer/reader whose in-flight write()/read() started before this
+    // point will have its commit CAS fail (see write()/read()), since its
+    // captured Pos can never match a Pos from a newer generation.
+    Pos oldPin = pin_.load(std::memory_order_acquire);
+    Pos freshPos = makePos_(generationOf_(oldPin) + 1, 0);
 
-    pin.store(buf,  std::memory_order_seq_cst);
-    pout.store(buf, std::memory_order_seq_cst);
+    pin_.store(freshPos, std::memory_order_seq_cst);
+    pout_.store(freshPos, std::memory_order_seq_cst);
 
     resetting_.store(false, std::memory_order_release);
 }
 
-#define CALCULATE_ENTRIES_USED(in, out, used)     \
-    if (in >= out)                                \
-    {                                             \
-        used = in - out;                          \
-    }                                             \
-    else                                          \
-    {                                             \
-        used = nelem + (unsigned int)(in - out);  \
-    }
-
 template<typename T>
-T* GenericFIFO<T>::canWrite_(int len) noexcept
+bool GenericFIFO<T>::canWrite_(int len, Pos& outStart) noexcept
 {
-    // Bail immediately if a reset() is in progress.  The write will be lost,
-    // but that is preferable to working with a partially-reset FIFO state.
-    if (resetting_.load(std::memory_order_acquire)) return nullptr;
+    if (resetting_.load(std::memory_order_acquire)) return false;
 
-    T *ppin = pin.load(std::memory_order_acquire);
+    Pos ppin = pin_.load(std::memory_order_acquire);
     unsigned int used = 0;
 
-    bool isResetting = resetOutCache.load(std::memory_order_relaxed);
-    if (!isResetting)
+    bool ok = computeUsed_(ppin, poutCache_, used);
+    if (!ok || (nelem - (int)used - 1) < len)
     {
-        CALCULATE_ENTRIES_USED(ppin, poutCache, used);
-    }
-    else
-    {
-        resetOutCache.store(false, std::memory_order_release);
-    }
-    if (isResetting || (nelem - used - 1) < (unsigned)len)
-    {
-        // reload poutCache and test again
-        poutCache = pout.load(std::memory_order_acquire);
-        CALCULATE_ENTRIES_USED(ppin, poutCache, used);
-        if ((nelem - used - 1) < (unsigned)len)
+        // Stale or insufficient -- reload poutCache_ and test again.
+        poutCache_ = pout_.load(std::memory_order_acquire);
+        ok = computeUsed_(ppin, poutCache_, used);
+        if (!ok || (nelem - (int)used - 1) < len)
         {
-            return nullptr;
+            return false;
         }
     }
 
-    return ppin;
+    outStart = ppin;
+    return true;
 }
 
 template<typename T>
-T* GenericFIFO<T>::canRead_(int len) noexcept
+bool GenericFIFO<T>::canRead_(int len, Pos& outStart) noexcept
 {
-    // Bail immediately if a reset() is in progress.  Returning stale data from
-    // a partially-reset FIFO is worse than returning nothing.
-    if (resetting_.load(std::memory_order_acquire)) return nullptr;
+    if (resetting_.load(std::memory_order_acquire)) return false;
 
-    T* ppout = pout.load(std::memory_order_acquire);
+    Pos ppout = pout_.load(std::memory_order_acquire);
     unsigned int used = 0;
 
-    bool isResetting = resetInCache.load(std::memory_order_relaxed);
-    if (!isResetting)
+    bool ok = computeUsed_(pinCache_, ppout, used);
+    if (!ok || used < (unsigned)len)
     {
-        CALCULATE_ENTRIES_USED(pinCache, ppout, used);
-    }
-    else
-    {
-        resetInCache.store(false, std::memory_order_release);
-    }
-
-    if (isResetting || used < (unsigned)len)
-    {
-        pinCache = pin.load(std::memory_order_acquire);
-        CALCULATE_ENTRIES_USED(pinCache, ppout, used);
-        if (used < (unsigned)len)
+        // Stale or insufficient -- reload pinCache_ and test again.
+        pinCache_ = pin_.load(std::memory_order_acquire);
+        ok = computeUsed_(pinCache_, ppout, used);
+        if (!ok || used < (unsigned)len)
         {
-            return nullptr;
+            return false;
         }
     }
 
-    return ppout;
+    outStart = ppout;
+    return true;
 }
 
 template<typename T>
@@ -249,23 +251,38 @@ int GenericFIFO<T>::write(T* data, int len) noexcept
 {
     assert(data != NULL);
 
-    T* ppin = canWrite_(len);
-    if (ppin == nullptr)
+    Pos startPos;
+    if (!canWrite_(len, startPos))
     {
         return -1;
-    } 
-    else 
+    }
+
+    std::uint32_t gen = generationOf_(startPos);
+    std::uint32_t idx = indexOf_(startPos);
+    while (len > 0)
     {
-        while (len > 0)
+        buf[idx] = *data++;
+        idx++;
+        if (idx >= (std::uint32_t)nelem)
         {
-            *ppin++ = *data++;
-            if (ppin >= (buf + nelem))
-            {
-                ppin = buf;
-            }
-            len--;
+            idx = 0;
         }
-        pin.store(ppin, std::memory_order_release);
+        len--;
+    }
+
+    // Commit only if `pin_` still holds exactly the (generation, index) we
+    // started from. In normal SPSC operation we're the sole writer, so the
+    // only thing that can move `pin_` out from under us is a concurrent
+    // reset(), which always changes the generation -- so this can never be
+    // fooled by a coincidental index match the way a bare-pointer CAS could.
+    // If it fails, abandon this write rather than clobbering the freshly
+    // reset FIFO, consistent with reset()'s "a lost write beats a corrupted
+    // FIFO" policy.
+    Pos expected = startPos;
+    Pos newPos = makePos_(gen, idx);
+    if (!pin_.compare_exchange_strong(expected, newPos, std::memory_order_release, std::memory_order_relaxed))
+    {
+        return -1;
     }
 
     return 0;
@@ -276,23 +293,32 @@ int GenericFIFO<T>::read(T* result, int len) noexcept
 {
     assert(result != NULL);
 
-    T* ppout = canRead_(len);
-    if (ppout == nullptr)
+    Pos startPos;
+    if (!canRead_(len, startPos))
     {
         return -1;
-    } 
-    else 
+    }
+
+    std::uint32_t gen = generationOf_(startPos);
+    std::uint32_t idx = indexOf_(startPos);
+    while (len > 0)
     {
-        while (len > 0)
+        *result++ = buf[idx];
+        idx++;
+        if (idx >= (std::uint32_t)nelem)
         {
-            *result++ = *ppout++;
-            if (ppout >= (buf + nelem))
-            {
-                ppout = buf;
-            }
-            len--;
-        } 
-        pout.store(ppout, std::memory_order_release);
+            idx = 0;
+        }
+        len--;
+    }
+
+    // See write() -- commit only if `pout_` still holds exactly the
+    // (generation, index) canRead_() handed us.
+    Pos expected = startPos;
+    Pos newPos = makePos_(gen, idx);
+    if (!pout_.compare_exchange_strong(expected, newPos, std::memory_order_release, std::memory_order_relaxed))
+    {
+        return -1;
     }
 
     return 0;
@@ -301,16 +327,22 @@ int GenericFIFO<T>::read(T* result, int len) noexcept
 template<typename T>
 int GenericFIFO<T>::numUsed() const noexcept
 {
-    T *ppin = pin.load(std::memory_order_acquire);
-    T *ppout = pout.load(std::memory_order_acquire);
-    unsigned int used;
+    Pos ppin = pin_.load(std::memory_order_acquire);
+    Pos ppout = pout_.load(std::memory_order_acquire);
+    unsigned int used = 0;
 
-    if (ppin >= ppout)
-      used = ppin - ppout;
-    else
-      used = nelem + (unsigned int)(ppin - ppout);
+    // If a reset() landed exactly between these two independent loads,
+    // they'll disagree on generation; report the FIFO as momentarily empty
+    // rather than computing nonsense from mismatched generations. This is a
+    // narrow, transient window on a diagnostic/sizing method, not a
+    // correctness-critical path (write()/read() use the generation-checked
+    // commit above, not this method).
+    if (!computeUsed_(ppin, ppout, used))
+    {
+        return 0;
+    }
 
-    return used;
+    return (int)used;
 }
 
 template<typename T>
@@ -334,11 +366,11 @@ class PreAllocatedFIFO : public GenericFIFO<T>
 public:
     PreAllocatedFIFO();
     virtual ~PreAllocatedFIFO() = default;
-    
+
     // No move/copies possible.
     PreAllocatedFIFO(const PreAllocatedFIFO<T, StaticSize>& rhs) = delete;
     PreAllocatedFIFO(PreAllocatedFIFO<T, StaticSize>&& rhs) = delete;
-    
+
 private:
     T ourBuf[StaticSize];
 };
