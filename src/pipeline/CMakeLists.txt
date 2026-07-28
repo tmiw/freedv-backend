@@ -22,7 +22,7 @@ add_library(fdv_audio_pipeline STATIC
 
 add_dependencies(fdv_audio_pipeline rade opus)
 target_compile_options(fdv_audio_pipeline PRIVATE ${WARNINGS_AS_ERRORS_FLAGS})
-target_link_libraries(fdv_audio_pipeline PRIVATE ${LIBEBUR128} agc rnnoise fdv_os_wrapper samplerate fdv_util)
+target_link_libraries(fdv_audio_pipeline PRIVATE ${LIBEBUR128} agc rnnoise fdv_os_wrapper r8brain fdv_util)
 target_link_libraries(fdv_audio_pipeline INTERFACE rade opus rnnoise)
 target_include_directories(fdv_audio_pipeline PRIVATE ${CODEC2_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_BINARY_DIR}/..)
 target_include_directories(fdv_audio_pipeline PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -30,7 +30,7 @@ target_include_directories(fdv_audio_pipeline PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
 if(BUILD_BACKEND_UNITTESTS)
 macro(DefineUnitTest utName)
     add_executable(${utName} test/${utName}.cpp)
-    target_link_libraries(${utName} PRIVATE fdv_audio_pipeline fdv_util samplerate)
+    target_link_libraries(${utName} PRIVATE fdv_audio_pipeline fdv_util r8brain)
     target_include_directories(${utName} PRIVATE ${CODEC2_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_BINARY_DIR}/..)
 
     add_test(NAME pipeline_${utName} COMMAND ${CMAKE_CURRENT_BINARY_DIR}/${utName})
@@ -50,7 +50,7 @@ DefineUnitTest(ldpc_decode)
 DefineUnitTest(ldpc_encode)
 
 DefineUnitTest(RadeTextTest)
-target_link_libraries(RadeTextTest PRIVATE rade opus samplerate)
+target_link_libraries(RadeTextTest PRIVATE rade opus r8brain)
 
 DefineUnitTest(RadeTextUnitTest)
 #endif(LINUX)
@@ -113,7 +113,7 @@ if(RADAE_PYTHON_EXECUTABLE)
     ExternalProject_Get_Property(rade_python SOURCE_DIR)
 
     DefineUnitTest(MinimalTxRxThreadTest)
-    target_link_libraries(MinimalTxRxThreadTest PRIVATE rade opus samplerate)
+    target_link_libraries(MinimalTxRxThreadTest PRIVATE rade opus r8brain)
     target_compile_definitions(MinimalTxRxThreadTest PRIVATE
 	    RADE_SRC_DIR="${SOURCE_DIR}"
         PYTHON_EXECUTABLE="${RADAE_PYTHON_EXECUTABLE}")

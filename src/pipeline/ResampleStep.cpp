@@ -38,33 +38,36 @@
 #include <assert.h>
 #include <cstdio>
 
-ResampleStep::ResampleStep(int inputSampleRate, int outputSampleRate, bool forPlotsOnly)
+int r8b::InterpFilterFracs = -1;
+
+ResampleStep::ResampleStep(int inputSampleRate, int outputSampleRate, bool)
     : inputSampleRate_(inputSampleRate)
     , outputSampleRate_(outputSampleRate)
 {
     int maxInputLen = inputSampleRate * 10 / 1000;
-    int maxOutputLen = outputSampleRate * 20 / 1000; // twice as much time just in case a block is bigger than usual
-    int src_error = 0;
 
-    resampleState_ = src_new(forPlotsOnly ? SRC_LINEAR : SRC_SINC_MEDIUM_QUALITY, 1, &src_error);
+    // r8brain is fast enough that we don't need special transition bands
+    // for plots.
+    double reqTransBand = 7.0;
+
+    resampleState_ = new r8b::CDSPResampler24(
+        inputSampleRate, outputSampleRate, maxInputLen, reqTransBand);
     assert(resampleState_ != nullptr);
 
     // Pre-allocate buffers so we don't have to do so during real-time operation.
     outputSamples_ = std::make_unique<short[]>(outputSampleRate);
     assert(outputSamples_ != nullptr);
 
-    tempInput_ = new float[maxInputLen];
+    tempInput_ = new double[maxInputLen];
     assert(tempInput_ != nullptr);
 
-    tempOutput_ = new float[maxOutputLen];
-    assert(tempOutput_ != nullptr);
+    prewarm_();
 }
 
 ResampleStep::~ResampleStep()
 {
-    src_delete(resampleState_);
+    delete resampleState_;
     delete[] tempInput_;
-    delete[] tempOutput_;
 }
 
 int ResampleStep::getInputSampleRate() const FREEDV_NONBLOCKING
@@ -99,47 +102,17 @@ short* ResampleStep::execute(short* inputSamples, int numInputSamples, int* numO
     auto outputPtr = outputSamples_.get();
     while (numInputSamples > 0)
     {
-        SRC_DATA src_data;
-
         int inputSize = std::min(numInputSamples, inputSampleRate_ * 10 / 1000);
-        int outputSize = outputSampleRate_ * 20 / 1000;
 
-        // libsamplerate is unlikely to use RT-unsafe constructs in normal use
-        // (verified with RTsan-enabled automated testing). Verified on 2025-09-30.
-        FREEDV_BEGIN_VERIFIED_SAFE
-        src_short_to_float_array(inputPtr, tempInput_, inputSize);
-        FREEDV_END_VERIFIED_SAFE
+        ConvertToFloatSampleType_<double, short>(inputPtr, tempInput_, inputSize);
+        double* tempOutputPtr = nullptr;
+        auto numSamples = resampleState_->process(tempInput_, inputSize, tempOutputPtr);
+        ConvertToIntSampleType_<short, double>(tempOutputPtr, outputPtr, numSamples);
 
-        //ConvertToFloatSampleType_<float, short>(inputPtr, tempInput_, inputSize);
-
-        src_data.data_in = tempInput_;
-        src_data.data_out = tempOutput_;
-        src_data.input_frames = inputSize;
-        src_data.output_frames = outputSize;
-        src_data.end_of_input = 0;
-        src_data.src_ratio = (double)outputSampleRate_/(double)inputSampleRate_;
-
-        // libsamplerate is unlikely to use RT-unsafe constructs in normal use
-        // (verified with RTsan-enabled automated testing). Verified on 2025-09-30.
-        FREEDV_BEGIN_VERIFIED_SAFE
-        int ret = src_process(resampleState_, &src_data);
-        assert(ret == 0);
-        (void)ret; // silence compiler warnings on release builds -- can't log in RT code.
-        assert(src_data.output_frames_gen <= outputSize);
-        FREEDV_END_VERIFIED_SAFE
-
-        //ConvertToIntSampleType_<short, float>(tempOutput_, outputPtr, src_data.output_frames_gen);
-        // libsamplerate is unlikely to use RT-unsafe constructs in normal use
-        // (verified with RTsan-enabled automated testing). Verified on 2025-09-30.
-        FREEDV_BEGIN_VERIFIED_SAFE
-        src_float_to_short_array(tempOutput_, outputPtr, src_data.output_frames_gen);
-        FREEDV_END_VERIFIED_SAFE
-
-
-        outputPtr += src_data.output_frames_gen;
+        outputPtr += numSamples;
         inputPtr += inputSize;
         numInputSamples -= inputSize;
-        *numOutputSamples += src_data.output_frames_gen;
+        *numOutputSamples += numSamples;
     }
     
     return outputSamples_.get();
@@ -147,5 +120,28 @@ short* ResampleStep::execute(short* inputSamples, int numInputSamples, int* numO
 
 void ResampleStep::reset() FREEDV_NONBLOCKING
 {
-    src_reset(resampleState_);
+    resampleState_->clear();
+    prewarm_();
+}
+
+void ResampleStep::prewarm_()
+{
+    if (inputSampleRate_ == outputSampleRate_) return;
+
+    int maxInputLen = inputSampleRate_ * 10 / 1000;
+    std::fill_n(tempInput_, maxInputLen, 0.0);
+
+    // Feed zero-valued samples until the resampler produces its first output.
+    // r8brain with DoConsumeLatency=true silently discards the first Latency
+    // input samples before emitting any output. Pre-warming here consumes that
+    // startup latency so that real audio produces output from the first sample,
+    // matching libsamplerate's behaviour and keeping feature files aligned.
+    double* tempOutputPtr = nullptr;
+    int lenRequired = resampleState_->getInLenBeforeOutPos(0);
+    while (lenRequired > 0)
+    {
+        int len = std::min(lenRequired, maxInputLen);
+        resampleState_->process(tempInput_, len, tempOutputPtr);
+        lenRequired -= len;
+    }
 }
