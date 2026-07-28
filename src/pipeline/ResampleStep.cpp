@@ -50,7 +50,7 @@ ResampleStep::ResampleStep(int inputSampleRate, int outputSampleRate, bool)
     // for plots.
     double reqTransBand = 7.0;
 
-    resampleState_ = new r8b::CDSPResampler24(
+    resampleState_ = new r8b::CDSPResampler(
         inputSampleRate, outputSampleRate, maxInputLen, reqTransBand);
     assert(resampleState_ != nullptr);
 
