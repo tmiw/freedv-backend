@@ -342,6 +342,38 @@ void rade_text_rx(rade_text_t ptr, float *syms, int symSize)
         {
             RADE_COMP *sym = &obj->inbound_pending_syms[index];
             rms += sym->real * sym->real + sym->imag * sym->imag;
+
+            // Pool a payload-derived noise contribution in with the pilot
+            // (known-sequence) one above. Payload symbols use the same
+            // |s|=1 4-point constellation as the pilots, so after
+            // per-symbol amplitude normalization we can measure squared
+            // distance to the *nearest* candidate point (decision-directed)
+            // and treat it the same as a pilot residual. This draws samples
+            // from the actual payload symbols' own time/frequency slots
+            // rather than relying solely on a separate 34-symbol pilot
+            // region that may have faded differently, and roughly triples
+            // the sample count backing the noise estimate (56 payload + 34
+            // pilot vs. 34 pilot alone). Decision-directed estimates are
+            // known to be biased low at low SNR (wrong decisions look
+            // artificially "close" to themselves); pooling with the
+            // unbiased pilot samples keeps that bias from dominating.
+            float sym_amp = std::sqrt(sym->real * sym->real + sym->imag * sym->imag);
+            if (sym_amp > 0)
+            {
+                float nr = sym->real / sym_amp;
+                float ni = sym->imag / sym_amp;
+                static const float candidates[4][2] = { {1, 0}, {0, 1}, {0, -1}, {-1, 0} };
+                float bestDist = 1e30f;
+                for (int c = 0; c < 4; c++)
+                {
+                    float dr = candidates[c][0] - nr;
+                    float di = candidates[c][1] - ni;
+                    float dist = dr * dr + di * di;
+                    if (dist < bestDist) bestDist = dist;
+                }
+                ss += bestDist;
+                ssCnt += 2;
+            }
         }
         else
         {
@@ -366,7 +398,7 @@ void rade_text_rx(rade_text_t ptr, float *syms, int symSize)
             }
         }
     }
-    rms = sqrtf(rms / symSize);
+    rms = sqrtf(rms / (LDPC_TOTAL_SIZE_BITS / 2));
 
     // Copy over symbols prior to decode.
     for (int index = 0; index < LDPC_TOTAL_SIZE_BITS / 2; index++)
