@@ -13,7 +13,7 @@ index 8328d5b..d8c24ab 100644
          float *z = &z_all[fr * z_per_frame];
          for (int i = 0; i < z_per_frame; i++) {
 diff --git a/src/rade_ofdm.c b/src/rade_ofdm.c
-index 60bc9ba..0ad0a0c 100644
+index 60bc9ba..7f419f0 100644
 --- a/src/rade_ofdm.c
 +++ b/src/rade_ofdm.c
 @@ -386,7 +386,7 @@ void rade_ofdm_est_pilots(const rade_ofdm *ofdm, RADE_COMP *pilot_est,
@@ -39,7 +39,7 @@ index 60bc9ba..0ad0a0c 100644
  /* Demodulate one modem frame */
  int rade_ofdm_demod_frame(const rade_ofdm *ofdm, float *z_hat, const RADE_COMP *rx_in,
 -                          int time_offset, int endofover, int coarse_mag, float *snr_est) {
-+                          int time_offset, int endofover, int coarse_mag, float *snr_est
++                          int time_offset, int endofover, int coarse_mag, float *snr_est,
 +			  float *S1_out, float *S2_out) {
      int Nc = ofdm->nc;
      int M = ofdm->m;
@@ -54,7 +54,7 @@ index 60bc9ba..0ad0a0c 100644
          /* Demap QPSK to latent floats */
          int out_idx = 0;
 diff --git a/src/rade_ofdm.h b/src/rade_ofdm.h
-index ceb3a80..4181400 100644
+index ceb3a80..f00308e 100644
 --- a/src/rade_ofdm.h
 +++ b/src/rade_ofdm.h
 @@ -130,18 +130,22 @@ void rade_ofdm_est_pilots(const rade_ofdm *ofdm, RADE_COMP *pilot_est,
@@ -78,7 +78,7 @@ index ceb3a80..4181400 100644
     Returns number of output floats (latent_dim * nzmf) */
  int rade_ofdm_demod_frame(const rade_ofdm *ofdm, float *z_hat, const RADE_COMP *rx_in,
 -                          int time_offset, int endofover, int coarse_mag, float *snr_est);
-+                          int time_offset, int endofover, int coarse_mag, float *snr_est
++                          int time_offset, int endofover, int coarse_mag, float *snr_est,
 +			  float *S1_out, float *S2_out);
  
  /*---------------------------------------------------------------------------*\
