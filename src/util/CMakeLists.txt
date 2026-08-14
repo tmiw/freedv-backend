@@ -34,6 +34,7 @@ if(NOT DISABLE_TLS_SUPPORT)
 
     if (OpenSSL_FOUND)
         target_link_libraries(fdv_util OpenSSL::SSL)
+	target_compile_definitions(fdv_util PUBLIC ENABLE_TLS_SUPPORT_WITH_OPENSSL)
     else (OpenSSL_FOUND)
         target_link_libraries(fdv_util tls)
     endif (OpenSSL_FOUND)
