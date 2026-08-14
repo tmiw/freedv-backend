@@ -545,7 +545,7 @@ next_fd:
 
                 auto sslCertDirEnv = getenv("SSL_CERT_DIR"); // NOLINT
                 auto sslCertFileEnv = getenv("SSL_CERT_FILE"); // NOLINT
-                if (!SSL_CTX_load_verify_locations(sslCtx_.load(std::memory_order_acquire), sslCertFileEnv, sslCertDirEnv))
+                if ((sslCertDirEnv != nullptr || sslCertFileEnv != nullptr) && !SSL_CTX_load_verify_locations(sslCtx_.load(std::memory_order_acquire), sslCertFileEnv, sslCertDirEnv))
                 {
                     auto errStr = GetSSLError_();
                     log_warn("Unable to set TLS certificate locations: %s", errStr.c_str());
