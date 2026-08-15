@@ -535,13 +535,17 @@ next_fd:
 #else
                 if (!SSL_CTX_set_default_verify_paths(sslCtx_.load(std::memory_order_acquire)))
                 {
+#if defined(__APPLE__) && defined(ENABLE_TLS_SUPPORT_WITH_OPENSSL)
+                    log_info("Setting TLS certificate validation paths failed, but this is expected on macOS");
+#else
                     auto errStr = GetSSLError_();
                     log_warn("Unable to set TLS certificate validation paths: %s", errStr.c_str());
+#endif // defined(__APPLE__) && defined(ENABLE_TLS_SUPPORT_WITH_OPENSSL)
                 }
 
                 auto sslCertDirEnv = getenv("SSL_CERT_DIR"); // NOLINT
                 auto sslCertFileEnv = getenv("SSL_CERT_FILE"); // NOLINT
-                if (!SSL_CTX_load_verify_locations(sslCtx_.load(std::memory_order_acquire), sslCertFileEnv, sslCertDirEnv))
+                if ((sslCertDirEnv != nullptr || sslCertFileEnv != nullptr) && !SSL_CTX_load_verify_locations(sslCtx_.load(std::memory_order_acquire), sslCertFileEnv, sslCertDirEnv))
                 {
                     auto errStr = GetSSLError_();
                     log_warn("Unable to set TLS certificate locations: %s", errStr.c_str());
