@@ -76,10 +76,20 @@ index ceb3a80..566e4e2 100644
  /*---------------------------------------------------------------------------*\
                             EOO HANDLING
 diff --git a/src/rade_rx.c b/src/rade_rx.c
-index 37ab98d..11a7a84 100644
+index 37ab98d..9db0d31 100644
 --- a/src/rade_rx.c
 +++ b/src/rade_rx.c
-@@ -241,7 +241,8 @@ int rade_rx_process(rade_rx_state *rx, float *features_out, float *eoo_out, cons
+@@ -233,15 +233,16 @@ int rade_rx_process(rade_rx_state *rx, float *features_out, float *eoo_out, cons
+         rx->rx_phase = rx_phase;
+ 
+         /* Normalize phase to prevent drift */
+-        //float phase_mag = rade_cabs(rx->rx_phase);
+-        //rx->rx_phase = rade_cscale(rx->rx_phase, 1.0f / phase_mag);
++        float phase_mag = rade_cabs(rx->rx_phase);
++        rx->rx_phase = rade_cscale(rx->rx_phase, 1.0f / phase_mag);
+ 
+         /* Demodulate OFDM frame */
+         float z_hat[RADE_NZMF * RADE_LATENT_DIM];
          float snr_est = 0.0f;
  
          rade_ofdm_demod_frame(&rx->ofdm, z_hat, rx_corrected,
