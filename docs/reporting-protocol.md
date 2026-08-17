@@ -1,6 +1,6 @@
 # Reporting Protocol Reference
 
-This document describes the two pieces of "reporting" functionality implemented in
+This document describes three pieces of "reporting" functionality implemented in
 this repository:
 
 1. [**On-air callsign encoding**](#1-on-air-callsign-encoding-rade-reliable-text) — how a callsign (including compound
@@ -9,10 +9,14 @@ this repository:
 2. [**FreeDV Reporter client protocol**](#2-freedv-reporter-client-protocol) — how a client
    (e.g. `freedv-gui`) talks to the `qso.freedv.org` FreeDV Reporter server: connection,
    authentication, and the JSON messages exchanged in both directions.
+3. [**UDP callsign broadcast protocol**](#3-udp-callsign-broadcast-protocol) — how a
+   client broadcasts received-callsign records as JSON UDP datagrams on the local
+   network/LAN, for consumption by other local software (e.g. logging applications).
 
 Source of truth is the code in `src/pipeline/rade_text.{h,cpp}`,
 `src/pipeline/ldpc_encode.{h,cpp}`, `src/pipeline/ldpc_decode.{h,cpp}`,
-`src/reporting/FreeDVReporter.{h,cpp}`, and `src/util/SocketIoClient.{h,cpp}`. Line
+`src/reporting/FreeDVReporter.{h,cpp}`, `src/util/SocketIoClient.{h,cpp}`,
+`src/reporting/UdpReporter.{h,cpp}`, and `src/util/UdpHandler.{h,cpp}`. Line
 references below point at this revision; consult the files directly for anything not
 covered here.
 
@@ -424,7 +428,102 @@ This mirrors how `freedv-gui` wires things up in
 
 ### 2.7 Related, but out of scope here
 
-`src/reporting/` also contains `pskreporter.{h,cpp}` (PSK Reporter UDP spot protocol),
-`UdpReporter.{h,cpp}`, and `CsvReporter.{h,cpp}` — other `IReporter` implementations
-used for reporting spots to services other than FreeDV Reporter. They don't share
-`FreeDVReporter`'s Socket.IO protocol and are not covered by this document.
+`src/reporting/` also contains `pskreporter.{h,cpp}` (PSK Reporter's own UDP spot
+protocol) and `CsvReporter.{h,cpp}` — other `IReporter` implementations used for
+reporting spots to services other than FreeDV Reporter. They don't share
+`FreeDVReporter`'s Socket.IO protocol and are not covered by this document. `UdpReporter`
+is also an `IReporter` implementation, but it speaks a protocol defined by this repo
+(rather than a third party's), so it's documented in full below.
+
+---
+
+## 3. UDP callsign broadcast protocol
+
+Implemented in `src/reporting/UdpReporter.{h,cpp}` on top of the generic
+`src/util/UdpHandler.{h,cpp}`. Unlike the FreeDV Reporter client (§2), this is not a
+connection to a central server — it's a **local, send-only, fire-and-forget UDP
+broadcast/multicast** of each received callsign as a single JSON datagram, intended for
+other software on the same machine/LAN to pick up (e.g. logging applications), in the
+same spirit as WSJT-X's UDP broadcast (`UdpHandler.cpp:261` explicitly notes this: *"This
+class is mainly for WSJT-X style logging"*).
+
+### 3.1 Transport
+
+* Plain UDP, one datagram per received callsign — no handshake, no acknowledgement, no
+  session state, and nothing is ever read back (`UdpReporter::onReceive_()` is a no-op,
+  `UdpReporter.h:62`).
+* `UdpReporter(address, port)` opens a UDP socket bound to no particular local address/
+  port, and always sends to the same configured destination `address:port`
+  (`UdpReporter.cpp:45-55`, `UdpHandler::open("", 0, address, port)`).
+* `address` is a literal IPv4 or IPv6 address (not a hostname — `UdpHandler`'s resolver
+  uses `AI_NUMERICHOST`, `UdpHandler.cpp:265-290`). It can be:
+  * a **unicast** address, in which case datagrams simply go to that one host, or
+  * a **multicast** address (`224.0.0.0`–`239.255.255.255` for IPv4, `ff00::/8` for
+    IPv6), in which case `UdpHandler` automatically joins that multicast group on the
+    default interface when the socket is opened (`isMulticastAddress_()` /
+    `joinMulticastGroup_()`, `UdpHandler.cpp:292-422`) — this is what lets other local
+    processes listening on that multicast group receive the datagrams without needing
+    to know this process's address ahead of time.
+* `freedv-gui`'s reference default (`ReportingConfiguration.cpp`) and
+  `freedv-integrations`'s `ReportingController` both use the same convention: multicast
+  address **`224.0.0.1`** (the "all systems on this subnet" address), port **`7177`**,
+  disabled by default and user-configurable in `freedv-gui`'s Tools → Options → Reporting
+  tab (`udpBroadcastEnabled`/`udpBroadcastAddress`/`udpBroadcastPort`).
+* Of `IReporter`'s methods, only `addReceiveRecord()` actually sends anything.
+  `freqChange()` just caches the frequency on the object (currently unused elsewhere in
+  the class); `transmit()`, `inAnalogMode()`, and `send()` are no-ops — they exist only
+  to satisfy the shared `IReporter` interface (§2.7 above / `IReporter.h`).
+
+### 3.2 Datagram payload
+
+Each call to `addReceiveRecord(callsign, mode, frequency, snr)` serialises and sends
+exactly one JSON object as the UDP payload (`UdpReporter::addReceiveRecord()`,
+`UdpReporter.cpp:73-119`):
+
+```json
+{
+  "type": "fdv_callsign",
+  "version": 1,
+  "timestamp": "2026-08-16T20:31:07Z",
+  "callsign": "W1ABC",
+  "mode": "RADEV1",
+  "snr": -2,
+  "frequency_hz": 14236000
+}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `type` | string | Always the literal `"fdv_callsign"` — a receiver can use this to distinguish this payload from other UDP traffic that might land on the same port. |
+| `version` | int | Message schema version, currently always `1` (`JSON_MESSAGE_VERSION`, `UdpReporter.h:69`). Bump expected if the schema changes. |
+| `timestamp` | string | UTC timestamp of the report, ISO-8601 `YYYY-MM-DDTHH:MM:SSZ` (`std::gmtime`/`strftime`, `UdpReporter.cpp:76-81`). |
+| `callsign` | string | The received callsign, exactly as passed to `addReceiveRecord()` (e.g. as decoded via the RADE reliable-text channel in §1, or via another mode's equivalent). |
+| `mode` | string | The FreeDV mode string in use, e.g. `"RADEV1"`, `"700D"`, `"2020"`. |
+| `snr` | int | Signal-to-noise ratio in dB, as a signed byte widened to a JSON integer. |
+| `frequency_hz` | uint | Frequency in Hz, taken directly from the `frequency` argument passed to `addReceiveRecord()` (**not** from a previously-cached `freqChange()` value — see §3.1). |
+
+There is no equivalent "TX report" / "frequency change" / roster datagram — this
+protocol only ever announces received callsigns.
+
+### 3.3 Minimal listener example
+
+Since this is one JSON object per UDP datagram on a well-known multicast group, a
+listener is trivial to write in any language, e.g. Python:
+
+```python
+import socket, struct, json
+
+MCAST_GRP, MCAST_PORT = "224.0.0.1", 7177
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+sock.bind(("", MCAST_PORT))
+sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                struct.pack("4sl", socket.inet_aton(MCAST_GRP), socket.INADDR_ANY))
+
+while True:
+    data, _ = sock.recvfrom(4096)
+    record = json.loads(data)
+    if record.get("type") == "fdv_callsign":
+        print(record["callsign"], record["mode"], record["snr"], record["frequency_hz"])
+```
