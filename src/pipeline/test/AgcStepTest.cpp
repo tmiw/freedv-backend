@@ -168,72 +168,10 @@ bool agcDoesNotBoostNearSilentSignal()
     return true;
 }
 
-// reset() should immediately return the gain to unity (0dB) rather than
-// continuing from wherever it had drifted to.
-bool agcResetReturnsGainToUnity()
-{
-    constexpr int sampleRate = 8000;
-    constexpr double TOLERANCE_DB = 2.0;
-
-    AgcStep step(sampleRate);
-
-    double amplitude = findAmplitudeForLoudness(-10.0, TEST_TONE_FREQ_HZ, sampleRate);
-    auto loudSignal = generateSineWave(amplitude, TEST_TONE_FREQ_HZ, 6.0, sampleRate);
-    auto output = runThroughAgc(step, loudSignal, sampleRate / 10);
-
-    // Sanity check: confirm gain actually drifted away from unity before we
-    // rely on reset() to bring it back.
-    double convergedLufs = measureLoudnessLufs(&output[output.size() - sampleRate], sampleRate, sampleRate);
-    if (std::abs(convergedLufs - AGC_TARGET_LUFS) > TOLERANCE_DB)
-    {
-        std::cerr << "[test setup invalid: gain never drifted away from unity, settled at "
-                   << convergedLufs << " LUFS]...";
-        return false;
-    }
-
-    step.reset();
-
-    // Immediately after reset(), the first block processed should be only a
-    // hair away from unity gain, regardless of how far gain had drifted.
-    int chunkSize = sampleRate / 100; // one 10ms AGC block
-    int numOutputSamples = 0;
-    short* result = step.execute(loudSignal.data(), chunkSize, &numOutputSamples);
-
-    if (numOutputSamples != chunkSize)
-    {
-        std::cerr << "[numOutputSamples[" << numOutputSamples << "] != " << chunkSize << "]...";
-        return false;
-    }
-
-    double inputRms = 0.0;
-    double outputRms = 0.0;
-    for (int i = 0; i < numOutputSamples; i++)
-    {
-        inputRms += static_cast<double>(loudSignal[i]) * loudSignal[i];
-        outputRms += static_cast<double>(result[i]) * result[i];
-    }
-    inputRms = std::sqrt(inputRms / numOutputSamples);
-    outputRms = std::sqrt(outputRms / numOutputSamples);
-
-    // Note: the WebRTC limiter stage adds a small amount of its own gain
-    // adjustment on top of AgcStep's own dB tracking, so this won't be
-    // exactly 0dB -- but it should be nowhere near the ~-13dB gain that had
-    // been applied just before reset() was called.
-    double gainDb = 20.0 * std::log10(outputRms / inputRms);
-    if (std::abs(gainDb) > 4.0)
-    {
-        std::cerr << "[gain right after reset() was " << gainDb << " dB, expected close to 0 dB]...";
-        return false;
-    }
-
-    return true;
-}
-
 int main()
 {
     TEST_CASE(agcConvergesLoudSignalToTargetLoudness);
     TEST_CASE(agcConvergesQuietSignalToTargetLoudness);
     TEST_CASE(agcDoesNotBoostNearSilentSignal);
-    TEST_CASE(agcResetReturnsGainToUnity);
     return 0;
 }

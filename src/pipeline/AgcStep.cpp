@@ -198,6 +198,4 @@ short* AgcStep::execute(short* inputSamples, int numInputSamples, int* numOutput
 void AgcStep::reset() FREEDV_NONBLOCKING
 {
     inputSampleFifo_.reset();
-    currentGainDb_ = 0;
-    targetGainDb_ = 0;
 }
