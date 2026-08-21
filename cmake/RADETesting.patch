@@ -122,3 +122,18 @@ index 76c497b..784b0db 100644
      /* Frame counter */
      int mf;
  
+diff --git a/src/rade_bpf.c b/src/rade_bpf.c
+index d549c9b..6c7f565 100644
+--- a/src/rade_bpf.c
++++ b/src/rade_bpf.c
+@@ -107,6 +107,10 @@ void rade_bpf_process(rade_bpf *bpf, RADE_COMP *y, const RADE_COMP *x, int n) {
+         y[i] = rade_cmul(y_bb, cconj_phase);
+     }
+ 
++    /* Normalize phase to prevent drift */
++    float phase_mag = rade_cabs(phase);
++    phase = rade_cscale(phase, 1.0f / phase_mag);
++
+     /* Save phase state for next call */
+     bpf->phase = phase;
+ }
