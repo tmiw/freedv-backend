@@ -115,7 +115,7 @@ RADEReceiveStep::RADEReceiveStep(
 #if !defined(DISABLE_UNIT_TEST)
     if (utRxFeatureFile != "")
     {
-        utFeatures_ = new PreAllocatedFIFO<float, NUM_FEATURES_TO_STORE>();
+        utFeatures_ = new GenericFIFO<float>(FEATURE_FIFO_SIZE);
         assert(utFeatures_ != nullptr);
 
         featuresFile_ = fopen((const char*)utRxFeatureFile.c_str(), "wb");
@@ -194,6 +194,7 @@ short* RADEReceiveStep::execute(short* inputSamples, int numInputSamples, int* n
     FREEDV_END_VERIFIED_SAFE
 
     int   nout = 0;
+    short* outputSamplePtr = outputSamples_.get();
     while ((*numOutputSamples + LPCNET_FRAME_SIZE) < maxSamples && inputSampleFifo_.read(inputBuf_, nin) == 0)
     {
         FREEDV_BEGIN_VERIFIED_SAFE
@@ -256,8 +257,9 @@ short* RADEReceiveStep::execute(short* inputSamples, int numInputSamples, int* n
                         pcm[i] = (int)floor(.5 + std::min(32767.f, std::max(-32767.f, 32768.f*fpcm[i])));
                     }
 
+                    memcpy(outputSamplePtr, pcm, sizeof(short) * LPCNET_FRAME_SIZE);
                     *numOutputSamples += LPCNET_FRAME_SIZE;
-                    outputSampleFifo_.write(pcm, LPCNET_FRAME_SIZE);
+                    outputSamplePtr += LPCNET_FRAME_SIZE;
                 }
             }
         }
@@ -267,11 +269,6 @@ short* RADEReceiveStep::execute(short* inputSamples, int numInputSamples, int* n
         FREEDV_END_VERIFIED_SAFE 
     }
   
-    if (*numOutputSamples > 0)
-    { 
-        outputSampleFifo_.read(outputSamples_.get(), *numOutputSamples);
-    }
-
     int sync = 0;
     int snr = 0;
 
@@ -303,7 +300,6 @@ short* RADEReceiveStep::execute(short* inputSamples, int numInputSamples, int* n
 void RADEReceiveStep::reset() FREEDV_NONBLOCKING
 {
     inputSampleFifo_.reset();
-    outputSampleFifo_.reset();
     pendingFeaturesIdx_ = 0;
 }
 

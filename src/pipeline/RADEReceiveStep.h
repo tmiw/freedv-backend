@@ -53,11 +53,6 @@ extern "C"
 #include "../util/Semaphore.h"
 #include "../util/realtime_fp.h"
 
-// Number of features to store. This is set to be close to the
-// typical size for RX/TX features for the rade_loss ctest to
-// avoid contention with normal RADE operation.
-#define NUM_FEATURES_TO_STORE (256 * 1024)
-
 // TBD - need to wrap in "extern C" to avoid linker errors
 extern "C"
 {
@@ -94,7 +89,6 @@ private:
     struct rade* dv_;
     FARGANState* fargan_;
     PreAllocatedFIFO<short, RADE_MODEM_SAMPLE_RATE> inputSampleFifo_;
-    PreAllocatedFIFO<short, RADE_SPEECH_SAMPLE_RATE> outputSampleFifo_;
     float* pendingFeatures_;
     int pendingFeaturesIdx_;
     FILE* featuresFile_;
@@ -106,7 +100,7 @@ private:
     float* eooOut_;
     std::unique_ptr<short[]> outputSamples_;
     
-    PreAllocatedFIFO<float, NUM_FEATURES_TO_STORE>* utFeatures_;
+    GenericFIFO<float>* utFeatures_;
     std::thread utFeatureThread_;
     std::atomic<bool> exitingFeatureThread_;
     Semaphore featuresAvailableSem_;

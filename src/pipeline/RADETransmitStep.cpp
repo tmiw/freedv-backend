@@ -91,7 +91,7 @@ RADETransmitStep::RADETransmitStep(struct rade* dv, LPCNetEncState* encState)
 #if !defined(DISABLE_UNIT_TEST)
     if (utTxFeatureFile != "")
     {
-        utFeatures_ = new PreAllocatedFIFO<float, NUM_FEATURES_TO_STORE>;
+        utFeatures_ = new GenericFIFO<float>(FEATURE_FIFO_SIZE);
         assert(utFeatures_ != nullptr);
 
         featuresFile_ = fopen((const char*)utTxFeatureFile.c_str(), "wb");
