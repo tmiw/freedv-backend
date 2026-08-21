@@ -102,6 +102,7 @@ RADEReceiveStep::RADEReceiveStep(
     realtime_fp<float()> const& freqOffsetFn)
     : dv_(dv)
     , fargan_(fargan)
+    , inputSampleFifo_(rade_nin_max(dv))
     , pendingFeatures_(nullptr)
     , pendingFeaturesIdx_(0)
     , featuresFile_(nullptr)
@@ -186,20 +187,28 @@ short* RADEReceiveStep::execute(short* inputSamples, int numInputSamples, int* n
 {
     auto maxSamples = getOutputSampleRate();
     *numOutputSamples = 0;
-    
-    inputSampleFifo_.write(inputSamples, numInputSamples);
-
-    FREEDV_BEGIN_VERIFIED_SAFE 
-    int   nin = rade_nin(dv_);
-    FREEDV_END_VERIFIED_SAFE
 
     int   nout = 0;
     short* outputSamplePtr = outputSamples_.get();
-    while ((*numOutputSamples + LPCNET_FRAME_SIZE) < maxSamples && inputSampleFifo_.read(inputBuf_, nin) == 0)
+    while ((*numOutputSamples + LPCNET_FRAME_SIZE) < maxSamples)
     {
-        FREEDV_BEGIN_VERIFIED_SAFE
+        FREEDV_BEGIN_VERIFIED_SAFE 
+        int   nin = rade_nin(dv_);
         assert(nin <= rade_nin_max(dv_));
         FREEDV_END_VERIFIED_SAFE
+
+        int samplesToWrite = std::min(inputSampleFifo_.numFree(), numInputSamples);
+        if (samplesToWrite > 0)
+        {
+            inputSampleFifo_.write(inputSamples, samplesToWrite);
+            numInputSamples -= samplesToWrite;
+            inputSamples += samplesToWrite;
+        }
+
+        if (inputSampleFifo_.read(inputBuf_, nin) != 0 && numInputSamples == 0)
+        {
+            break;
+        }
 
         // demod per frame processing
         for(int i=0; i<nin; i++)
@@ -263,10 +272,6 @@ short* RADEReceiveStep::execute(short* inputSamples, int numInputSamples, int* n
                 }
             }
         }
-
-        FREEDV_BEGIN_VERIFIED_SAFE 
-        nin = rade_nin(dv_);
-        FREEDV_END_VERIFIED_SAFE 
     }
   
     int sync = 0;

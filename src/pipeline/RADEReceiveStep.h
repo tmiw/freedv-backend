@@ -88,7 +88,7 @@ private:
     std::atomic<int> snr_;
     struct rade* dv_;
     FARGANState* fargan_;
-    PreAllocatedFIFO<short, RADE_MODEM_SAMPLE_RATE> inputSampleFifo_;
+    GenericFIFO<short> inputSampleFifo_;
     float* pendingFeatures_;
     int pendingFeaturesIdx_;
     FILE* featuresFile_;
