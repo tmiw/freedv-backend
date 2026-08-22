@@ -181,6 +181,7 @@ short* RADETransmitStep::execute(short* inputSamples, int numInputSamples, int* 
         return outputSamples_.get();
     }
 
+    short* tmpOutput = outputSamples_.get();
     while ((*numOutputSamples + numSamplesPerTx) < maxSamples)
     {
         int samplesToWrite = std::min(inputSampleFifo_.numFree(), numInputSamples);
@@ -230,18 +231,14 @@ short* RADETransmitStep::execute(short* inputSamples, int numInputSamples, int* 
                         // We only need the real component for TX.
                         radeOutShort_[index] = radeOut_[index].real * RADE_SCALING_FACTOR;
                     }
-                    outputSampleFifo_.write(radeOutShort_, numOut);
-                    *numOutputSamples = outputSampleFifo_.numUsed();
+                    std::copy(radeOutShort_, &radeOutShort_[numOut], tmpOutput);
+                    tmpOutput += numOut;
+                    *numOutputSamples += numOut;
                 }
             }
         }
     }
 
-    if (*numOutputSamples > 0)
-    {
-        outputSampleFifo_.read(outputSamples_.get(), *numOutputSamples);
-    }
-    
     return outputSamples_.get();
 }
 
