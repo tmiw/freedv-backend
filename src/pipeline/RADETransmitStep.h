@@ -77,7 +77,7 @@ public:
 private:
     struct rade* dv_;
     LPCNetEncState* encState_;
-    PreAllocatedFIFO<short, RADE_SPEECH_SAMPLE_RATE> inputSampleFifo_;
+    GenericFIFO<short> inputSampleFifo_;
     PreAllocatedFIFO<short, RADE_MODEM_SAMPLE_RATE> outputSampleFifo_;
     float* featureList_;
     int featureListIdx_;
