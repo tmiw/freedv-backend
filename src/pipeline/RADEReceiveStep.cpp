@@ -102,7 +102,7 @@ RADEReceiveStep::RADEReceiveStep(
     realtime_fp<float()> const& freqOffsetFn)
     : dv_(dv)
     , fargan_(fargan)
-    , inputSampleFifo_(rade_nin_max(dv))
+    , inputSampleFifo_(rade_nin_max(dv) + 1)
     , pendingFeatures_(nullptr)
     , pendingFeaturesIdx_(0)
     , featuresFile_(nullptr)
