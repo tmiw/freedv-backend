@@ -233,7 +233,7 @@ short* RADETransmitStep::execute(short* inputSamples, int numInputSamples, int* 
                     for (int index = 0; index < numOut; index++)
                     {
                         // We only need the real component for TX.
-                        radeOutShort_[index] = radeOut_[index].real * RADE_SCALING_FACTOR;
+                        radeOutShort_[index] = radeOut_[index].real * RADE_INT16_SCALE;
                     }
                     outputSampleFifo_.write(radeOutShort_, numOut);
                     *numOutputSamples = outputSampleFifo_.numUsed();
