@@ -259,15 +259,15 @@ int GenericFIFO<T>::write(T* data, int len) noexcept
 
     std::uint32_t gen = generationOf_(startPos);
     std::uint32_t idx = indexOf_(startPos);
-    while (len > 0)
+    int numToCopy = std::min((std::uint32_t)len, nelem - idx);
+    std::copy(data, &data[numToCopy], &buf[idx]);
+    len -= numToCopy;
+    idx += numToCopy;
+    data += numToCopy;
+    if (idx >= (std::uint32_t)nelem)
     {
-        buf[idx] = *data++;
-        idx++;
-        if (idx >= (std::uint32_t)nelem)
-        {
-            idx = 0;
-        }
-        len--;
+        std::copy(data, &data[len], buf);
+        idx = len;
     }
 
     // Commit only if `pin_` still holds exactly the (generation, index) we
@@ -301,15 +301,15 @@ int GenericFIFO<T>::read(T* result, int len) noexcept
 
     std::uint32_t gen = generationOf_(startPos);
     std::uint32_t idx = indexOf_(startPos);
-    while (len > 0)
+    int numToCopy = std::min((std::uint32_t)len, nelem - idx);
+    std::copy(&buf[idx], &buf[idx + numToCopy], result);
+    result += numToCopy;
+    idx += numToCopy;
+    len -= numToCopy;
+    if (idx >= (std::uint32_t)nelem)
     {
-        *result++ = buf[idx];
-        idx++;
-        if (idx >= (std::uint32_t)nelem)
-        {
-            idx = 0;
-        }
-        len--;
+        std::copy(buf, &buf[len], result);
+        idx = len;
     }
 
     // See write() -- commit only if `pout_` still holds exactly the

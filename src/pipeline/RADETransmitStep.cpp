@@ -82,6 +82,7 @@ RADETransmitStep::RADETransmitStep(struct rade* dv, LPCNetEncState* encState, ra
     : dv_(dv)
     , encState_(encState)
     , textPtr_(textPtr)
+    , inputSampleFifo_(LPCNET_FRAME_SIZE + 1)
     , featureList_(nullptr)
     , featureListIdx_(0)
     , featuresFile_(nullptr)
@@ -90,7 +91,7 @@ RADETransmitStep::RADETransmitStep(struct rade* dv, LPCNetEncState* encState, ra
 #if !defined(DISABLE_UNIT_TEST)
     if (utTxFeatureFile != "")
     {
-        utFeatures_ = new PreAllocatedFIFO<float, NUM_FEATURES_TO_STORE>;
+        utFeatures_ = new GenericFIFO<float>(FEATURE_FIFO_SIZE);
         assert(utFeatures_ != nullptr);
 
         featuresFile_ = fopen((const char*)utTxFeatureFile.c_str(), "wb");
@@ -179,63 +180,73 @@ short* RADETransmitStep::execute(short* inputSamples, int numInputSamples, int* 
         return outputSamples_.get();
     }
 
-    inputSampleFifo_.write(inputSamples, numInputSamples);
-    while ((*numOutputSamples + numSamplesPerTx) < maxSamples && inputSampleFifo_.numUsed() >= LPCNET_FRAME_SIZE)
+    while ((*numOutputSamples + numSamplesPerTx) < maxSamples)
     {
-        short pcm[LPCNET_FRAME_SIZE];
-        float features[NB_TOTAL_FEATURES];
+        int samplesToWrite = std::min(inputSampleFifo_.numFree(), numInputSamples);
+        inputSampleFifo_.write(inputSamples, samplesToWrite);
+        numInputSamples -= samplesToWrite;
+        inputSamples += samplesToWrite;
 
-        // Feature extraction
-        inputSampleFifo_.read(pcm, LPCNET_FRAME_SIZE);
-        FREEDV_BEGIN_VERIFIED_SAFE
-        lpcnet_compute_single_frame_features(encState_, pcm, features, arch_);
-        FREEDV_END_VERIFIED_SAFE
-            
-        if (featuresFile_)
+        if (inputSampleFifo_.numFree() > 0)
         {
-            utFeatures_->write(features, NB_TOTAL_FEATURES);
-            if (utFeatures_->numUsed() > (0.75 * utFeatures_->capacity()))
-            {
-                featuresAvailableSem_.signal();
-            }
+            break;
         }
-            
-        for (int index = 0; index < NB_TOTAL_FEATURES; index++)
+        else
         {
-            featureList_[featureListIdx_++] = features[index];
-            if (featureListIdx_ == numRequiredFeaturesForRADE)
+            short pcm[LPCNET_FRAME_SIZE];
+            float features[NB_TOTAL_FEATURES];
+
+            // Feature extraction
+            inputSampleFifo_.read(pcm, LPCNET_FRAME_SIZE);
+            FREEDV_BEGIN_VERIFIED_SAFE
+            lpcnet_compute_single_frame_features(encState_, pcm, features, arch_);
+            FREEDV_END_VERIFIED_SAFE
+            
+            if (featuresFile_)
             {
-                featureListIdx_ = 0;
-
-                // RADE TX handling
-                int numOut = 0;
-                FREEDV_BEGIN_VERIFIED_SAFE
-                    if (textPtr_ != nullptr)
-                    {
-                        // Stream one bit of the (continuously repeating) text
-                        // payload per modem frame (~25 bits/s).
-                        rade_tx_set_data_symbol(dv_, rade_text_tx_next_symbol(textPtr_));
-                    }
-                    numOut = rade_tx(dv_, radeOut_, &featureList_[0]);
-                FREEDV_END_VERIFIED_SAFE
-
-                for (int index = 0; index < numOut; index++)
+                utFeatures_->write(features, NB_TOTAL_FEATURES);
+                if (utFeatures_->numUsed() > (0.75 * utFeatures_->capacity()))
                 {
-                    // We only need the real component for TX.
-                    radeOutShort_[index] = radeOut_[index].real * RADE_INT16_SCALE;
+                    featuresAvailableSem_.signal();
                 }
-                outputSampleFifo_.write(radeOutShort_, numOut);
+            }
+            
+            for (int index = 0; index < NB_TOTAL_FEATURES; index++)
+            {
+                featureList_[featureListIdx_++] = features[index];
+                if (featureListIdx_ == numRequiredFeaturesForRADE)
+                {
+                    featureListIdx_ = 0;
+
+                    // RADE TX handling
+                    int numOut = 0;
+                    FREEDV_BEGIN_VERIFIED_SAFE
+                        if (textPtr_ != nullptr)
+                        {
+                            // Stream one bit of the (continuously repeating) text
+                            // payload per modem frame (~25 bits/s).
+                            rade_tx_set_data_symbol(dv_, rade_text_tx_next_symbol(textPtr_));
+                        }
+                        numOut = rade_tx(dv_, radeOut_, &featureList_[0]);
+                    FREEDV_END_VERIFIED_SAFE
+
+                    for (int index = 0; index < numOut; index++)
+                    {
+                        // We only need the real component for TX.
+                        radeOutShort_[index] = radeOut_[index].real * RADE_SCALING_FACTOR;
+                    }
+                    outputSampleFifo_.write(radeOutShort_, numOut);
+                    *numOutputSamples = outputSampleFifo_.numUsed();
+                }
             }
         }
-
-        *numOutputSamples = outputSampleFifo_.numUsed();
     }
 
     if (*numOutputSamples > 0)
     {
         outputSampleFifo_.read(outputSamples_.get(), *numOutputSamples);
     }
-    
+
     return outputSamples_.get();
 }
 
