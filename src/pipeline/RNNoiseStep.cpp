@@ -45,7 +45,7 @@
 
 RNNoiseStep::RNNoiseStep()
     : firstFrame_(true)
-    , inputSampleFifo_(RNNOISE_SAMPLE_RATE / 2)
+    , inputSampleFifo_(RNNOISE_FRAME_SIZE + 1)
 {
     rnnoise_ = rnnoise_create(nullptr);
     assert(rnnoise_ != nullptr);
@@ -76,17 +76,15 @@ short* RNNoiseStep::execute(short* inputSamples, int numInputSamples, int* numOu
     *numOutputSamples = 0;
 
     short* outputSamples = outputSamples_.get();
+    short* tmpOutput = outputSamples;
 
-    int numRNNoiseRuns = (inputSampleFifo_.numUsed() + numInputSamples) / RNNOISE_FRAME_SIZE;
-    if (numRNNoiseRuns > 0)
+    while (numInputSamples > 0)
     {
-        *numOutputSamples = (numRNNoiseRuns - (firstFrame_ ? 1 : 0)) * RNNOISE_FRAME_SIZE;
-        
-        short* tmpOutput = outputSamples;
-        
-        inputSampleFifo_.write(inputSamples, numInputSamples);
-        while (inputSampleFifo_.numUsed() >= RNNOISE_FRAME_SIZE)
+        inputSampleFifo_.write(inputSamples++, 1);
+        numInputSamples--;
+        if (inputSampleFifo_.numUsed() == RNNOISE_FRAME_SIZE)
         {
+            *numOutputSamples += (!firstFrame_ ? 1 : 0) * RNNOISE_FRAME_SIZE;
             inputSampleFifo_.read(tmpOutput, RNNOISE_FRAME_SIZE);
 
             float tmpFloat[RNNOISE_FRAME_SIZE];
@@ -105,10 +103,6 @@ short* RNNoiseStep::execute(short* inputSamples, int numInputSamples, int* numOu
             }
             firstFrame_ = false;
         }
-    }
-    else if (numInputSamples > 0 && inputSamples != nullptr)
-    {
-        inputSampleFifo_.write(inputSamples, numInputSamples);
     }
     
     return outputSamples;
