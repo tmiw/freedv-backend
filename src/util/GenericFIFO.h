@@ -260,13 +260,13 @@ int GenericFIFO<T>::write(T* data, int len) noexcept
     std::uint32_t gen = generationOf_(startPos);
     std::uint32_t idx = indexOf_(startPos);
     int numToCopy = std::min((std::uint32_t)len, nelem - idx);
-    std::copy(data, &data[numToCopy], &buf[idx]);
+    std::copy_n(data, numToCopy, &buf[idx]);
     len -= numToCopy;
     idx += numToCopy;
     data += numToCopy;
     if (idx >= (std::uint32_t)nelem)
     {
-        std::copy(data, &data[len], buf);
+        std::copy_n(data, len, buf);
         idx = len;
     }
 
@@ -302,13 +302,13 @@ int GenericFIFO<T>::read(T* result, int len) noexcept
     std::uint32_t gen = generationOf_(startPos);
     std::uint32_t idx = indexOf_(startPos);
     int numToCopy = std::min((std::uint32_t)len, nelem - idx);
-    std::copy(&buf[idx], &buf[idx + numToCopy], result);
+    std::copy_n(&buf[idx], numToCopy, result);
     result += numToCopy;
     idx += numToCopy;
     len -= numToCopy;
     if (idx >= (std::uint32_t)nelem)
     {
-        std::copy(buf, &buf[len], result);
+        std::copy_n(buf, len, result);
         idx = len;
     }
 
