@@ -169,9 +169,9 @@ short* AgcStep::execute(short* inputSamples, int numInputSamples, int* numOutput
             float temp = 0;
             for (auto ctr = 0; ctr < numSamplesPerRun_; ctr++)
             {
-                ConvertToFloatSampleType_<float, short>(&tmpInput[ctr], &temp, 1);
+                ConvertSingleSampleToFloatSampleType_<float, short>(&tmpInput[ctr], &temp);
                 temp *= scaleFactor;
-                ConvertToIntSampleType_<short, float>(&temp, &tmpInput[ctr], 1);
+                ConvertSingleSampleToIntSampleType_<short, float>(&temp, &tmpInput[ctr]);
             }
 
             // Run WebRTC to make sure we don't clip.
