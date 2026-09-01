@@ -44,6 +44,9 @@ LevelAdjustStep::LevelAdjustStep(int sampleRate, realtime_fp<float()> const& sca
     // Pre-allocate buffers so we don't have to do so during real-time operation.
     outputSamples_ = std::make_unique<short[]>(sampleRate_);
     assert(outputSamples_ != nullptr);
+
+    tmpFloatInput_ = std::make_unique<float[]>(sampleRate_ / 100);
+    assert(tmpFloatInput_ != nullptr);
 }
 
 LevelAdjustStep::~LevelAdjustStep()
@@ -64,16 +67,25 @@ int LevelAdjustStep::getOutputSampleRate() const FREEDV_NONBLOCKING
 short* LevelAdjustStep::execute(short* inputSamples, int numInputSamples, int* numOutputSamples) FREEDV_NONBLOCKING
 {
     float scaleFactor = scaleFactorFn_();
+    short* inPtr = inputSamples;
     short* outPtr = outputSamples_.get();
+    float* tmpPtr = tmpFloatInput_.get();
+    *numOutputSamples = numInputSamples;
 
-    float temp = 0;
-    for (int index = 0; index < numInputSamples; index++)
+    while (numInputSamples > 0)
     {
-        ConvertSingleSampleToFloatSampleType_<float, short>(&inputSamples[index], &temp);
-        temp *= scaleFactor;
-        ConvertSingleSampleToIntSampleType_<short, float>(&temp, &outPtr[index]);
+        int samplesToRead = std::min(numInputSamples, sampleRate_ / 100); // process 10ms blocks
+        ConvertToFloatSampleType_<float, short>(inPtr, tmpPtr, samplesToRead);
+        for (int index = 0; index < samplesToRead; index++)
+        {
+            tmpPtr[index] *= scaleFactor;
+        }
+        ConvertToIntSampleType_<short, float>(tmpPtr, outPtr, samplesToRead);
+
+        inPtr += samplesToRead;
+        outPtr += samplesToRead;
+        numInputSamples -= samplesToRead;
     }
     
-    *numOutputSamples = numInputSamples;
-    return outPtr;
+    return outputSamples_.get();
 }
