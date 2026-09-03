@@ -1,0 +1,139 @@
+diff --git a/src/rade_ber_test.c b/src/rade_ber_test.c
+index 8328d5b..d8c24ab 100644
+--- a/src/rade_ber_test.c
++++ b/src/rade_ber_test.c
+@@ -265,7 +265,8 @@ int main(int argc, char *argv[]) {
+                               0,   /* time_offset: perfect timing */
+                               0,   /* endofover: normal frame */
+                               1,   /* coarse_mag: amplitude correction */
+-                              &snr_est);
++                              &snr_est,
++			      NULL, NULL); /* S1_out/S2_out: not needed here */
+ 
+         float *z = &z_all[fr * z_per_frame];
+         for (int i = 0; i < z_per_frame; i++) {
+diff --git a/src/rade_ofdm.c b/src/rade_ofdm.c
+index 60bc9ba..d876d4c 100644
+--- a/src/rade_ofdm.c
++++ b/src/rade_ofdm.c
+@@ -386,7 +386,7 @@ void rade_ofdm_est_pilots(const rade_ofdm *ofdm, RADE_COMP *pilot_est,
+ float rade_ofdm_pilot_eq(const rade_ofdm *ofdm, RADE_COMP *rx_sym,
+                          const RADE_COMP *rx_pilots_start,
+                          const RADE_COMP *pilot_est_start, const RADE_COMP *pilot_est_end,
+-                         int coarse_mag) {
++                         int coarse_mag, float *S1_out, float *S2_out) {
+     int Nc = ofdm->nc;
+     int Ns = ofdm->ns;
+     int M = ofdm->m;
+@@ -409,6 +409,8 @@ float rade_ofdm_pilot_eq(const rade_ofdm *ofdm, RADE_COMP *rx_sym,
+         S2 += Rcn_hat.imag * Rcn_hat.imag;
+     }
+     S2 += 1e-12f;  /* Avoid division by zero */
++    *S1_out = S1;
++    *S2_out = S2;
+     float snr_est = S1 / (2.0f * S2) - 1.0f;
+     if (snr_est <= 0.1f) snr_est = 0.1f;
+     float snrdB_est = 10.0f * log10f(snr_est);
+@@ -463,7 +465,8 @@ float rade_ofdm_pilot_eq(const rade_ofdm *ofdm, RADE_COMP *rx_sym,
+ 
+ /* Demodulate one modem frame */
+ int rade_ofdm_demod_frame(const rade_ofdm *ofdm, float *z_hat, const RADE_COMP *rx_in,
+-                          int time_offset, int endofover, int coarse_mag, float *snr_est) {
++                          int time_offset, int endofover, int coarse_mag, float *snr_est,
++                          float *S1_out, float *S2_out) {
+     int Nc = ofdm->nc;
+     int M = ofdm->m;
+     int Ncp = ofdm->ncp;
+@@ -497,7 +500,7 @@ int rade_ofdm_demod_frame(const rade_ofdm *ofdm, float *z_hat, const RADE_COMP *
+             memcpy(&rx_data[s * Nc], rx_sym[s + 1], sizeof(RADE_COMP) * Nc);
+         }
+ 
+-        *snr_est = rade_ofdm_pilot_eq(ofdm, rx_data, &rx_pilots[0], pilot_est[0], pilot_est[1], coarse_mag);
++        *snr_est = rade_ofdm_pilot_eq(ofdm, rx_data, &rx_pilots[0], pilot_est[0], pilot_est[1], coarse_mag, S1_out, S2_out);
+ 
+         /* Demap QPSK to latent floats */
+         int out_idx = 0;
+diff --git a/src/rade_ofdm.h b/src/rade_ofdm.h
+index ceb3a80..566e4e2 100644
+--- a/src/rade_ofdm.h
++++ b/src/rade_ofdm.h
+@@ -134,14 +134,15 @@ void rade_ofdm_est_pilots(const rade_ofdm *ofdm, RADE_COMP *pilot_est,
+ float rade_ofdm_pilot_eq(const rade_ofdm *ofdm, RADE_COMP *rx_sym,
+                          const RADE_COMP *rx_pilots_start,
+                          const RADE_COMP *pilot_est_start, const RADE_COMP *pilot_est_end,
+-                         int coarse_mag);
++                         int coarse_mag, float *S1_out, float *S2_out);
+ 
+ /* Demodulate one modem frame of time-domain samples to latent vectors
+    rx_in[nmf+m+ncp] -> z_hat[nzmf*latent_dim]
+    tmax: timing offset, endofover: flag for EOO processing
+    Returns number of output floats (latent_dim * nzmf) */
+ int rade_ofdm_demod_frame(const rade_ofdm *ofdm, float *z_hat, const RADE_COMP *rx_in,
+-                          int time_offset, int endofover, int coarse_mag, float *snr_est);
++                          int time_offset, int endofover, int coarse_mag, float *snr_est,
++                          float *S1_out, float *S2_out);
+ 
+ /*---------------------------------------------------------------------------*\
+                            EOO HANDLING
+diff --git a/src/rade_rx.c b/src/rade_rx.c
+index 37ab98d..9db0d31 100644
+--- a/src/rade_rx.c
++++ b/src/rade_rx.c
+@@ -233,15 +233,16 @@ int rade_rx_process(rade_rx_state *rx, float *features_out, float *eoo_out, cons
+         rx->rx_phase = rx_phase;
+ 
+         /* Normalize phase to prevent drift */
+-        //float phase_mag = rade_cabs(rx->rx_phase);
+-        //rx->rx_phase = rade_cscale(rx->rx_phase, 1.0f / phase_mag);
++        float phase_mag = rade_cabs(rx->rx_phase);
++        rx->rx_phase = rade_cscale(rx->rx_phase, 1.0f / phase_mag);
+ 
+         /* Demodulate OFDM frame */
+         float z_hat[RADE_NZMF * RADE_LATENT_DIM];
+         float snr_est = 0.0f;
+ 
+         rade_ofdm_demod_frame(&rx->ofdm, z_hat, rx_corrected,
+-                              rx->time_offset, endofover, rx->coarse_mag, &snr_est);
++                              rx->time_offset, endofover, rx->coarse_mag, &snr_est,
++			      &rx->dbg_S1, &rx->dbg_S2);
+ 
+         /* Update SNR estimate with moving average */
+         rx->snrdB_3k_est = 0.9f * rx->snrdB_3k_est + 0.1f * snr_est;
+@@ -314,6 +315,7 @@ int rade_rx_process(rade_rx_state *rx, float *features_out, float *eoo_out, cons
+         fprintf(stderr, "Dtmax12: %8.2f %8.2f tmax: %4d fmax: %6.2f",
+                 rx->acq.Dtmax12, rx->acq.Dtmax12_eoo, rx->tmax, rx->fmax);
+         fprintf(stderr, " SNRdB: %5.2f", rx->snrdB_3k_est);
++	fprintf(stderr, " S1: %.4e S2: %.4e", rx->dbg_S1, rx->dbg_S2);
+         if (rx->auxdata && rx->state == RADE_STATE_SYNC) {
+             fprintf(stderr, " uw_err: %d", rx->uw_errors);
+         }
+diff --git a/src/rade_rx.h b/src/rade_rx.h
+index 76c497b..784b0db 100644
+--- a/src/rade_rx.h
++++ b/src/rade_rx.h
+@@ -94,6 +94,10 @@ typedef struct {
+     /* SNR estimate */
+     float snrdB_3k_est;
+ 
++    /* Raw pilot-power-ratio terms feeding the SNR estimate, for diagnostics */
++    float dbg_S1;
++    float dbg_S2;
++
+     /* Frame counter */
+     int mf;
+ 
+diff --git a/src/rade_bpf.c b/src/rade_bpf.c
+index d549c9b..6c7f565 100644
+--- a/src/rade_bpf.c
++++ b/src/rade_bpf.c
+@@ -107,6 +107,10 @@ void rade_bpf_process(rade_bpf *bpf, RADE_COMP *y, const RADE_COMP *x, int n) {
+         y[i] = rade_cmul(y_bb, cconj_phase);
+     }
+ 
++    /* Normalize phase to prevent drift */
++    float phase_mag = rade_cabs(phase);
++    phase = rade_cscale(phase, 1.0f / phase_mag);
++
+     /* Save phase state for next call */
+     bpf->phase = phase;
+ }
