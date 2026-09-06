@@ -535,13 +535,17 @@ next_fd:
 #else
                 if (!SSL_CTX_set_default_verify_paths(sslCtx_.load(std::memory_order_acquire)))
                 {
+#if defined(__APPLE__) && defined(ENABLE_TLS_SUPPORT_WITH_OPENSSL)
+                    log_info("Setting TLS certificate validation paths failed, but this is expected on macOS");
+#else
                     auto errStr = GetSSLError_();
                     log_warn("Unable to set TLS certificate validation paths: %s", errStr.c_str());
+#endif // defined(__APPLE__) && defined(ENABLE_TLS_SUPPORT_WITH_OPENSSL)
                 }
 
                 auto sslCertDirEnv = getenv("SSL_CERT_DIR"); // NOLINT
                 auto sslCertFileEnv = getenv("SSL_CERT_FILE"); // NOLINT
-                if (!SSL_CTX_load_verify_locations(sslCtx_.load(std::memory_order_acquire), sslCertFileEnv, sslCertDirEnv))
+                if ((sslCertDirEnv != nullptr || sslCertFileEnv != nullptr) && !SSL_CTX_load_verify_locations(sslCtx_.load(std::memory_order_acquire), sslCertFileEnv, sslCertDirEnv))
                 {
                     auto errStr = GetSSLError_();
                     log_warn("Unable to set TLS certificate locations: %s", errStr.c_str());
@@ -680,20 +684,27 @@ next_fd:
 void TcpConnectionHandler::disconnectImpl_(bool callHandler)
 {
     auto tmp = socket_.load(std::memory_order_acquire);
+    socket_.store(INVALID_SOCKET, std::memory_order_release);
     if (tmp != INVALID_SOCKET)
     {
-        socket_.store(INVALID_SOCKET, std::memory_order_release);
-
 #if defined(ENABLE_TLS_SUPPORT)
         auto tmpSsl = ssl_.load(std::memory_order_acquire);
         ssl_.store(nullptr, std::memory_order_release);
+        auto tmpCtx = sslCtx_.load(std::memory_order_acquire);
+        sslCtx_.store(nullptr, std::memory_order_release);
+#endif // defined(ENABLE_TLS_SUPPORT)
+
+        if (receiveThread_.joinable())
+        {
+            receiveThread_.join();
+        }
+
+#if defined(ENABLE_TLS_SUPPORT)
         if (tmpSsl != nullptr) 
         {
             SSL_shutdown(tmpSsl);
             SSL_free(tmpSsl);
         }
-        auto tmpCtx = sslCtx_.load(std::memory_order_acquire);
-        sslCtx_.store(nullptr, std::memory_order_release);
         if (tmpCtx != nullptr)
         {
             SSL_CTX_free(tmpCtx);
@@ -705,11 +716,6 @@ void TcpConnectionHandler::disconnectImpl_(bool callHandler)
 #else
         close(tmp);
 #endif // defined(WIN32)
-
-        if (receiveThread_.joinable())
-        {
-            receiveThread_.join();
-        }
 
         if (callHandler)
         {
