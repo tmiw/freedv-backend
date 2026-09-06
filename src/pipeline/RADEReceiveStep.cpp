@@ -86,8 +86,11 @@ static void freq_shift_coh(RADE_COMP rx_fdm_fcorr[], RADE_COMP rx_fdm[], float f
     foff_rect.real = cosf(2.0*M_PI*foff/Fs);
     foff_rect.imag = sinf(2.0*M_PI*foff/Fs);
     for(i=0; i<nin; i++) {
-	*foff_phase_rect = cmult(*foff_phase_rect, foff_rect);
-	rx_fdm_fcorr[i] = cmult(rx_fdm[i], *foff_phase_rect);
+        *foff_phase_rect = cmult(*foff_phase_rect, foff_rect);
+        if (foff != 0.f)
+            rx_fdm_fcorr[i] = cmult(rx_fdm[i], *foff_phase_rect);
+        else
+            rx_fdm_fcorr[i] = rx_fdm[i];
     }
 
     /* normalise digital oscillator as the magnitude can drift over time */
@@ -139,9 +142,6 @@ RADEReceiveStep::RADEReceiveStep(
     featuresOut_ = new float[rade_n_features_in_out(dv_)];
     assert(featuresOut_ != nullptr);
 
-    eooOut_ = new float[rade_n_eoo_bits(dv_)];
-    assert(eooOut_ != nullptr);
-
     pendingFeatures_ = new float[NB_TOTAL_FEATURES];
     assert(pendingFeatures_ != nullptr);
 
@@ -158,7 +158,6 @@ RADEReceiveStep::~RADEReceiveStep()
     delete[] inputBuf_;
     delete[] inputBufCplx_;
     delete[] featuresOut_;
-    delete[] eooOut_;
     delete[] pendingFeatures_;
     outputSamples_ = nullptr;
 
@@ -213,30 +212,37 @@ short* RADEReceiveStep::execute(short* inputSamples, int numInputSamples, int* n
         // demod per frame processing
         for(int i=0; i<nin; i++)
         {
-            inputBufCplx_[i].real = inputBuf_[i] / 32767.0;
+            inputBufCplx_[i].real = inputBuf_[i] * (2.0f / RADE_INT16_SCALE);
             inputBufCplx_[i].imag = 0.0;
         }
 
         // Optional frequency shifting
-        freq_shift_coh(rxFdmOffset_, inputBufCplx_, freqOffsetFn_(), RADE_MODEM_SAMPLE_RATE, &rxFreqOffsetPhaseRectObjs_, nin);
+        auto offset = freqOffsetFn_();
+        freq_shift_coh(rxFdmOffset_, inputBufCplx_, offset, RADE_MODEM_SAMPLE_RATE, &rxFreqOffsetPhaseRectObjs_, nin);
         
         // RADE processing (input signal->features).
         int hasEooOut = 0;
 
         FREEDV_BEGIN_VERIFIED_SAFE
-            nout = rade_rx(dv_, featuresOut_, &hasEooOut, eooOut_, rxFdmOffset_);
+            nout = rade_rx(dv_, featuresOut_, &hasEooOut, nullptr, rxFdmOffset_);
         FREEDV_END_VERIFIED_SAFE
 
-        if (hasEooOut && textPtr_ != nullptr)
+        if (nout > 0 && textPtr_ != nullptr)
         {
+            float dataSym = 0.0f;
+            FREEDV_BEGIN_VERIFIED_SAFE
+                dataSym = rade_rx_get_data_symbol(dv_);
+            FREEDV_END_VERIFIED_SAFE
+
             FREEDV_BEGIN_REALTIME_UNSAFE
 
-            // Handle RX of bits from EOO.
-            rade_text_rx(textPtr_, eooOut_, rade_n_eoo_bits(dv_) / 2);
+            // Feed the streamed data symbol (~25 bits/s) into the text decoder.
+            rade_text_rx_symbol(textPtr_, dataSym);
 
             FREEDV_END_REALTIME_UNSAFE
         }
-        else if (!hasEooOut)
+
+        if (!hasEooOut)
         {
             if (featuresFile_)
             {

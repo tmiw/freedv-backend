@@ -81,10 +81,10 @@ static float phi(float x)
 static const int E = (int)graph.edges.size();
 static std::vector<float> m_vc(E), m_cv(E, 0.0f);
 
-LDPCDecodeResult ldpc_decode(const RADE_COMP* syms,
-                              const float*    amplitudes,
-                              float           noise_var,
-                              int             max_iter)
+LDPCDecodeResult ldpc_decode(const float* syms,
+                              const float* amplitudes,
+                              float        noise_var,
+                              int          max_iter)
 {
     if (noise_var < 1e-10f) noise_var = 1e-10f;
 
@@ -117,18 +117,23 @@ LDPCDecodeResult ldpc_decode(const RADE_COMP* syms,
             const auto& ce = graph.check_edges[i];
             const int   nd = (int)ce.size();
 
+            // phi(|v|) is needed once per edge to build the sum below, and
+            // again per edge afterward as part of phi(sum - phi(|v|)) --
+            // cache it here instead of recomputing the same exp/log twice.
+            float phi_v[112];
             int sign = 1;
             float sum = 0;
             for (int k = 0; k < nd; k++) {
                 const float v = m_vc[ce[k]];
                 sign *= (v >= 0.0f) ? 1 : -1;
-                sum += std::max(0.0f, phi(std::abs(v)));
+                phi_v[k] = std::max(0.0f, phi(std::abs(v)));
+                sum += phi_v[k];
             }
 
             for (int k = 0; k < nd; k++) {
                 const float v = m_vc[ce[k]];
                 int inv_sign = (v >= 0.0f) ? 1 : -1;
-                m_cv[ce[k]] = std::clamp(inv_sign * sign * std::max(0.0f, phi(sum - phi(std::abs(v)))), -LLR_MAX, LLR_MAX);
+                m_cv[ce[k]] = std::clamp(inv_sign * sign * std::max(0.0f, phi(sum - phi_v[k])), -LLR_MAX, LLR_MAX);
             }
         }
 
@@ -155,12 +160,16 @@ LDPCDecodeResult ldpc_decode(const RADE_COMP* syms,
             result.message[j] = (L < 0.0f) ? 1 : 0;
         }
 
-        // bits * H' must equal 0. Check here.
+        // bits * H' must equal 0. Check here. Walk the sparse edge list
+        // (already built for the message-passing steps above) instead of
+        // scanning the dense 56x112 HRA_56_56 matrix -- same result, since
+        // HRA_56_56[i][j] is nonzero exactly on graph.check_edges[i]'s
+        // variables, but touches far fewer entries for a sparse code.
         bool ok = true;
         for (int i = 0; i < 56 && ok; i++) {
             int ctr = 0;
-            for (int j = 0; j < 112; j++) {
-                ctr += HRA_56_56[i][j] * result.message[j];
+            for (int e : graph.check_edges[i]) {
+                ctr += result.message[graph.edges[e].var];
             }
             ok = (ctr % 2) == 0; // non-zero check
         }
@@ -176,102 +185,37 @@ LDPCDecodeResult ldpc_decode(const RADE_COMP* syms,
     return result;
 }
 
-float calc_likelihood(const RADE_COMP* sym, float var, float real, float imag, float amp, float avg_amp)
+// ---- Exact BPSK channel LLR computation ----
+//
+// For BPSK the MAP log-likelihood ratio has a closed form since each bit
+// value corresponds to exactly one constellation point (no log-sum-exp over
+// multiple candidates is needed, unlike higher-order constellations):
+//
+//   LLR = log( exp(-(r-a)²/(2σ²)) ) - log( exp(-(r+a)²/(2σ²)) )
+//       = 2·a·r / σ²
+//
+// Constellation (amplitude a): s = +a -> bit 0, s = -a -> bit 1.
+//
+// The amplitude used above is weighted relative to the mean amplitude across
+// all symbols so that per-symbol fading confidence scales the LLR.
+
+void ldpc_linear_log_map(const float* syms,
+                         const float* amplitudes,
+                         float        noise_var,
+                         float*       llr_out)
 {
-    float errR = sym->real - real;
-    float errI = sym->imag - imag;
-    float a = amp / avg_amp;
-    return -var * a * a * (errR * errR + errI * errI);
-}
-
-// Linear constant log-map. See https://sciencedirect.com/science/article/pii/S001600321200035X
-float max_star(float x, float y)
-{
-    float maxXY = std::max(x, y);
-    float absdiff = std::abs(x - y);
-    float logXY = 0;
-
-    if (absdiff <= 2.45)
-    {
-        logXY = -0.24 * absdiff + 0.596;
-    }
-    else if (absdiff > 2.45 && absdiff <= 3.5)
-    {
-        logXY = 0.048;
-    }
-
-    return maxXY + logXY;
-}
-
-// ---- Simplified-MAX-Log-MAP channel LLR computation ----
-//
-// For each QPSK symbol the exact MAP log-likelihood ratio:
-//
-//   LLR_b = log( Σ_{s: b=0} exp(-||r - a·s||² / (2σ²)) )
-//         - log( Σ_{s: b=1} exp(-||r - a·s||² / (2σ²)) )
-//
-// is approximated by replacing log-sum-exp with max (i.e., min squared distance):
-//
-//   LLR_b ≈ min_{s: b=1} ||r - a·s||² / (2σ²)
-//          - min_{s: b=0} ||r - a·s||² / (2σ²)
-//
-// Constellation (amplitude a):
-//   s00 = ( a,  0)  bits (0,0)   s01 = ( 0,  a)  bits (0,1)
-//   s10 = ( 0, -a)  bits (1,0)   s11 = (-a,  0)  bits (1,1)
-
-void ldpc_linear_log_map(const RADE_COMP* syms,
-                         const float*    amplitudes,
-                         float           noise_var,
-                         float*          llr_out)
-{
-    constexpr int NUM_BITS_PER_SYMBOL = 2;
-    constexpr int NUM_SYMBOLS = 56;
+    constexpr int NUM_SYMBOLS = 112;
 
     float mean_amp = 0;
-    for (int k = 0; k < NUM_SYMBOLS; k++) 
+    for (int k = 0; k < NUM_SYMBOLS; k++)
     {
         mean_amp += amplitudes[k];
     }
     mean_amp /= NUM_SYMBOLS;
-    float EsNo = 1.0f / (2.0f * noise_var);
 
     for (int k = 0; k < NUM_SYMBOLS; k++) {
-        const float a  = amplitudes[k];
-
-        float num[NUM_BITS_PER_SYMBOL];
-        float den[NUM_BITS_PER_SYMBOL];
-        float sym_likelihoods[] = {
-            calc_likelihood(&syms[k], EsNo, 1, 0, a, mean_amp),  // 00
-            calc_likelihood(&syms[k], EsNo, 0, 1, a, mean_amp),  // 01
-            calc_likelihood(&syms[k], EsNo, 0, -1, a, mean_amp), // 10
-            calc_likelihood(&syms[k], EsNo, -1, 0, a, mean_amp)  // 11
-        };
-
-        for (int index = 0; index < NUM_BITS_PER_SYMBOL; index++)
-        {
-            num[index] = den[index] = -LLR_MAX;
-        }
-
-        // 00
-        den[0] = max_star(den[0], sym_likelihoods[0]);
-        den[1] = max_star(den[1], sym_likelihoods[0]);
-
-        // 01
-        den[0] = max_star(den[0], sym_likelihoods[1]);
-        num[1] = max_star(num[1], sym_likelihoods[1]);
-
-        // 10
-        num[0] = max_star(num[0], sym_likelihoods[2]);
-        den[1] = max_star(den[1], sym_likelihoods[2]);
-
-        // 11
-        num[0] = max_star(num[0], sym_likelihoods[3]);
-        num[1] = max_star(num[1], sym_likelihoods[3]);
-
-        const float llr_bit0 = num[0] - den[0];
-        const float llr_bit1 = num[1] - den[1];
-
-        llr_out[2*k]     = -std::clamp(llr_bit0, -LLR_MAX, LLR_MAX);
-        llr_out[2*k + 1] = -std::clamp(llr_bit1, -LLR_MAX, LLR_MAX);
+        const float rel_amp = amplitudes[k] / mean_amp;
+        const float llr = 2.0f * rel_amp * rel_amp * syms[k] / noise_var;
+        llr_out[k] = std::clamp(llr, -LLR_MAX, LLR_MAX);
     }
 }
