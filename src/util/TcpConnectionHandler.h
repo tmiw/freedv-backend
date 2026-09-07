@@ -55,6 +55,8 @@ protected:
     std::string host_;
     int port_;
     bool usingTLS_;
+    // Reconnect-policy flag. Carries no payload, so relaxed ordering is enough;
+    // it just needs to be read/written atomically.
     std::atomic<bool> enableReconnect_;
     
     virtual void onConnect_() = 0;
@@ -64,13 +66,25 @@ protected:
 private:
     std::thread receiveThread_;
     ThreadedTimer reconnectTimer_;
+    // socket_ / ssl_ / sslCtx_ are accessed with relaxed ordering. They are only
+    // ever handed to receiveImpl_() via the receiveThread_ std::thread creation and
+    // torn down after receiveThread_.join() (see disconnectImpl_()), so the thread
+    // create/join edges provide all the required happens-before; the atomics just
+    // guarantee non-torn reads and stop the compiler caching the value across
+    // receiveImpl_()'s loop. connectImpl_()/sendImpl_()/disconnectImpl_() all run
+    // on the same ThreadedObject worker thread (program order). This stays valid as
+    // long as receiveThread_ is re-created per connection rather than long-lived.
 #if defined(WIN32)
     std::atomic<SOCKET> socket_;
 #else
     std::atomic<int> socket_;
 #endif // defined(WIN32)
+    // DNS-completion flags, polled in sleep loops. The resolved addrinfo is handed
+    // over via std::future (its own synchronisation), so these carry no payload:
+    // relaxed ordering.
     std::atomic<bool> ipv4Complete_;
     std::atomic<bool> ipv6Complete_;
+    // Cancellation flag polled by connectImpl_(); no payload -> relaxed.
     std::atomic<bool> cancelConnect_;
     GenericFIFO<char> receiveBuffer_;
     OnRecvEndFn onRecvEndFn_;

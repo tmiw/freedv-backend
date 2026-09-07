@@ -42,7 +42,7 @@ ThreadedTimer::TimerServer::TimerServer()
 
 ThreadedTimer::TimerServer::~TimerServer()
 {
-    isDestroying_ = true;
+    isDestroying_.store(true, std::memory_order_relaxed);
     timerCV_.notify_one();
     objectThread_.join();
 }
@@ -90,7 +90,7 @@ void ThreadedTimer::TimerServer::eventLoop_()
 
     std::unique_lock<std::mutex> lk(mutex_);
     std::chrono::time_point<std::chrono::steady_clock> nextFireTime;
-    while (!isDestroying_.load(std::memory_order_acquire))
+    while (!isDestroying_.load(std::memory_order_relaxed))
     {
         if (timerQueue_.empty())
         {
@@ -111,7 +111,7 @@ void ThreadedTimer::TimerServer::eventLoop_()
         // Execute timers that have fired.
         auto currentTime = std::chrono::steady_clock::now();
         while (
-            !isDestroying_.load(std::memory_order_acquire) && 
+            !isDestroying_.load(std::memory_order_relaxed) && 
             !timerQueue_.empty() && timerQueue_.top()->nextFireTime_ <= currentTime)
         {
             ThreadedTimer* tmpTimer = timerQueue_.top();
@@ -130,7 +130,7 @@ void ThreadedTimer::TimerServer::eventLoop_()
             }
             else
             {
-                tmpTimer->isRunning_.store(false, std::memory_order_release); 
+                tmpTimer->isRunning_.store(false, std::memory_order_relaxed); 
             }
 
             // NOTE: we have to drop the lock here to avoid deadlocks in case the fn wants to mess with
@@ -153,7 +153,7 @@ ThreadedTimer::ThreadedTimer()
     , timeoutMilliseconds_(0)
 {
 #if !defined(__APPLE__)
-    isRunning_.store(false, std::memory_order_release);
+    isRunning_.store(false, std::memory_order_relaxed);
 #endif // !defined(__APPLE__)
 }
 
@@ -166,7 +166,7 @@ ThreadedTimer::ThreadedTimer(int milliseconds, TimerCallbackFn fn, bool repeat)
     setCallback(std::move(fn));
     setRepeat(repeat);
 #if !defined(__APPLE__)
-    isRunning_.store(false, std::memory_order_release);
+    isRunning_.store(false, std::memory_order_relaxed);
 #endif // !defined(__APPLE__)
 }
 
@@ -198,7 +198,7 @@ bool ThreadedTimer::isRunning()
 #if defined(__APPLE__)
     return internalTimer_ != nullptr;
 #else
-    return isRunning_.load(std::memory_order_acquire);
+    return isRunning_.load(std::memory_order_relaxed);
 #endif // defined(__APPLE__)
 }
     
@@ -225,7 +225,7 @@ void ThreadedTimer::start()
     {
         std::unique_lock<std::mutex> lk(timerMutex_);
         nextFireTime_ = std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::milliseconds(timeoutMilliseconds_));
-        isRunning_.store(true, std::memory_order_release);
+        isRunning_.store(true, std::memory_order_relaxed);
     }
     TheTimerServer_.registerTimer(this);
 #endif // defined(__APPLE__)
@@ -242,13 +242,13 @@ void ThreadedTimer::stop()
         internalTimer_ = nullptr;
     }
 #else
-    if (isRunning_.load(std::memory_order_acquire))
+    if (isRunning_.load(std::memory_order_relaxed))
     {
         // Temporarily unlock here to avoid deadlocks.
         lk.unlock();
         TheTimerServer_.unregisterTimer(this);
         lk.lock();
-        isRunning_.store(false, std::memory_order_release);
+        isRunning_.store(false, std::memory_order_relaxed);
     }
 #endif // defined(__APPLE__)
 }

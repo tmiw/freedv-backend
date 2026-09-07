@@ -52,6 +52,9 @@ protected:
 private:
     ThreadedObject* parent_;
     std::string name_;
+    // Control flags/counter only. The task payload travels through eventQueueMutex_
+    // (below) or GCD's dispatch_async, and the final barrier is objectThread_.join()
+    // / waitForAllTasksComplete_(), so relaxed ordering is sufficient here.
     std::atomic<bool> suppressEnqueue_;
 
 #if defined(__APPLE__)

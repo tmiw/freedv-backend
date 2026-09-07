@@ -66,7 +66,7 @@ FreeDVReporter::FreeDVReporter(std::string hostname, std::string callsign, std::
     sioClient_ = new SocketIoClient();
     assert(sioClient_ != nullptr);
 
-    isFullyConnected_.store(false, std::memory_order_release);
+    isFullyConnected_.store(false, std::memory_order_relaxed);
 }
 
 FreeDVReporter::~FreeDVReporter()
@@ -189,7 +189,7 @@ void FreeDVReporter::addReceiveRecord(std::string callsign, std::string mode, ui
 {
     std::unique_lock<std::mutex> lk(objMutex_);
     
-    if (isValidForReporting() && isFullyConnected_.load(std::memory_order_acquire))
+    if (isValidForReporting() && isFullyConnected_.load(std::memory_order_relaxed))
     {
         yyjson_mut_doc* rxDoc = yyjson_mut_doc_new(nullptr);
         yyjson_mut_val* rxData = yyjson_mut_obj(rxDoc);
@@ -328,7 +328,7 @@ void FreeDVReporter::connect_()
     sioClient_->setOnDisconnectFn([&]() {
         std::unique_lock<std::mutex> lk(objMutex_);
         isConnecting_ = false;
-        isFullyConnected_.store(false, std::memory_order_release);
+        isFullyConnected_.store(false, std::memory_order_relaxed);
         
         if (onReporterDisconnectFn_)
         {
@@ -337,7 +337,7 @@ void FreeDVReporter::connect_()
     });
     
     isConnecting_ = true;
-    isFullyConnected_.store(false, std::memory_order_release);
+    isFullyConnected_.store(false, std::memory_order_relaxed);
     
     std::stringstream ss;
     ss << hostname_;
@@ -419,7 +419,7 @@ void FreeDVReporter::onFreeDVReporterConnectionSuccessful_(yyjson_val* msgParams
     (void)msgParams;
     
     std::unique_lock<std::mutex> lk(objMutex_);
-    isFullyConnected_.store(true, std::memory_order_release);
+    isFullyConnected_.store(true, std::memory_order_relaxed);
 
     if (onConnectionSuccessfulFn_)
     {
@@ -661,7 +661,7 @@ void FreeDVReporter::onFreeDVReporterBulkUpdate_(yyjson_val* msgParams)
 
 void FreeDVReporter::freqChangeImpl_(uint64_t frequency)
 {
-    if (isFullyConnected_.load(std::memory_order_acquire))
+    if (isFullyConnected_.load(std::memory_order_relaxed))
     {
         yyjson_mut_doc* freqDoc = yyjson_mut_doc_new(nullptr);
         yyjson_mut_val* freqData = yyjson_mut_obj(freqDoc);
@@ -678,7 +678,7 @@ void FreeDVReporter::freqChangeImpl_(uint64_t frequency)
 
 void FreeDVReporter::transmitImpl_(std::string const& mode, bool tx)
 {
-    if (isFullyConnected_.load(std::memory_order_acquire))
+    if (isFullyConnected_.load(std::memory_order_relaxed))
     {
         yyjson_mut_doc* txDoc = yyjson_mut_doc_new(nullptr);
         yyjson_mut_val* txData = yyjson_mut_obj(txDoc);
@@ -696,7 +696,7 @@ void FreeDVReporter::transmitImpl_(std::string const& mode, bool tx)
 
 void FreeDVReporter::sendMessageImpl_(std::string const& message)
 {
-    if (isFullyConnected_.load(std::memory_order_acquire))
+    if (isFullyConnected_.load(std::memory_order_relaxed))
     {
         yyjson_mut_doc* txDoc = yyjson_mut_doc_new(nullptr);
         yyjson_mut_val* txData = yyjson_mut_obj(txDoc);
@@ -713,7 +713,7 @@ void FreeDVReporter::sendMessageImpl_(std::string const& message)
 void FreeDVReporter::hideFromViewImpl_()
 {
     hidden_ = true;
-    if (isFullyConnected_.load(std::memory_order_acquire))
+    if (isFullyConnected_.load(std::memory_order_relaxed))
     {
         sioClient_->emit("hide_self");
     }
@@ -727,7 +727,7 @@ void FreeDVReporter::showOurselvesImpl_()
     }
     
     hidden_ = false;
-    if (isFullyConnected_.load(std::memory_order_acquire))
+    if (isFullyConnected_.load(std::memory_order_relaxed))
     {
         sioClient_->emit("show_self");
     }

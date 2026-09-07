@@ -53,7 +53,7 @@ SocketIoClient::~SocketIoClient()
     
     // Note: not currently done in the underlying object due to
     // "pure virtual" function exceptions.
-    enableReconnect_.store(false, std::memory_order_release);
+    enableReconnect_.store(false, std::memory_order_relaxed);
     auto fut = disconnect();
     fut.wait();
 

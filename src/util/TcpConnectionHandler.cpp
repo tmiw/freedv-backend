@@ -101,7 +101,7 @@ TcpConnectionHandler::TcpConnectionHandler()
 TcpConnectionHandler::~TcpConnectionHandler()
 {
     // Make sure we're disconnected before destroying.
-    enableReconnect_.store(false, std::memory_order_release);
+    enableReconnect_.store(false, std::memory_order_relaxed);
 
     auto fut = disconnect();
     fut.wait();
@@ -116,11 +116,11 @@ TcpConnectionHandler::~TcpConnectionHandler()
 
 std::future<void> TcpConnectionHandler::connect(const char* host, int port, bool enableReconnect, bool enableTLS)
 {
-    cancelConnect_ = false;
+    cancelConnect_.store(false, std::memory_order_relaxed);
     host_ = host;
     port_ = port;
     usingTLS_ = enableTLS;
-    enableReconnect_.store(enableReconnect, std::memory_order_release);
+    enableReconnect_.store(enableReconnect, std::memory_order_relaxed);
     
     std::shared_ptr<std::promise<void>> prom = std::make_shared<std::promise<void> >();
     auto fut = prom->get_future();
@@ -135,14 +135,14 @@ std::future<void> TcpConnectionHandler::connect(const char* host, int port, bool
 std::future<void> TcpConnectionHandler::disconnect()
 {
     // Cancel any pending connections
-    cancelConnect_ = true;
+    cancelConnect_.store(true, std::memory_order_relaxed);
     
     std::shared_ptr<std::promise<void>> prom = std::make_shared<std::promise<void> >();
     auto fut = prom->get_future();
     
     enqueue_([&, prom]() {
         disconnectImpl_();
-        cancelConnect_ = false;
+        cancelConnect_.store(false, std::memory_order_relaxed);
         prom->set_value();
     });
     return fut;
@@ -189,8 +189,8 @@ void TcpConnectionHandler::connectImpl_()
     struct addrinfo* results[] = {nullptr, nullptr}; // [0] = IPv6, [1] = IPv4
     struct addrinfo* heads[] = {nullptr, nullptr};
     
-    ipv4Complete_ = false;
-    ipv6Complete_ = false;
+    ipv4Complete_.store(false, std::memory_order_relaxed);
+    ipv6Complete_.store(false, std::memory_order_relaxed);
 
     std::shared_ptr<std::promise<struct addrinfo*> > ipv6ResultPromise = 
         std::make_shared<std::promise<struct addrinfo*> >();
@@ -206,7 +206,7 @@ void TcpConnectionHandler::connectImpl_()
         struct addrinfo *result = nullptr;
         resolveAddresses_(AF_INET6, host_.c_str(), portStr.c_str(), &result);
         ipv6ResultPromise->set_value(result);
-        ipv6Complete_ = true;
+        ipv6Complete_.store(true, std::memory_order_relaxed);
     });
     
     std::thread ipv4ResolveThread([&, portStr, ipv4ResultPromise]() {
@@ -215,44 +215,44 @@ void TcpConnectionHandler::connectImpl_()
         struct addrinfo *result = nullptr;
         resolveAddresses_(AF_INET, host_.c_str(), portStr.c_str(), &result);
         ipv4ResultPromise->set_value(result);
-        ipv4Complete_ = true;
+        ipv4Complete_.store(true, std::memory_order_relaxed);
     });
     
     log_info("waiting for DNS");
     
-    while (!cancelConnect_ && ipv4Complete_ == false && ipv6Complete_ == false)
+    while (!cancelConnect_.load(std::memory_order_relaxed) && ipv4Complete_.load(std::memory_order_relaxed) == false && ipv6Complete_.load(std::memory_order_relaxed) == false)
     {
         std::this_thread::sleep_for(1ms);
     }
     
-    log_info("some DNS results are available (v4 = %d, v6 = %d)", (bool)ipv4Complete_, (bool)ipv6Complete_);
+    log_info("some DNS results are available (v4 = %d, v6 = %d)", ipv4Complete_.load(std::memory_order_relaxed), ipv6Complete_.load(std::memory_order_relaxed));
 
-    if (ipv6Complete_ == true)
+    if (ipv6Complete_.load(std::memory_order_relaxed) == true)
     {
         heads[0] = ipv6ResultFuture.get();
         results[0] = heads[0];
     }
 
-    if (ipv4Complete_ == true)
+    if (ipv4Complete_.load(std::memory_order_relaxed) == true)
     {
         heads[1] = ipv4ResultFuture.get();
         results[1] = heads[1];
     }
 
-    if (ipv6Complete_ == false)
+    if (ipv6Complete_.load(std::memory_order_relaxed) == false)
     {
         log_info("waiting additional time for IPv6 DNS results");
         std::this_thread::sleep_for(50ms);
-        if (ipv6Complete_ == true)
+        if (ipv6Complete_.load(std::memory_order_relaxed) == true)
         {
             heads[0] = ipv6ResultFuture.get();
             results[0] = heads[0];
         }
     }
-    if (ipv4Complete_ == false && ipv6Complete_ == true && results[0] == nullptr)
+    if (ipv4Complete_.load(std::memory_order_relaxed) == false && ipv6Complete_.load(std::memory_order_relaxed) == true && results[0] == nullptr)
     {
         log_info("no valid IPv6 results, need to wait for IPv4 before continuing.");
-        while (ipv4Complete_ == false)
+        while (ipv4Complete_.load(std::memory_order_relaxed) == false)
         {
             std::this_thread::sleep_for(1ms);
         }
@@ -261,11 +261,11 @@ void TcpConnectionHandler::connectImpl_()
     }
 
     int whichIndex = 0;
-    if (ipv6Complete_ == true && results[0] != nullptr)
+    if (ipv6Complete_.load(std::memory_order_relaxed) == true && results[0] != nullptr)
     {
         log_info("starting with IPv6 connection");
     }
-    else if (ipv4Complete_ == true && results[1] != nullptr)
+    else if (ipv4Complete_.load(std::memory_order_relaxed) == true && results[1] != nullptr)
     {
         log_info("starting with IPv4 connection");
         whichIndex = 1;
@@ -278,7 +278,7 @@ void TcpConnectionHandler::connectImpl_()
     std::vector<SOCKET> pendingSockets;
 #endif // !defined(WIN32)
     
-    while (!cancelConnect_ && (results[0] || results[1]))
+    while (!cancelConnect_.load(std::memory_order_relaxed) && (results[0] || results[1]))
     {
         struct addrinfo* current = results[whichIndex];
         int ret = 0;
@@ -344,7 +344,7 @@ void TcpConnectionHandler::connectImpl_()
         if (ret == 0)
         {
             // Connection succeeded immediately -- no need to attempt any other IPs
-            socket_.store(fd, std::memory_order_release);
+            socket_.store(fd, std::memory_order_relaxed);
             break;
         }
 #if defined(WIN32)
@@ -389,7 +389,7 @@ void TcpConnectionHandler::connectImpl_()
 
         // Check socket list to see if there have been any connections yet.
         checkConnections_(pendingSockets);
-        if (socket_.load(std::memory_order_acquire) != INVALID_SOCKET)
+        if (socket_.load(std::memory_order_relaxed) != INVALID_SOCKET)
         {
             break;
         }
@@ -414,12 +414,12 @@ next_fd:
         {
             whichIndex = (whichIndex + 1) % 2;
             
-            if (results[whichIndex] == nullptr && (ipv4Complete_ == false || ipv6Complete_ == false))
+            if (results[whichIndex] == nullptr && (ipv4Complete_.load(std::memory_order_relaxed) == false || ipv6Complete_.load(std::memory_order_relaxed) == false))
             {
                 // No more addresses to go through, so we *really* need to make sure
                 // we're done with DNS before exiting the loop.
                 log_info("ran out of addresses to check but DNS requests are still pending");
-                while (ipv4Complete_ == false || ipv6Complete_ == false)
+                while (ipv4Complete_.load(std::memory_order_relaxed) == false || ipv6Complete_.load(std::memory_order_relaxed) == false)
                 {
                     std::this_thread::sleep_for(1ms);
                 }
@@ -446,7 +446,7 @@ next_fd:
     }
     
     // Keep checking connections until one connects or we all time out.
-    while (!cancelConnect_ && pendingSockets.size() > 0 && socket_.load(std::memory_order_acquire) == INVALID_SOCKET)
+    while (!cancelConnect_.load(std::memory_order_relaxed) && pendingSockets.size() > 0 && socket_.load(std::memory_order_relaxed) == INVALID_SOCKET)
     {
         checkConnections_(pendingSockets);
     }
@@ -454,7 +454,7 @@ next_fd:
     // Close any connections still pending.
     for (auto& sock : pendingSockets)
     {
-        if (sock != socket_.load(std::memory_order_acquire))
+        if (sock != socket_.load(std::memory_order_relaxed))
         {
 #if defined(WIN32)
             closesocket(sock);
@@ -464,20 +464,20 @@ next_fd:
         }
     }
     
-    if (socket_.load(std::memory_order_acquire) != INVALID_SOCKET)
+    if (socket_.load(std::memory_order_relaxed) != INVALID_SOCKET)
     {
         bool connSucceeded = true;
 #if defined(ENABLE_TLS_SUPPORT)
-        sslCtx_.store(nullptr, std::memory_order_release);
-        ssl_.store(nullptr, std::memory_order_release);
+        sslCtx_.store(nullptr, std::memory_order_relaxed);
+        ssl_.store(nullptr, std::memory_order_relaxed);
 
         // We have a valid socket. If the user wants to connect via TLS, attempt TLS negotiation now.
         // If we can't negotiate TLS for whatever reason, close socket and try again in a bit.
         if (usingTLS_)
         {
             const SSL_METHOD* method = TLS_client_method();
-            sslCtx_.store(SSL_CTX_new(method), std::memory_order_release);
-            if (sslCtx_.load(std::memory_order_acquire) == nullptr)
+            sslCtx_.store(SSL_CTX_new(method), std::memory_order_relaxed);
+            if (sslCtx_.load(std::memory_order_relaxed) == nullptr)
             {
                 auto errStr = GetSSLError_();
                 log_error("Unable to create SSL context: %s", errStr.c_str());
@@ -487,7 +487,7 @@ next_fd:
             else
             {
                 // Set up certificate validation
-                SSL_CTX_set_verify(sslCtx_.load(std::memory_order_acquire), SSL_VERIFY_PEER, nullptr);
+                SSL_CTX_set_verify(sslCtx_.load(std::memory_order_relaxed), SSL_VERIFY_PEER, nullptr);
 
                 // Set up root certificate locations. Note that on Windows,
                 // we use the Windows certificate store, so we need to manually
@@ -500,12 +500,12 @@ next_fd:
                     HCERTSTORE hStore;
                     PCCERT_CONTEXT pContext = nullptr;
                     X509 *x509 = nullptr;
-                    X509_STORE *store = SSL_CTX_get_cert_store(sslCtx_.load(std::memory_order_acquire));
+                    X509_STORE *store = SSL_CTX_get_cert_store(sslCtx_.load(std::memory_order_relaxed));
                     
                     if (store == nullptr)
                     {
                         store = X509_STORE_new();
-                        SSL_CTX_set_cert_store(sslCtx_.load(std::memory_order_acquire), store);
+                        SSL_CTX_set_cert_store(sslCtx_.load(std::memory_order_relaxed), store);
                     }
 
                     hStore = CertOpenSystemStoreW(NULL, L"ROOT");
@@ -533,7 +533,7 @@ next_fd:
                     }
                 }
 #else
-                if (!SSL_CTX_set_default_verify_paths(sslCtx_.load(std::memory_order_acquire)))
+                if (!SSL_CTX_set_default_verify_paths(sslCtx_.load(std::memory_order_relaxed)))
                 {
 #if defined(__APPLE__) && defined(ENABLE_TLS_SUPPORT_WITH_OPENSSL)
                     log_info("Setting TLS certificate validation paths failed, but this is expected on macOS");
@@ -545,7 +545,7 @@ next_fd:
 
                 auto sslCertDirEnv = getenv("SSL_CERT_DIR"); // NOLINT
                 auto sslCertFileEnv = getenv("SSL_CERT_FILE"); // NOLINT
-                if ((sslCertDirEnv != nullptr || sslCertFileEnv != nullptr) && !SSL_CTX_load_verify_locations(sslCtx_.load(std::memory_order_acquire), sslCertFileEnv, sslCertDirEnv))
+                if ((sslCertDirEnv != nullptr || sslCertFileEnv != nullptr) && !SSL_CTX_load_verify_locations(sslCtx_.load(std::memory_order_relaxed), sslCertFileEnv, sslCertDirEnv))
                 {
                     auto errStr = GetSSLError_();
                     log_warn("Unable to set TLS certificate locations: %s", errStr.c_str());
@@ -554,16 +554,16 @@ next_fd:
 #endif // defined(WIN32)
 
                 // Force >= TLS 1.2
-                if (!SSL_CTX_set_min_proto_version(sslCtx_.load(std::memory_order_acquire), TLS1_2_VERSION)) 
+                if (!SSL_CTX_set_min_proto_version(sslCtx_.load(std::memory_order_relaxed), TLS1_2_VERSION)) 
                 {
                     auto errStr = GetSSLError_();
                     log_warn("Unable to mandate minimum TLS version: %s", errStr.c_str());
                 }
 
-                ssl_.store(SSL_new(sslCtx_.load(std::memory_order_acquire)), std::memory_order_release);
-                assert(ssl_ != nullptr);
+                ssl_.store(SSL_new(sslCtx_.load(std::memory_order_relaxed)), std::memory_order_relaxed);
+                assert(ssl_.load(std::memory_order_relaxed) != nullptr);
 
-                if (!SSL_set_fd(ssl_.load(std::memory_order_acquire), (int)socket_.load(std::memory_order_acquire)))
+                if (!SSL_set_fd(ssl_.load(std::memory_order_relaxed), (int)socket_.load(std::memory_order_relaxed)))
                 {
                     auto errStr = GetSSLError_();
                     log_error("Unable to assign socket to SSL context: %s", errStr.c_str());
@@ -573,8 +573,8 @@ next_fd:
                 else
                 {
                     // Set hostname for SSL negotiation
-                    SSL_set_tlsext_host_name(ssl_.load(std::memory_order_acquire), host_.c_str());
-                    if (!SSL_set1_host(ssl_.load(std::memory_order_acquire), host_.c_str())) 
+                    SSL_set_tlsext_host_name(ssl_.load(std::memory_order_relaxed), host_.c_str());
+                    if (!SSL_set1_host(ssl_.load(std::memory_order_relaxed), host_.c_str())) 
                     {
                         auto errStr = GetSSLError_();
                         log_warn("Unable to assign hostname for certificate validation: %s", errStr.c_str());
@@ -582,27 +582,27 @@ next_fd:
 
                     // Attempt SSL negotiation
                     int sslRet = 0;
-                    while ((sslRet = SSL_connect(ssl_.load(std::memory_order_acquire))) != 1)
+                    while ((sslRet = SSL_connect(ssl_.load(std::memory_order_relaxed))) != 1)
                     {
                         fd_set writeSet;
                         fd_set readSet;
                         FD_ZERO(&writeSet);
                         FD_ZERO(&readSet);
-                        auto sslErr = SSL_get_error(ssl_.load(std::memory_order_acquire), sslRet);
+                        auto sslErr = SSL_get_error(ssl_.load(std::memory_order_relaxed), sslRet);
                         if (sslErr == SSL_ERROR_WANT_READ || sslErr == SSL_ERROR_WANT_WRITE)
                         {
                             // Block until we're able to continue.
-                            auto rawSock = socket_.load(std::memory_order_acquire);
+                            auto rawSock = socket_.load(std::memory_order_relaxed);
                             if (sslErr == SSL_ERROR_WANT_READ) FD_SET(rawSock, &readSet);
                             else FD_SET(rawSock, &writeSet);
 
-                            select(socket_.load(std::memory_order_acquire) + 1, &readSet, &writeSet, nullptr, nullptr);
+                            select(socket_.load(std::memory_order_relaxed) + 1, &readSet, &writeSet, nullptr, nullptr);
                         }
                         else
                         {
-                            if (SSL_get_verify_result(ssl_.load(std::memory_order_acquire)) != X509_V_OK)
+                            if (SSL_get_verify_result(ssl_.load(std::memory_order_relaxed)) != X509_V_OK)
                             {
-                                log_error("Certificate validation error: %s", X509_verify_cert_error_string(SSL_get_verify_result(ssl_.load(std::memory_order_acquire))));
+                                log_error("Certificate validation error: %s", X509_verify_cert_error_string(SSL_get_verify_result(ssl_.load(std::memory_order_relaxed))));
                             }
 
                             auto errStr = GetSSLError_();
@@ -623,7 +623,7 @@ next_fd:
             char buf[256];
             struct sockaddr_storage addr;
             socklen_t len = sizeof(addr);
-            if (getpeername(socket_.load(std::memory_order_acquire), (struct sockaddr*)&addr, &len) != 0)
+            if (getpeername(socket_.load(std::memory_order_relaxed), (struct sockaddr*)&addr, &len) != 0)
             {
 #if defined(WIN32)
                 int err = WSAGetLastError();
@@ -648,7 +648,7 @@ next_fd:
             receiveThread_ = std::thread(std::bind(&TcpConnectionHandler::receiveImpl_, this));
         }
     }
-    else if (enableReconnect_.load(std::memory_order_acquire))
+    else if (enableReconnect_.load(std::memory_order_relaxed))
     {
         // Attempt reconnect
         log_warn("connection failed, waiting to reconnect");
@@ -658,7 +658,7 @@ next_fd:
     // Free address info objects
     ipv6ResolveThread.detach();
     ipv4ResolveThread.detach();
-    while (!ipv4Complete_ || !ipv6Complete_)
+    while (!ipv4Complete_.load(std::memory_order_relaxed) || !ipv6Complete_.load(std::memory_order_relaxed))
     {
         std::this_thread::sleep_for(1ms);
     }
@@ -683,15 +683,15 @@ next_fd:
 
 void TcpConnectionHandler::disconnectImpl_(bool callHandler)
 {
-    auto tmp = socket_.load(std::memory_order_acquire);
-    socket_.store(INVALID_SOCKET, std::memory_order_release);
+    auto tmp = socket_.load(std::memory_order_relaxed);
+    socket_.store(INVALID_SOCKET, std::memory_order_relaxed);
     if (tmp != INVALID_SOCKET)
     {
 #if defined(ENABLE_TLS_SUPPORT)
-        auto tmpSsl = ssl_.load(std::memory_order_acquire);
-        ssl_.store(nullptr, std::memory_order_release);
-        auto tmpCtx = sslCtx_.load(std::memory_order_acquire);
-        sslCtx_.store(nullptr, std::memory_order_release);
+        auto tmpSsl = ssl_.load(std::memory_order_relaxed);
+        ssl_.store(nullptr, std::memory_order_relaxed);
+        auto tmpCtx = sslCtx_.load(std::memory_order_relaxed);
+        sslCtx_.store(nullptr, std::memory_order_relaxed);
 #endif // defined(ENABLE_TLS_SUPPORT)
 
         if (receiveThread_.joinable())
@@ -722,7 +722,7 @@ void TcpConnectionHandler::disconnectImpl_(bool callHandler)
             onDisconnect_();
         }
 
-        if (enableReconnect_.load(std::memory_order_acquire))
+        if (enableReconnect_.load(std::memory_order_relaxed))
         {
             reconnectTimer_.start();
         }
@@ -731,7 +731,7 @@ void TcpConnectionHandler::disconnectImpl_(bool callHandler)
 
 void TcpConnectionHandler::sendImpl_(const char* buf, int length)
 {
-    if (socket_.load(std::memory_order_acquire) != INVALID_SOCKET)
+    if (socket_.load(std::memory_order_relaxed) != INVALID_SOCKET)
     {
         // Simulate blocking socket for write. Most of the time this should
         // complete immediately anyway.
@@ -740,34 +740,34 @@ void TcpConnectionHandler::sendImpl_(const char* buf, int length)
             fd_set writeSet;
 
             FD_ZERO(&writeSet);
-            FD_SET(socket_.load(std::memory_order_acquire), &writeSet);
+            FD_SET(socket_.load(std::memory_order_relaxed), &writeSet);
 
-            int rv = select(socket_.load(std::memory_order_acquire) + 1, nullptr, &writeSet, nullptr, nullptr);
+            int rv = select(socket_.load(std::memory_order_relaxed) + 1, nullptr, &writeSet, nullptr, nullptr);
             if (rv > 0)
             {
                 int numWritten = 0;
 #if defined(ENABLE_TLS_SUPPORT)
-                if (usingTLS_ && ssl_.load(std::memory_order_acquire) != nullptr)
+                if (usingTLS_ && ssl_.load(std::memory_order_relaxed) != nullptr)
                 {
                     while (
-                        (ssl_.load(std::memory_order_acquire) != nullptr) &&
-                        (numWritten = SSL_write(ssl_.load(std::memory_order_acquire), buf, length)) < 0)
+                        (ssl_.load(std::memory_order_relaxed) != nullptr) &&
+                        (numWritten = SSL_write(ssl_.load(std::memory_order_relaxed), buf, length)) < 0)
                     {
                         fd_set readSet;
                         FD_ZERO(&readSet);
-                        auto sslErr = SSL_get_error(ssl_.load(std::memory_order_acquire), numWritten);
+                        auto sslErr = SSL_get_error(ssl_.load(std::memory_order_relaxed), numWritten);
                         if (sslErr == SSL_ERROR_WANT_WRITE)
                         {
                             // Can be handled by the top level loop. Not an error.
                             goto tryAgain;
                         }
-                        else if (sslErr == SSL_ERROR_WANT_READ && socket_.load(std::memory_order_acquire) != INVALID_SOCKET)
+                        else if (sslErr == SSL_ERROR_WANT_READ && socket_.load(std::memory_order_relaxed) != INVALID_SOCKET)
                         {
                             // Block until we're able to continue.
-                            auto rawSock = socket_.load(std::memory_order_acquire);
+                            auto rawSock = socket_.load(std::memory_order_relaxed);
                             FD_SET(rawSock, &readSet);
 
-                            select(socket_.load(std::memory_order_acquire) + 1, &readSet, nullptr, nullptr, nullptr);
+                            select(socket_.load(std::memory_order_relaxed) + 1, &readSet, nullptr, nullptr, nullptr);
                             continue;
                         }
                         else
@@ -782,9 +782,9 @@ void TcpConnectionHandler::sendImpl_(const char* buf, int length)
 #endif // defined(ENABLE_TLS_SUPPORT)
                 {
 #if defined(WIN32)
-                    numWritten = ::send(socket_.load(std::memory_order_acquire), buf, length, 0);
+                    numWritten = ::send(socket_.load(std::memory_order_relaxed), buf, length, 0);
 #else
-                    numWritten = write(socket_.load(std::memory_order_acquire), buf, length);
+                    numWritten = write(socket_.load(std::memory_order_relaxed), buf, length);
 #endif // defined(WIN32)
                 }
                 if (numWritten > 0)
@@ -839,46 +839,46 @@ void TcpConnectionHandler::receiveImpl_()
 
     SetThreadName("TCPRx");
 
-    while (socket_.load(std::memory_order_acquire) != INVALID_SOCKET)
+    while (socket_.load(std::memory_order_relaxed) != INVALID_SOCKET)
     {
         struct timeval tv = {0, 250000}; // 250ms
         fd_set readSet;
         FD_ZERO(&readSet);
-        FD_SET(socket_.load(std::memory_order_acquire), &readSet);
+        FD_SET(socket_.load(std::memory_order_relaxed), &readSet);
 
-        int rv = select(socket_.load(std::memory_order_acquire) + 1, &readSet, nullptr, nullptr, &tv);
-        if (rv > 0 && socket_.load(std::memory_order_acquire) != INVALID_SOCKET)
+        int rv = select(socket_.load(std::memory_order_relaxed) + 1, &readSet, nullptr, nullptr, &tv);
+        if (rv > 0 && socket_.load(std::memory_order_relaxed) != INVALID_SOCKET)
         {
             int numRead = 0;
             int numHaveRead = 0;
 #if defined(ENABLE_TLS_SUPPORT)
-            while(!usingTLS_ || ssl_.load(std::memory_order_acquire) != nullptr)
+            while(!usingTLS_ || ssl_.load(std::memory_order_relaxed) != nullptr)
 #else
             while(true)
 #endif // defined(ENABLE_TLS_SUPPORT)
             {
 #if defined(ENABLE_TLS_SUPPORT)
-                if (usingTLS_ && ssl_.load(std::memory_order_acquire) != nullptr)
+                if (usingTLS_ && ssl_.load(std::memory_order_relaxed) != nullptr)
                 {
-                    numRead = SSL_read(ssl_.load(std::memory_order_acquire), buf, READ_SIZE_BYTES);
-                    if (numRead < 0 && ssl_.load(std::memory_order_acquire))
+                    numRead = SSL_read(ssl_.load(std::memory_order_relaxed), buf, READ_SIZE_BYTES);
+                    if (numRead < 0 && ssl_.load(std::memory_order_relaxed))
                     {
                         fd_set writeSet;
                         FD_ZERO(&writeSet);
-                        auto sslErr = SSL_get_error(ssl_.load(std::memory_order_acquire), numRead);
+                        auto sslErr = SSL_get_error(ssl_.load(std::memory_order_relaxed), numRead);
                         if (sslErr == SSL_ERROR_WANT_READ)
                         {
                             // This case can be handled by the top-level select()
                             // loop. Not an error.
                             goto tryAgain;
                         }
-                        else if (sslErr == SSL_ERROR_WANT_WRITE && socket_.load(std::memory_order_acquire) != INVALID_SOCKET)
+                        else if (sslErr == SSL_ERROR_WANT_WRITE && socket_.load(std::memory_order_relaxed) != INVALID_SOCKET)
                         {
                             // Block until we're able to continue writing.
-                            auto rawSock = socket_.load(std::memory_order_acquire);
+                            auto rawSock = socket_.load(std::memory_order_relaxed);
                             FD_SET(rawSock, &writeSet);
 
-                            select(socket_.load(std::memory_order_acquire) + 1, nullptr, &writeSet, nullptr, nullptr);
+                            select(socket_.load(std::memory_order_relaxed) + 1, nullptr, &writeSet, nullptr, nullptr);
                             continue;
                         }
                         else
@@ -893,9 +893,9 @@ void TcpConnectionHandler::receiveImpl_()
 #endif // defined(ENABLE_TLS_SUPPORT)
                 {
 #if defined(WIN32)
-                    numRead = recv(socket_.load(std::memory_order_acquire), buf, READ_SIZE_BYTES, 0);
+                    numRead = recv(socket_.load(std::memory_order_relaxed), buf, READ_SIZE_BYTES, 0);
 #else
-                    numRead = read(socket_.load(std::memory_order_acquire), buf, READ_SIZE_BYTES);
+                    numRead = read(socket_.load(std::memory_order_relaxed), buf, READ_SIZE_BYTES);
 #endif // defined(WIN32)
                 }
 
@@ -913,31 +913,31 @@ void TcpConnectionHandler::receiveImpl_()
                     break;
                 }
             }
-            if (numHaveRead > 0 && socket_.load(std::memory_order_acquire) != INVALID_SOCKET)
+            if (numHaveRead > 0 && socket_.load(std::memory_order_relaxed) != INVALID_SOCKET)
             {
                 enqueue_([this]() {
                     char tmp[READ_SIZE_BYTES];
                     int toRead = std::min(receiveBuffer_.numUsed(), READ_SIZE_BYTES);
-                    while (socket_.load(std::memory_order_acquire) != INVALID_SOCKET && toRead > 0)
+                    while (socket_.load(std::memory_order_relaxed) != INVALID_SOCKET && toRead > 0)
                     {
                         receiveBuffer_.read(tmp, toRead);
-                        if (socket_.load(std::memory_order_acquire) != INVALID_SOCKET) onReceive_(tmp, toRead);
+                        if (socket_.load(std::memory_order_relaxed) != INVALID_SOCKET) onReceive_(tmp, toRead);
                         toRead = std::min(receiveBuffer_.numUsed(), READ_SIZE_BYTES);
                     }
-                    if (socket_.load(std::memory_order_acquire) != INVALID_SOCKET && onRecvEndFn_)
+                    if (socket_.load(std::memory_order_relaxed) != INVALID_SOCKET && onRecvEndFn_)
                     {
                         onRecvEndFn_();
                     }
                 });
             } 
-            else if (numRead == 0 && socket_.load(std::memory_order_acquire) != INVALID_SOCKET)
+            else if (numRead == 0 && socket_.load(std::memory_order_relaxed) != INVALID_SOCKET)
             {
                 log_warn("EOF received");
                 enqueue_([this]() {
                     disconnectImpl_();
                 });
             }
-            else if (numRead < 0 && socket_.load(std::memory_order_acquire) != INVALID_SOCKET)
+            else if (numRead < 0 && socket_.load(std::memory_order_relaxed) != INVALID_SOCKET)
             {
 #if defined(WIN32)
                 log_warn("read failed (errno=%d)", WSAGetLastError());
@@ -949,7 +949,7 @@ void TcpConnectionHandler::receiveImpl_()
                 });
             }
         }
-        else if (rv < 0 && socket_.load(std::memory_order_acquire) != INVALID_SOCKET)
+        else if (rv < 0 && socket_.load(std::memory_order_relaxed) != INVALID_SOCKET)
         {
 #if defined(WIN32)
             log_warn("read failed (errno=%d)", WSAGetLastError());
@@ -1021,7 +1021,7 @@ void TcpConnectionHandler::checkConnections_(std::vector<int>& sockets)
                 else if (sockErrCode == 0)
                 {
                     // Connection succeeded.
-                    socket_.store(sock, std::memory_order_release);
+                    socket_.store(sock, std::memory_order_relaxed);
                     break;
                 }
                 
