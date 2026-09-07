@@ -64,12 +64,42 @@ public:
 protected:
     // Helper method that converts integer samples to floating point samples
     template<typename DstType, typename SrcType, SrcType SampleDivisor = std::numeric_limits<SrcType>::max()>
+    static void ConvertSingleSampleToFloatSampleType_(SrcType* sourceSamples, DstType* destSamples);
+    template<typename DstType, typename SrcType, SrcType SampleDivisor = std::numeric_limits<SrcType>::max()>
     static void ConvertToFloatSampleType_(SrcType* sourceSamples, DstType* destSamples, std::size_t numSamples);
 
     // Helper method that converts floating point samples to integer samples
     template<typename DstType, typename SrcType, DstType SampleMultiplier = std::numeric_limits<DstType>::max()>
+    static void ConvertSingleSampleToIntSampleType_(SrcType* sourceSamples, DstType* destSamples);
+    template<typename DstType, typename SrcType, DstType SampleMultiplier = std::numeric_limits<DstType>::max()>
     static void ConvertToIntSampleType_(SrcType* sourceSamples, DstType* destSamples, std::size_t numSamples);
 };
+
+template<typename DstType, typename SrcType, SrcType SampleDivisor>
+void IPipelineStep::ConvertSingleSampleToFloatSampleType_(SrcType* sourceSamples, DstType* destSamples)
+{
+    // Make sure template types are correct
+    static_assert(std::numeric_limits<DstType>::is_iec559);
+    static_assert(std::numeric_limits<SrcType>::is_integer);
+
+    // Make sure divisor isn't zero
+    static_assert(SampleDivisor != 0);
+
+    // Iterate through samples, performing division (if needed) and typecasting
+    if (SampleDivisor == 1)
+    {
+        destSamples[0] = (DstType)sourceSamples[0];
+    }
+    else
+    {
+        auto divider = SampleDivisor + 1;
+        if (SampleDivisor != std::numeric_limits<DstType>::max())
+        {
+            divider = SampleDivisor;
+        }
+        destSamples[0] = (DstType)sourceSamples[0] * ((DstType)1.0 / divider);
+    }
+}
 
 template<typename DstType, typename SrcType, SrcType SampleDivisor>
 void IPipelineStep::ConvertToFloatSampleType_(SrcType* sourceSamples, DstType* destSamples, std::size_t numSamples)
@@ -99,6 +129,39 @@ void IPipelineStep::ConvertToFloatSampleType_(SrcType* sourceSamples, DstType* d
         for (std::size_t index = 0; index < numSamples; index++)
         {
             destSamples[index] = (DstType)sourceSamples[index] * ((DstType)1.0 / divider);
+        }
+    }
+}
+
+template<typename DstType, typename SrcType, DstType SampleMultiplier>
+void IPipelineStep::ConvertSingleSampleToIntSampleType_(SrcType* sourceSamples, DstType* destSamples)
+{
+    // Make sure template types are correct
+    static_assert(std::numeric_limits<SrcType>::is_iec559);
+    static_assert(std::numeric_limits<DstType>::is_integer);
+
+    // Iterate through samples, performing multiplication (if needed) and typecasting
+    if (SampleMultiplier == 1)
+    {
+        destSamples[0] = (DstType)sourceSamples[0];
+    }
+    else
+    {
+        constexpr auto MIN_DST_TYPE_VAL = std::numeric_limits<DstType>::min();
+        constexpr auto MAX_DST_TYPE_VAL = std::numeric_limits<DstType>::max();
+        constexpr auto multiplier = (SampleMultiplier != MAX_DST_TYPE_VAL) ? SampleMultiplier : (SampleMultiplier + 1);
+        SrcType temp = sourceSamples[0] * multiplier;
+        if (temp <= MIN_DST_TYPE_VAL)
+        {
+            destSamples[0] = MIN_DST_TYPE_VAL;
+        }
+        else if (temp >= MAX_DST_TYPE_VAL)
+        {
+            destSamples[0] = MAX_DST_TYPE_VAL;
+        }
+        else
+        {
+            destSamples[0] = static_cast<DstType>(std::trunc(temp));
         }
     }
 }

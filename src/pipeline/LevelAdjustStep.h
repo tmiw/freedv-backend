@@ -54,6 +54,7 @@ private:
     realtime_fp<float()> scaleFactorFn_;
     int sampleRate_;
     std::unique_ptr<short[]> outputSamples_;
+    std::unique_ptr<float[]> tmpFloatInput_;
 };
 
 #endif // AUDIO_PIPELINE__LEVEL_ADJUST_STEP_H

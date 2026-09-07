@@ -50,7 +50,7 @@ TapStep::TapStep(int sampleRate, IPipelineStep* tapStep)
     : tapStep_(tapStep)
     , sampleRate_(sampleRate)
     , endingTapThread_(false)
-    , tapThreadInput_(sampleRate)
+    , tapThreadInput_(sampleRate * 0.25f)
 {
     tapThread_ = std::thread([&]() {
         const int SAMPLE_RATE_AT_10MS = sampleRate_ / 100;
@@ -99,13 +99,20 @@ int TapStep::getOutputSampleRate() const FREEDV_NONBLOCKING
 short* TapStep::execute(short* inputSamples, int numInputSamples, int* numOutputSamples) FREEDV_NONBLOCKING
 {
     assert(tapStep_->getInputSampleRate() == sampleRate_);
-    
-    tapThreadInput_.write(inputSamples, numInputSamples);
-    if (tapThreadInput_.numUsed() > (100 * sampleRate_ / 1000))
+
+    *numOutputSamples = numInputSamples;
+    short* tmpInputSamples = inputSamples;
+    while (numInputSamples > 0)
     {
-        sem_.signal();
+        int samplesToRead = std::min(sampleRate_ / 100, numInputSamples);
+        tapThreadInput_.write(tmpInputSamples, samplesToRead);
+        tmpInputSamples += samplesToRead;
+        numInputSamples -= samplesToRead;
+        if (tapThreadInput_.numUsed() > (100 * sampleRate_ / 1000))
+        {
+            sem_.signal();
+        }
     }
  
-    *numOutputSamples = numInputSamples;
     return inputSamples;
 }

@@ -684,20 +684,27 @@ next_fd:
 void TcpConnectionHandler::disconnectImpl_(bool callHandler)
 {
     auto tmp = socket_.load(std::memory_order_acquire);
+    socket_.store(INVALID_SOCKET, std::memory_order_release);
     if (tmp != INVALID_SOCKET)
     {
-        socket_.store(INVALID_SOCKET, std::memory_order_release);
-
 #if defined(ENABLE_TLS_SUPPORT)
         auto tmpSsl = ssl_.load(std::memory_order_acquire);
         ssl_.store(nullptr, std::memory_order_release);
+        auto tmpCtx = sslCtx_.load(std::memory_order_acquire);
+        sslCtx_.store(nullptr, std::memory_order_release);
+#endif // defined(ENABLE_TLS_SUPPORT)
+
+        if (receiveThread_.joinable())
+        {
+            receiveThread_.join();
+        }
+
+#if defined(ENABLE_TLS_SUPPORT)
         if (tmpSsl != nullptr) 
         {
             SSL_shutdown(tmpSsl);
             SSL_free(tmpSsl);
         }
-        auto tmpCtx = sslCtx_.load(std::memory_order_acquire);
-        sslCtx_.store(nullptr, std::memory_order_release);
         if (tmpCtx != nullptr)
         {
             SSL_CTX_free(tmpCtx);
@@ -709,11 +716,6 @@ void TcpConnectionHandler::disconnectImpl_(bool callHandler)
 #else
         close(tmp);
 #endif // defined(WIN32)
-
-        if (receiveThread_.joinable())
-        {
-            receiveThread_.join();
-        }
 
         if (callHandler)
         {

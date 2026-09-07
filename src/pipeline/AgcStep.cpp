@@ -57,7 +57,7 @@ AgcStep::AgcStep(int sampleRate)
     : sampleRate_(sampleRate == 8000 || sampleRate == 16000 || sampleRate == 32000 || sampleRate == 48000 ? sampleRate : 48000)
     , targetGainDb_(0.0)
     , currentGainDb_(0.0)
-    , inputSampleFifo_(sampleRate / 2)
+    , inputSampleFifo_(MAX_AGC_SAMPLES + 1)
 {
     numSamplesPerRun_ = std::min(MAX_AGC_SAMPLES, sampleRate_ / TEN_MS_DIVIDER); // 10ms blocks, 160 max samples
     assert(numSamplesPerRun_ > 0);
@@ -120,18 +120,16 @@ short* AgcStep::execute(short* inputSamples, int numInputSamples, int* numOutput
 
     *numOutputSamples = 0;
     short* outputSamples = outputSamples_.get();
+    short* tmpOutput = outputSamples;
+    short* tmpInput = tmpInput_.get();
 
-    int numRuns = (inputSampleFifo_.numUsed() + numInputSamples) / numSamplesPerRun_;
-    if (numRuns > 0)
+    while (numInputSamples > 0)
     {
-        *numOutputSamples = numRuns * numSamplesPerRun_;
-        
-        short* tmpOutput = outputSamples;
-        short* tmpInput = tmpInput_.get();
-
-        inputSampleFifo_.write(inputSamples, numInputSamples);
-        while (inputSampleFifo_.numUsed() >= numSamplesPerRun_)
+        inputSampleFifo_.write(inputSamples++, 1);
+        numInputSamples--;
+        if (inputSampleFifo_.numUsed() == numSamplesPerRun_)
         {
+            *numOutputSamples += numSamplesPerRun_;
             inputSampleFifo_.read(tmpInput, numSamplesPerRun_);
 
             // Step 1: feed samples into ebur128 and return current
@@ -171,9 +169,9 @@ short* AgcStep::execute(short* inputSamples, int numInputSamples, int* numOutput
             float temp = 0;
             for (auto ctr = 0; ctr < numSamplesPerRun_; ctr++)
             {
-                ConvertToFloatSampleType_<float, short>(&tmpInput[ctr], &temp, 1);
+                ConvertSingleSampleToFloatSampleType_<float, short>(&tmpInput[ctr], &temp);
                 temp *= scaleFactor;
-                ConvertToIntSampleType_<short, float>(&temp, &tmpInput[ctr], 1);
+                ConvertSingleSampleToIntSampleType_<short, float>(&temp, &tmpInput[ctr]);
             }
 
             // Run WebRTC to make sure we don't clip.
@@ -186,10 +184,6 @@ short* AgcStep::execute(short* inputSamples, int numInputSamples, int* numOutput
                 const_cast<int16_t *const *>(&tmpOutput), inMicLevel, &outMicLevel, echo, &saturationWarning);
             tmpOutput += numSamplesPerRun_;
         }
-    }
-    else if (numInputSamples > 0 && inputSamples != nullptr)
-    {
-        inputSampleFifo_.write(inputSamples, numInputSamples);
     }
     
     return outputSamples;

@@ -40,6 +40,7 @@ macro(DefineUnitTest utName)
         PROPERTIES BUILD_RPATH "${CMAKE_BUILD_RPATH};${rade_BINARY_DIR}/src")
 endmacro()
 
+DefineUnitTest(AgcStepTest)
 DefineUnitTest(AudioPipelineTest)
 DefineUnitTest(EitherOrTest)
 DefineUnitTest(LevelAdjustTest)
