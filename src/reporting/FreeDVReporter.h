@@ -129,6 +129,9 @@ private:
     
     std::mutex objMutex_;
     bool isConnecting_;
+    // Always read/written while holding objMutex_, which supplies the ordering;
+    // the atomic itself only needs relaxed. (Kept atomic rather than a plain bool
+    // to keep tooling like TSan happy about the lock-free-looking accessors.)
     std::atomic<bool> isFullyConnected_;
     
     SocketIoClient* sioClient_;

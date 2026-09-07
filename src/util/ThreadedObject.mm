@@ -46,7 +46,7 @@ ThreadedObject::ThreadedObject(std::string name, ThreadedObject* parent)
     queue_ = dispatch_queue_create_with_target(nullptr, DISPATCH_QUEUE_SERIAL, parentQueue);
     assert(queue_ != nil);
     
-    numQueued_ = 0;
+    numQueued_.store(0, std::memory_order_relaxed);
 }
 
 ThreadedObject::~ThreadedObject()
@@ -60,27 +60,27 @@ ThreadedObject::~ThreadedObject()
 
 void ThreadedObject::enqueue_(std::function<void()> fn, int) // NOLINT
 {
-    if (suppressEnqueue_.load(std::memory_order_acquire)) return;
+    if (suppressEnqueue_.load(std::memory_order_relaxed)) return;
 
     // note: timeout not implemented
-    numQueued_++;
+    numQueued_.fetch_add(1, std::memory_order_relaxed);
     dispatch_async(queue_, ^() {
         fn();
-        numQueued_--;
+        numQueued_.fetch_sub(1, std::memory_order_relaxed);
     });
 }
 
 void ThreadedObject::waitForAllTasksComplete_()
 {
-    suppressEnqueue_.store(true, std::memory_order_release);
+    suppressEnqueue_.store(true, std::memory_order_relaxed);
 
     // We wait forever here instead of 250ms as with the non-macOS implementation
     // since we don't have a way to just clear out the queued events in the dispatch
     // queue after the timeout.
-    while (numQueued_ > 0)
+    while (numQueued_.load(std::memory_order_relaxed) > 0)
     {
         std::this_thread::sleep_for(10ms);
     }
 
-    suppressEnqueue_.store(false, std::memory_order_release);
+    suppressEnqueue_.store(false, std::memory_order_relaxed);
 }

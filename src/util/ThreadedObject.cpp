@@ -53,7 +53,7 @@ ThreadedObject::~ThreadedObject()
         {
             std::unique_lock<std::recursive_mutex> lk(eventQueueMutex_);
             eventQueue_.clear();
-            isDestroying_.store(true, std::memory_order_release);
+            isDestroying_.store(true, std::memory_order_relaxed);
             eventQueueCV_.notify_one();
         }
 
@@ -63,7 +63,7 @@ ThreadedObject::~ThreadedObject()
 
 void ThreadedObject::enqueue_(std::function<void()> fn, int timeoutMilliseconds)
 {
-    if (suppressEnqueue_.load(std::memory_order_acquire)) return;
+    if (suppressEnqueue_.load(std::memory_order_relaxed)) return;
 
     if (parent_ != nullptr)
     {
@@ -117,7 +117,7 @@ void ThreadedObject::eventLoop_()
 
     SetThreadName(name_);
 
-    while (!isDestroying_.load(std::memory_order_acquire))
+    while (!isDestroying_.load(std::memory_order_relaxed))
     {
         std::function<void()> fn;
         
@@ -129,16 +129,16 @@ void ThreadedObject::eventLoop_()
                 std::unique_lock<std::recursive_mutex> lk(eventQueueMutex_);
 
                 count = eventQueue_.size();
-                if (count == 0 && !isDestroying_.load(std::memory_order_acquire))
+                if (count == 0 && !isDestroying_.load(std::memory_order_relaxed))
                 {
                     eventQueueCV_.wait(lk, [&]() {
-                        return isDestroying_.load(std::memory_order_acquire) || eventQueue_.size() > 0;
+                        return isDestroying_.load(std::memory_order_relaxed) || eventQueue_.size() > 0;
                     });
                     
                     count = eventQueue_.size();
                 }
 
-                if (isDestroying_.load(std::memory_order_acquire) || count == 0)
+                if (isDestroying_.load(std::memory_order_relaxed) || count == 0)
                 {
                     break;
                 }
@@ -147,28 +147,28 @@ void ThreadedObject::eventLoop_()
                 eventQueue_.pop_front();
             }
         
-            if (!isDestroying_.load(std::memory_order_acquire) && fn)
+            if (!isDestroying_.load(std::memory_order_relaxed) && fn)
             {
-                taskCurrentlyExecuting_.store(true, std::memory_order_release);
+                taskCurrentlyExecuting_.store(true, std::memory_order_relaxed);
                 fn();
-                taskCurrentlyExecuting_.store(false, std::memory_order_release);
+                taskCurrentlyExecuting_.store(false, std::memory_order_relaxed);
             }
 
             count--;
-        } while (!isDestroying_.load(std::memory_order_acquire) && count > 0);
+        } while (!isDestroying_.load(std::memory_order_relaxed) && count > 0);
     }
 }
 
 void ThreadedObject::waitForAllTasksComplete_()
 {
     std::unique_lock<std::recursive_mutex> lk(eventQueueMutex_);
-    suppressEnqueue_.store(true, std::memory_order_release);
+    suppressEnqueue_.store(true, std::memory_order_relaxed);
     auto count = eventQueue_.size();
     lk.unlock();
 
     constexpr int MAX_TIMEOUT_COUNT = 250; // should be ~250ms
     int timeoutCount = 0;
-    while ((count > 0 || taskCurrentlyExecuting_.load(std::memory_order_acquire)) && timeoutCount < MAX_TIMEOUT_COUNT)
+    while ((count > 0 || taskCurrentlyExecuting_.load(std::memory_order_relaxed)) && timeoutCount < MAX_TIMEOUT_COUNT)
     {
         std::this_thread::sleep_for(1ms);
         lk.lock();
@@ -178,5 +178,5 @@ void ThreadedObject::waitForAllTasksComplete_()
         timeoutCount++;
     }
 
-    suppressEnqueue_.store(false, std::memory_order_release);
+    suppressEnqueue_.store(false, std::memory_order_relaxed);
 }

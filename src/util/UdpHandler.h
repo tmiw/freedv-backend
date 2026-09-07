@@ -50,6 +50,10 @@ protected:
     
 private:
     std::thread receiveThread_;
+    // Accessed with relaxed ordering: published to receiveImpl_() via the
+    // receiveThread_ std::thread creation and torn down after receiveThread_.join()
+    // (see disconnect()), so the thread create/join edges carry the ordering; the
+    // atomic only guarantees a non-torn read of the fd.
 #if defined(WIN32)
     std::atomic<SOCKET> socket_;
 #else

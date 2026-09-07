@@ -76,6 +76,8 @@ private:
         };
 
         std::mutex mutex_;
+        // Shutdown flag; timerQueue_ is guarded by mutex_ and the final barrier is
+        // objectThread_.join(), so relaxed ordering is enough.
         std::atomic<bool> isDestroying_;
         std::thread objectThread_;
         std::condition_variable timerCV_;
@@ -83,6 +85,9 @@ private:
         void eventLoop_();
     };
 
+    // "Is this timer currently scheduled" state. The timer config (fn_, repeat_,
+    // timeoutMilliseconds_, nextFireTime_) is guarded by timerMutex_, not by this
+    // flag, so relaxed ordering is enough.
     std::atomic<bool> isRunning_;
     std::chrono::time_point<std::chrono::steady_clock> nextFireTime_;
 

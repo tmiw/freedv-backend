@@ -143,14 +143,14 @@ void UdpHandler::openImpl_(const char* sendIp, int sendPort)
         }
 
 #if defined(WIN32)
-        socket_ = socket(addressType, SOCK_DGRAM, IPPROTO_UDP);
-        if (socket_ == INVALID_SOCKET)
+        socket_.store(socket(addressType, SOCK_DGRAM, IPPROTO_UDP), std::memory_order_relaxed);
+        if (socket_.load(std::memory_order_relaxed) == INVALID_SOCKET)
         {
             log_warn("cannot open socket (err=%d)", WSAGetLastError());
         }
 #else
-        socket_ = socket(addressType, SOCK_DGRAM, IPPROTO_UDP);
-        if(socket_ < 0)
+        socket_.store(socket(addressType, SOCK_DGRAM, IPPROTO_UDP), std::memory_order_relaxed);
+        if(socket_.load(std::memory_order_relaxed) < 0)
         {
             log_warn("cannot open socket (err=%d)", errno);
         }
@@ -178,20 +178,20 @@ void UdpHandler::openImpl_(const char* sendIp, int sendPort)
         if (result != nullptr)
         {
 #if defined(WIN32)
-            socket_ = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
-            if (socket_ == INVALID_SOCKET)
+            socket_.store(socket(result->ai_family, result->ai_socktype, result->ai_protocol), std::memory_order_relaxed);
+            if (socket_.load(std::memory_order_relaxed) == INVALID_SOCKET)
             {
                 log_warn("cannot open socket (err=%d)", WSAGetLastError());
             }
 #else
-            socket_ = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
-            if(socket_ < 0)
+            socket_.store(socket(result->ai_family, result->ai_socktype, result->ai_protocol), std::memory_order_relaxed);
+            if(socket_.load(std::memory_order_relaxed) < 0)
             {
                 log_warn("cannot open socket (err=%d)", errno);
             }
 #endif // defined(WIN32)
 
-            auto err = ::bind(socket_, result->ai_addr, result->ai_addrlen);
+            auto err = ::bind(socket_.load(std::memory_order_relaxed), result->ai_addr, result->ai_addrlen);
             if (err != 0)
             {
 #if defined(WIN32)
@@ -219,10 +219,10 @@ void UdpHandler::openImpl_(const char* sendIp, int sendPort)
 
 void UdpHandler::closeImpl_()
 {
-    auto tmp = socket_.load(std::memory_order_acquire);
+    auto tmp = socket_.load(std::memory_order_relaxed);
     if (tmp != INVALID_SOCKET)
     {
-        socket_.store(INVALID_SOCKET, std::memory_order_release);
+        socket_.store(INVALID_SOCKET, std::memory_order_relaxed);
 
 #if defined(WIN32)
         closesocket(tmp);
@@ -242,7 +242,7 @@ void UdpHandler::sendImpl_(const char* host, int port, const char* buf, int leng
     struct addrinfo* result = resolveIpAddress_(host, port);
     if (result != nullptr)
     {
-        auto rv = sendto(socket_, buf, length, 0, result->ai_addr, result->ai_addrlen);
+        auto rv = sendto(socket_.load(std::memory_order_relaxed), buf, length, 0, result->ai_addr, result->ai_addrlen);
         if (rv < 0)
         {
 #if defined(WIN32)
@@ -325,7 +325,7 @@ void UdpHandler::joinMulticastGroup_(struct addrinfo* addr)
         multicastRequest.ipv6mr_interface = 0;
 
         /* Join the multicast address */
-        if (setsockopt(socket_.load(std::memory_order_acquire), IPPROTO_IPV6, IPV6_JOIN_GROUP, (char*) &multicastRequest, sizeof(multicastRequest)) != 0) 
+        if (setsockopt(socket_.load(std::memory_order_relaxed), IPPROTO_IPV6, IPV6_JOIN_GROUP, (char*) &multicastRequest, sizeof(multicastRequest)) != 0) 
         {
 #if defined(WIN32)
             log_warn("Cannot join multicast group (err=%d)", WSAGetLastError());
@@ -390,7 +390,7 @@ void UdpHandler::joinMulticastGroup_(struct addrinfo* addr)
                         multicastRequest.imr_interface.s_addr = ifAddr;
 
                         // We also need to specify IP_MULTICAST_IF too.
-                        if (setsockopt(socket_.load(std::memory_order_acquire), IPPROTO_IP, IP_MULTICAST_IF, (char*) &ifAddr, sizeof(ifAddr)) != 0) 
+                        if (setsockopt(socket_.load(std::memory_order_relaxed), IPPROTO_IP, IP_MULTICAST_IF, (char*) &ifAddr, sizeof(ifAddr)) != 0) 
                         {
                             log_warn("Cannot join multicast group (err=%d)", WSAGetLastError());
                         }
@@ -406,7 +406,7 @@ void UdpHandler::joinMulticastGroup_(struct addrinfo* addr)
 #endif // defined(WIN32)
 
         /* Join the multicast address */
-        if (setsockopt(socket_.load(std::memory_order_acquire), IPPROTO_IP, IP_ADD_MEMBERSHIP, (char*) &multicastRequest, sizeof(multicastRequest)) != 0) 
+        if (setsockopt(socket_.load(std::memory_order_relaxed), IPPROTO_IP, IP_ADD_MEMBERSHIP, (char*) &multicastRequest, sizeof(multicastRequest)) != 0) 
         {
 #if defined(WIN32)
             log_warn("Cannot join multicast group (err=%d)", WSAGetLastError());
