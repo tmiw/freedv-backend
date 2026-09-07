@@ -203,7 +203,10 @@ bool GenericFIFO<T>::canWrite_(int len, Pos& outStart) noexcept
 {
     if (resetting_.load(std::memory_order_acquire)) return false;
 
-    Pos ppin = pin_.load(std::memory_order_acquire);
+    // Own cursor: only the producer writes pin_, so this load synchronises with nothing
+    // and needs no ordering of its own. The acquire that matters on this side is the
+    // pout_ load below.
+    Pos ppin = pin_.load(std::memory_order_relaxed);
     unsigned int used = 0;
 
     bool ok = computeUsed_(ppin, poutCache_, used);
@@ -227,7 +230,10 @@ bool GenericFIFO<T>::canRead_(int len, Pos& outStart) noexcept
 {
     if (resetting_.load(std::memory_order_acquire)) return false;
 
-    Pos ppout = pout_.load(std::memory_order_acquire);
+    // Own cursor: only the consumer writes pout_, so this load synchronises with nothing.
+    // The acquire that matters on this side is the pin_ load below, which is what makes
+    // the producer's buffer writes visible.
+    Pos ppout = pout_.load(std::memory_order_relaxed);
     unsigned int used = 0;
 
     bool ok = computeUsed_(pinCache_, ppout, used);
