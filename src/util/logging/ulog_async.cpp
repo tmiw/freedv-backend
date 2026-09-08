@@ -452,8 +452,7 @@ void serializeArgs(const char* fmt, va_list ap, Record& rec) FREEDV_NONBLOCKING
             }
             case AK_PTR:
             {
-                std::uintptr_t v =
-                    reinterpret_cast<std::uintptr_t>(va_arg(ap, void*));
+                void* v = va_arg(ap, void*);
                 ok = w.put(&v, sizeof v);
                 break;
             }
@@ -620,11 +619,10 @@ void renderMessage(const Record& rec, char* out, std::size_t cap)
             }
             case AK_PTR:
             {
-                std::uintptr_t v = 0;
+                void* v = nullptr;
                 if (!r.get(&v, sizeof v)) { argsExhausted = true; break; }
                 std::snprintf(spec, sizeof spec, "%%%sp", s.prefix);
-                n = std::snprintf(out + used, remain, spec,
-                                  reinterpret_cast<void*>(v));
+                n = std::snprintf(out + used, remain, spec, v);
                 break;
             }
             case AK_STR:

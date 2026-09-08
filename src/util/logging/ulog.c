@@ -631,16 +631,14 @@ void ulog_log(int level, const char *file, int line, const char *topic, const ch
 }
 
 #ifdef ULOG_ASYNC
-void ulog_log_prerendered(int level, const char *file, int line,
-                          long tv_sec, long tv_nsec, const char *rendered_msg) {
-    (void) tv_nsec;
-
-    if (level < ulog.level) {
-        return;
-    }
-
+// Variadic shim so message_format_args is a genuine, va_start-initialised list.
+// The already-rendered text is passed through as the single "%s" argument, so
+// the normal output path (custom prefix, quiet, extra outputs, ...) is reused
+// verbatim and any '%' in the text is printed literally.
+static void emit_prerendered_(int level, const char *file, int line,
+                              struct tm *tm_buf, ...) {
     ulog_Event ev = {
-            .message = rendered_msg,
+            .message = "%s",
             .file    = file,
             .line    = line,
             .level   = level,
@@ -648,23 +646,14 @@ void ulog_log_prerendered(int level, const char *file, int line,
             .topic = -1,
 #endif
     };
-    ev.prerendered      = rendered_msg;
-    ev.time_is_borrowed = true;
-
 #if FEATURE_TIME
-    // Only the single async consumer thread calls this, so a function-local
-    // static is safe and avoids the per-event malloc() in process_callback().
-    {
-        static struct tm tm_buf;
-        time_t t = (time_t) tv_sec;
-#if defined(WIN32)
-        localtime_s(&tm_buf, &t);
+    ev.time             = tm_buf;
+    ev.time_is_borrowed = true;
 #else
-        localtime_r(&t, &tm_buf);
+    (void) tm_buf;
 #endif
-        ev.time = &tm_buf;
-    }
-#endif
+
+    va_start(ev.message_format_args, tm_buf);
 
     lock();
 
@@ -675,6 +664,33 @@ void ulog_log_prerendered(int level, const char *file, int line,
 #endif
 
     unlock();
+
+    va_end(ev.message_format_args);
+}
+
+void ulog_log_prerendered(int level, const char *file, int line,
+                          long tv_sec, long tv_nsec, const char *rendered_msg) {
+    (void) tv_nsec;
+
+    if (level < ulog.level) {
+        return;
+    }
+
+#if FEATURE_TIME
+    // Only the single async consumer thread calls this, so a function-local
+    // static is safe and avoids the per-event malloc() in process_callback().
+    static struct tm tm_buf;
+    time_t t = (time_t) tv_sec;
+#if defined(WIN32)
+    localtime_s(&tm_buf, &t);
+#else
+    localtime_r(&t, &tm_buf);
+#endif
+    emit_prerendered_(level, file, line, &tm_buf, rendered_msg);
+#else
+    (void) tv_sec;
+    emit_prerendered_(level, file, line, NULL, rendered_msg);
+#endif
 }
 #endif // ULOG_ASYNC
 
@@ -689,13 +705,6 @@ static void print_message(ulog_Event *ev, FILE *file) {
 
 #if FEATURE_FILE_STRING
     fprintf(file, " %s:%d: ", ev->file, ev->line);  // file and line
-#endif
-
-#ifdef ULOG_ASYNC
-    if (ev->prerendered) {
-        fputs(ev->prerendered, file);  // already formatted by the async path
-        return;
-    }
 #endif
 
     vfprintf(file, ev->message, ev->message_format_args);  // message

@@ -163,12 +163,9 @@ typedef struct {
     int level;         // Event debug level
 
 #ifdef ULOG_ASYNC
-    // Set by the async logging consumer (ulog_async.cpp): when non-NULL the
-    // message text is already formatted and is printed verbatim instead of
-    // running message/message_format_args through vfprintf().
-    const char *prerendered;
-    // When true, `time` points at storage owned by the caller and must not
-    // be free()d by the output path.
+    // Set on the async logging path (see ulog_log_prerendered): when true,
+    // `time` points at storage the caller owns and the output path must not
+    // free() it.
     bool time_is_borrowed;
 #endif
 } ulog_Event;
