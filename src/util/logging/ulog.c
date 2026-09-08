@@ -28,6 +28,10 @@
 #include "libfmemopen.h"
 #endif // defined(_WIN32)
 
+#ifdef ULOG_ASYNC
+#include "ulog_async.h"
+#endif
+
 #define ULOG_NEW_LINE_ON true
 #define ULOG_NEW_LINE_OFF false
 #define ULOG_COLOR_ON true
@@ -494,7 +498,10 @@ static void write_formatted_message(ulog_Event *ev, FILE *file, bool full_time, 
     } else {
         print_time_sec(ev, file);
     }
-    free(ev->time);
+#ifdef ULOG_ASYNC
+    if (!ev->time_is_borrowed)
+#endif
+        free(ev->time);
 #else
     (void) full_time;
 #endif  // FEATURE_TIME
@@ -561,6 +568,19 @@ void ulog_log(int level, const char *file, int line, const char *topic, const ch
     if (level < ulog.level) {
         return;
     }
+
+#ifdef ULOG_ASYNC
+    // On a real-time thread, capture the call without formatting, locking or
+    // touching stdio. The async consumer thread renders and emits it later.
+    if (ulog_async_is_realtime_thread()) {
+        va_list async_args;
+        va_start(async_args, message);
+        ulog_async_enqueue(level, file, line, message, async_args);
+        va_end(async_args);
+        return;
+    }
+#endif
+
 #if !FEATURE_TOPICS
     (void) topic;
 #else
@@ -610,6 +630,54 @@ void ulog_log(int level, const char *file, int line, const char *topic, const ch
     va_end(ev.message_format_args);
 }
 
+#ifdef ULOG_ASYNC
+void ulog_log_prerendered(int level, const char *file, int line,
+                          long tv_sec, long tv_nsec, const char *rendered_msg) {
+    (void) tv_nsec;
+
+    if (level < ulog.level) {
+        return;
+    }
+
+    ulog_Event ev = {
+            .message = rendered_msg,
+            .file    = file,
+            .line    = line,
+            .level   = level,
+#if FEATURE_TOPICS
+            .topic = -1,
+#endif
+    };
+    ev.prerendered      = rendered_msg;
+    ev.time_is_borrowed = true;
+
+#if FEATURE_TIME
+    // Only the single async consumer thread calls this, so a function-local
+    // static is safe and avoids the per-event malloc() in process_callback().
+    {
+        static struct tm tm_buf;
+        time_t t = (time_t) tv_sec;
+#if defined(WIN32)
+        localtime_s(&tm_buf, &t);
+#else
+        localtime_r(&t, &tm_buf);
+#endif
+        ev.time = &tm_buf;
+    }
+#endif
+
+    lock();
+
+    log_to_stdout(&ev);
+
+#if FEATURE_EXTRA_OUTPUTS
+    log_to_extra_outputs(&ev);
+#endif
+
+    unlock();
+}
+#endif // ULOG_ASYNC
+
 static void print_level(ulog_Event *ev, FILE *file) {
     fprintf(file, " %-1s", level_strings[ev->level]);
 }
@@ -621,6 +689,13 @@ static void print_message(ulog_Event *ev, FILE *file) {
 
 #if FEATURE_FILE_STRING
     fprintf(file, " %s:%d: ", ev->file, ev->line);  // file and line
+#endif
+
+#ifdef ULOG_ASYNC
+    if (ev->prerendered) {
+        fputs(ev->prerendered, file);  // already formatted by the async path
+        return;
+    }
 #endif
 
     vfprintf(file, ev->message, ev->message_format_args);  // message
