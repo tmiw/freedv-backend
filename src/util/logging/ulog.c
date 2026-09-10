@@ -32,6 +32,22 @@
 #include "ulog_async.h"
 #endif
 
+// ulog_set_level() may be called from any thread (e.g. a settings UI) while the
+// async consumer thread -- and, with ULOG_ASYNC, every logging thread -- reads
+// the level unlocked on the hot path (the `level < ulog.level` early-out). Make
+// just this one field atomic so those accesses are race-free. Relaxed ordering
+// is enough: the level is an independent knob, not a gate on other state.
+#if defined(ULOG_ASYNC) && !defined(__STDC_NO_ATOMICS__)
+#include <stdatomic.h>
+typedef _Atomic int ulog_level_t;
+#define ULOG_LEVEL_LOAD()   atomic_load_explicit(&ulog.level, memory_order_relaxed)
+#define ULOG_LEVEL_STORE(v) atomic_store_explicit(&ulog.level, (v), memory_order_relaxed)
+#else
+typedef int ulog_level_t;
+#define ULOG_LEVEL_LOAD()   (ulog.level)
+#define ULOG_LEVEL_STORE(v) (ulog.level = (v))
+#endif
+
 #define ULOG_NEW_LINE_ON true
 #define ULOG_NEW_LINE_OFF false
 #define ULOG_COLOR_ON true
@@ -56,7 +72,7 @@ typedef struct {
 typedef struct {
     ulog_LockFn lock_function;  // Mutex function
     void *lock_arg;             // Mutex argument
-    int level;                  // Debug level
+    ulog_level_t level;         // Debug level (atomic under ULOG_ASYNC)
     bool quiet;                 // Quiet mode
     Callback callback_stdout;   // to stdout
 
@@ -564,8 +580,8 @@ static void log_to_stdout(ulog_Event *ev) {
 
 /// @brief Logs the message
 void ulog_log(int level, const char *file, int line, const char *topic, const char *message, ...) {
-    
-    if (level < ulog.level) {
+
+    if (level < ULOG_LEVEL_LOAD()) {
         return;
     }
 
@@ -676,7 +692,7 @@ void ulog_log_prerendered(int level, const char *file, int line,
                           long tv_sec, long tv_nsec, const char *rendered_msg) {
     (void) tv_nsec;
 
-    if (level < ulog.level) {
+    if (level < ULOG_LEVEL_LOAD()) {
         return;
     }
 
@@ -750,7 +766,7 @@ const char *ulog_get_level_string(int level) {
 
 /// @brief Sets the debug level
 void ulog_set_level(int level) {
-    ulog.level = level;
+    ULOG_LEVEL_STORE(level);
 }
 
 
