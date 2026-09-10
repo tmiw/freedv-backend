@@ -175,7 +175,7 @@ void* MinimalTxRxThread::Entry()
     
     // Return to normal scheduling
     helper->clearHelperRealTime();
-    
+
     return NULL;
 }
 

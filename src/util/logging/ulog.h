@@ -161,6 +161,13 @@ typedef struct {
     const char *file;  // Event file name
     int line;          // Event line number
     int level;         // Event debug level
+
+#ifdef ULOG_ASYNC
+    // Set on the async logging path (see ulog_log_prerendered): when true,
+    // `time` points at storage the caller owns and the output path must not
+    // free() it.
+    bool time_is_borrowed;
+#endif
 } ulog_Event;
 
 typedef void (*ulog_LogFn)(ulog_Event *ev, void *arg);
@@ -191,6 +198,24 @@ int ulog_event_to_cstr(ulog_Event *ev, char *out, size_t out_size);
 /// @param message - Message format string
 /// @param ... - Format arguments
 void ulog_log(int level, const char *file, int line, const char *topic, const char *message, ...);
+
+#ifdef ULOG_ASYNC
+/// @brief Emits an already-formatted log line through the normal ulog output
+///        path (stdout callback, extra outputs, custom prefix, ...).
+///
+/// Used by the async logging consumer thread to flush records captured from
+/// other threads. Not real-time safe itself (takes the ulog lock); never call
+/// it from a real-time thread. See ulog_async.h.
+///
+/// @param level        - Debug level
+/// @param file         - Source file (as captured at log time)
+/// @param line         - Source line (as captured at log time)
+/// @param tv_sec       - Wall-clock seconds captured at log time
+/// @param tv_nsec      - Nanoseconds captured at log time (currently unused)
+/// @param rendered_msg - Fully formatted message text
+void ulog_log_prerendered(int level, const char *file, int line,
+                          long tv_sec, long tv_nsec, const char *rendered_msg);
+#endif
 
 /* ============================================================================
    Core Functionality: Thread Safety
