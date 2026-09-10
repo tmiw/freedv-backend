@@ -232,14 +232,11 @@ short* RADEReceiveStep::execute(short* inputSamples, int numInputSamples, int* n
             float dataSym = 0.0f;
             FREEDV_BEGIN_VERIFIED_SAFE
                 dataSym = rade_rx_get_data_symbol(dv_);
+
+                // Feed the streamed data symbol (~25 bits/s) into the text decoder.
+                rade_text_rx_symbol(textPtr_, dataSym);
+
             FREEDV_END_VERIFIED_SAFE
-
-            FREEDV_BEGIN_REALTIME_UNSAFE
-
-            // Feed the streamed data symbol (~25 bits/s) into the text decoder.
-            rade_text_rx_symbol(textPtr_, dataSym);
-
-            FREEDV_END_REALTIME_UNSAFE
         }
 
         if (!hasEooOut)
