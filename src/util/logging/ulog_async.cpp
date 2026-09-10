@@ -114,6 +114,12 @@ std::atomic<bool>       g_running{false};
 std::atomic<Semaphore*> g_sem{nullptr};
 std::thread             g_consumer;
 
+// True while the consumer is parked on the semaphore with nothing left to do,
+// i.e. its last drain() pass has fully returned (every fprintf completed). Used
+// by ulog_async_flush() so it waits for emission to finish, not just for the
+// ring counters to line up.
+std::atomic<bool>       g_consumerIdle{false};
+
 // Set only on the consumer thread, so its own log_*() calls (and anything the
 // output path logs re-entrantly) take ulog's synchronous path instead of
 // enqueueing back onto the ring.
@@ -127,6 +133,7 @@ void ringInit()
     }
     g_enqueuePos.store(0, std::memory_order_relaxed);
     g_dequeuePos.store(0, std::memory_order_relaxed);
+    g_consumerIdle.store(false, std::memory_order_relaxed);
     g_ringReady.store(true, std::memory_order_release);
 }
 
@@ -740,11 +747,16 @@ void consumerMain()
     Semaphore* sem = g_sem.load(std::memory_order_acquire);
     while (g_running.load(std::memory_order_acquire))
     {
+        drain();
+
+        // Mark idle only once drain() has fully returned, so a flusher that
+        // observes (ring empty && idle) knows every record's fprintf is done.
+        g_consumerIdle.store(true, std::memory_order_release);
         if (sem != nullptr)
         {
             sem->waitFor(100); // ms; also a periodic safety drain
         }
-        drain();
+        g_consumerIdle.store(false, std::memory_order_release);
     }
     drain(); // final sweep
 }
@@ -826,8 +838,13 @@ extern "C" void ulog_async_flush(void)
         {
             sem->signal();
         }
-        if (g_enqueuePos.load(std::memory_order_acquire) ==
-            g_dequeuePos.load(std::memory_order_acquire))
+        // Done only when the ring is empty *and* the consumer has parked after
+        // a completed drain pass -- otherwise a record can be popped (counters
+        // level) while its fprintf is still in flight, and a caller that reads
+        // the log right after flush() would miss the tail of it.
+        bool ringEmpty = g_enqueuePos.load(std::memory_order_acquire) ==
+                         g_dequeuePos.load(std::memory_order_acquire);
+        if (ringEmpty && g_consumerIdle.load(std::memory_order_acquire))
         {
             return;
         }
