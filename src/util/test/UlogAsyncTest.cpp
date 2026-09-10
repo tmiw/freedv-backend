@@ -1,4 +1,10 @@
-// Tests for the real-time-safe async ulog front end (ulog_async.{h,cpp}).
+// Tests for the async ulog front end (ulog_async.{h,cpp}).
+//
+// The consumer thread starts automatically (static constructor), so these
+// tests never call ulog_async_start()/ulog_async_stop() except where they
+// deliberately exercise the stop/restart path. Every log_*() call -- from the
+// main thread or a worker -- is routed through the ring, so the tests flush
+// before inspecting the captured output.
 //
 // stderr (ulog's default sink) is redirected to a temp file around each
 // exercise so the rendered output can be inspected.
@@ -99,20 +105,16 @@ size_t countOccurrences(const std::string& hay, const std::string& needle)
 
 bool testDeferredFormatting()
 {
-    std::cout << "Test 1 (deferred formatting from a realtime thread): ";
+    std::cout << "Test 1 (deferred formatting from a worker thread): ";
 
     std::string out = captureStderr([]() {
-        ulog_async_start();
         std::thread rt([]() {
-            ulog_set_thread_realtime(true);
             log_info("int=%d str=%s flt=%.2f", 42, "hello", 3.14159);
             log_warn("widths l=%ld ll=%lld u=%u z=%zu", 7L, 8LL, 9u,
                      static_cast<size_t>(10));
-            ulog_set_thread_realtime(false);
         });
         rt.join();
         ulog_async_flush();
-        ulog_async_stop();
     });
 
     bool result = contains(out, "int=42 str=hello flt=3.14");
@@ -125,19 +127,17 @@ bool testDeferredFormatting()
     return result;
 }
 
-bool testNonRealtimeUnaffected()
+bool testMainThreadRoutedThroughAsync()
 {
-    std::cout << "Test 2 (non-realtime threads stay synchronous): ";
+    std::cout << "Test 2 (main-thread logs go through the async path too): ";
 
     std::string out = captureStderr([]() {
-        ulog_async_start();
-        // No ulog_set_thread_realtime(true): must be written inline, before
-        // any flush.
-        log_info("synchronous %d", 123);
-        ulog_async_stop();
+        log_info("from the main thread %d", 123);
+        // Not written inline any more: it only reaches stderr once drained.
+        ulog_async_flush();
     });
 
-    bool result = contains(out, "synchronous 123");
+    bool result = contains(out, "from the main thread 123");
     std::cout << (result ? "PASS" : "FAIL") << "\n";
     if (!result) std::cout << "---\n" << out << "---\n";
     return result;
@@ -150,17 +150,13 @@ bool testNullAndLongString()
     std::string big(4096, 'A');
 
     std::string out = captureStderr([&]() {
-        ulog_async_start();
         std::thread rt([&]() {
-            ulog_set_thread_realtime(true);
             const char* np = nullptr;
             log_info("null=[%s]", np);
             log_info("big=[%s]", big.c_str());
-            ulog_set_thread_realtime(false);
         });
         rt.join();
         ulog_async_flush();
-        ulog_async_stop();
     });
 
     bool result = contains(out, "null=[(null)]");
@@ -172,28 +168,37 @@ bool testNullAndLongString()
     return result;
 }
 
-bool testDropsWhenNotStarted()
+bool testSynchronousFallbackWhenStopped()
 {
-    std::cout << "Test 4 (records are dropped, counted, not written when consumer is down): ";
+    std::cout << "Test 4 (stop -> synchronous fallback, start -> async resumes): ";
 
-    unsigned long before = ulog_async_dropped_count();
-
-    std::string out = captureStderr([]() {
-        std::thread rt([]() {
-            ulog_set_thread_realtime(true);
-            for (int i = 0; i < 20; ++i)
-            {
-                log_info("must be dropped %d", i);
-            }
-            ulog_set_thread_realtime(false);
-        });
-        rt.join();
+    // While the consumer is stopped, ulog_async_is_active() is false and
+    // ulog_log() formats inline: the line is present with no flush at all.
+    std::string stopped = captureStderr([]() {
+        ulog_async_stop();
+        std::thread w([]() { log_info("sync fallback %d", 7); });
+        w.join();
+        // deliberately no ulog_async_flush()
     });
 
-    unsigned long dropped = ulog_async_dropped_count() - before;
-    bool result = (dropped == 20);
-    result &= !contains(out, "must be dropped");
-    std::cout << (result ? "PASS" : "FAIL") << " (dropped=" << dropped << ")\n";
+    bool result = contains(stopped, "sync fallback 7");
+
+    // Bring the consumer back and confirm async delivery works again.
+    std::string resumed = captureStderr([]() {
+        ulog_async_start();
+        std::thread w([]() { log_info("async resumed %d", 9); });
+        w.join();
+        ulog_async_flush();
+    });
+
+    result &= contains(resumed, "async resumed 9");
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    if (!result)
+    {
+        std::cout << "--- stopped ---\n" << stopped
+                  << "--- resumed ---\n" << resumed << "---\n";
+    }
     return result;
 }
 
@@ -223,7 +228,7 @@ bool survivorsInOrder(const std::string& out, int threads, int perThread,
 
 bool testMultiProducerInvariants()
 {
-    std::cout << "Test 5 (many realtime producers: accounting + ordering hold): ";
+    std::cout << "Test 5 (many producers, ring overflows: accounting + ordering hold): ";
 
     constexpr int kThreads = 6;
     constexpr int kPerThread = 400;
@@ -232,24 +237,19 @@ bool testMultiProducerInvariants()
     unsigned long before = ulog_async_dropped_count();
 
     std::string out = captureStderr([&]() {
-        ulog_async_start();
-
         std::vector<std::thread> producers;
         for (int t = 0; t < kThreads; ++t)
         {
             producers.emplace_back([t]() {
-                ulog_set_thread_realtime(true);
                 for (int i = 0; i < kPerThread; ++i)
                 {
                     log_info("prod %d seq %d", t, i);
                 }
-                ulog_set_thread_realtime(false);
             });
         }
         for (auto& p : producers) p.join();
 
         ulog_async_flush();
-        ulog_async_stop();
     });
 
     unsigned long dropped = ulog_async_dropped_count() - before;
@@ -259,7 +259,7 @@ bool testMultiProducerInvariants()
     size_t survivors = 0;
     bool ordered = survivorsInOrder(out, kThreads, kPerThread, survivors);
 
-    // Core invariants for a lossy-but-honest realtime logger:
+    // Core invariants for a lossy-but-honest logger:
     //  * every record is either emitted or counted as dropped, none vanish;
     //  * whatever survives keeps per-thread order;
     //  * the visible producer lines match the survivors we can account for;
@@ -283,9 +283,9 @@ int main()
     bool result = true;
 
     result &= testDeferredFormatting();
-    result &= testNonRealtimeUnaffected();
+    result &= testMainThreadRoutedThroughAsync();
     result &= testNullAndLongString();
-    result &= testDropsWhenNotStarted();
+    result &= testSynchronousFallbackWhenStopped();
     result &= testMultiProducerInvariants();
 
     return result ? 0 : -1;

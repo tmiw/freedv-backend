@@ -4,14 +4,20 @@
 //
 // Design
 // ------
-// * A thread marks itself real-time via ulog_set_thread_realtime(true).
-// * ulog_log() (in ulog.c) checks ulog_async_is_realtime_thread(); if set it
-//   calls ulog_async_enqueue() instead of formatting/writing inline.
+// * The consumer thread starts automatically before main() (a static
+//   constructor calls ulog_async_start()) and stops at process exit. Nothing
+//   in the application has to be called to enable async logging.
+// * ulog_log() (in ulog.c) checks ulog_async_is_active(); while the consumer is
+//   running it calls ulog_async_enqueue() from *every* thread instead of
+//   formatting/writing inline. The consumer thread's own log calls, and the
+//   brief windows before start-up / after shutdown, take ulog's synchronous
+//   path.
 // * ulog_async_enqueue() captures the call into a fixed-size record: level,
 //   file pointer, line, a timestamp, and the *unformatted* arguments
 //   serialized into an inline byte buffer (integers/floats by value, strings
 //   copied inline). It never allocates, never locks, never touches stdio.
 // * Records go into a bounded lock-free MPSC ring (Vyukov bounded queue).
+//   Ring full => the record is dropped and an atomic counter is bumped.
 // * A dedicated consumer thread waits on a semaphore, pops records, renders
 //   them with snprintf(), and hands the finished string to
 //   ulog_log_prerendered() which runs ulog's normal output path (stdout
@@ -108,7 +114,10 @@ std::atomic<bool>       g_running{false};
 std::atomic<Semaphore*> g_sem{nullptr};
 std::thread             g_consumer;
 
-thread_local bool tl_isRealtime = false;
+// Set only on the consumer thread, so its own log_*() calls (and anything the
+// output path logs re-entrantly) take ulog's synchronous path instead of
+// enqueueing back onto the ring.
+thread_local bool tl_isConsumer = false;
 
 void ringInit()
 {
@@ -726,6 +735,8 @@ void drain()
 
 void consumerMain()
 {
+    tl_isConsumer = true;
+
     Semaphore* sem = g_sem.load(std::memory_order_acquire);
     while (g_running.load(std::memory_order_acquire))
     {
@@ -744,14 +755,12 @@ void consumerMain()
 // Public C API
 // ===========================================================================
 
-extern "C" void ulog_set_thread_realtime(bool is_realtime)
+extern "C" bool ulog_async_is_active(void)
 {
-    tl_isRealtime = is_realtime;
-}
-
-extern "C" bool ulog_async_is_realtime_thread(void)
-{
-    return tl_isRealtime;
+    // g_ringReady goes true at the tail of ringInit() and false only after the
+    // consumer has been joined, so it brackets exactly the interval in which
+    // enqueueing is safe and will be drained.
+    return g_ringReady.load(std::memory_order_acquire) && !tl_isConsumer;
 }
 
 extern "C" void ulog_async_start(void)
@@ -762,12 +771,16 @@ extern "C" void ulog_async_start(void)
         return; // already running
     }
 
-    ringInit();
     g_droppedReported = g_dropped.load(std::memory_order_relaxed);
 
+    // Publish the semaphore before the ring is marked ready so a producer that
+    // observes g_ringReady already has something to signal.
     Semaphore* sem = new Semaphore();
     g_sem.store(sem, std::memory_order_release);
 
+    ringInit(); // sets g_ringReady last
+
+    // Start the consumer last; it drains whatever is already queued on entry.
     g_consumer = std::thread(consumerMain);
 }
 
@@ -788,6 +801,11 @@ extern "C" void ulog_async_stop(void)
     {
         g_consumer.join();
     }
+
+    // The consumer did a final sweep before exiting, but ulog_async_is_active()
+    // still routed callers here until now; catch anything that landed in the
+    // ring after that sweep before we close the door.
+    drain();
 
     g_sem.store(nullptr, std::memory_order_release);
     delete sem;
@@ -855,3 +873,23 @@ extern "C" void ulog_async_enqueue(int level, const char* file, int line,
         sem->signal();
     }
 }
+
+// ===========================================================================
+// Automatic lifecycle
+// ===========================================================================
+
+namespace {
+
+// Brings the consumer thread up before main() and takes it down (draining the
+// ring) at process exit, so applications never call ulog_async_start() /
+// ulog_async_stop() themselves. Defined last in the translation unit so every
+// ring global above is already constructed when the constructor runs.
+struct AsyncLifecycle
+{
+    AsyncLifecycle()  { ulog_async_start(); }
+    ~AsyncLifecycle() { ulog_async_stop(); }
+};
+
+AsyncLifecycle g_asyncLifecycle;
+
+} // namespace

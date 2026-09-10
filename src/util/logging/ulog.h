@@ -203,9 +203,9 @@ void ulog_log(int level, const char *file, int line, const char *topic, const ch
 /// @brief Emits an already-formatted log line through the normal ulog output
 ///        path (stdout callback, extra outputs, custom prefix, ...).
 ///
-/// Used by the async logging consumer thread to flush records captured on
-/// real-time threads. Not real-time safe itself (takes the ulog lock); never
-/// call it from a real-time thread. See ulog_async.h.
+/// Used by the async logging consumer thread to flush records captured from
+/// other threads. Not real-time safe itself (takes the ulog lock); never call
+/// it from a real-time thread. See ulog_async.h.
 ///
 /// @param level        - Debug level
 /// @param file         - Source file (as captured at log time)

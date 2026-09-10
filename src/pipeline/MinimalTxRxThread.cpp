@@ -46,7 +46,6 @@ using namespace std::chrono_literals;
 #include "../../pipeline/BandwidthExpandStep.h"
 
 #include "../../util/logging/ulog.h"
-#include "../../util/logging/ulog_async.h"
 #include "../../os/os_interface.h"
 
 #include "../../pipeline/pipeline_defines.h"
@@ -130,9 +129,6 @@ void* MinimalTxRxThread::Entry()
     // Request real-time scheduling from the operating system.
     helper->setHelperRealTime();
 
-    // Route this thread's log_*() calls through the real-time-safe async path.
-    ulog_set_thread_realtime(true);
-
 #if defined(ENABLE_PROCESSING_STATS)
     resetStats_();
 #endif // defined(ENABLE_PROCESSING_STATS)
@@ -178,7 +174,6 @@ void* MinimalTxRxThread::Entry()
     pipeline_ = nullptr;
     
     // Return to normal scheduling
-    ulog_set_thread_realtime(false);
     helper->clearHelperRealTime();
 
     return NULL;

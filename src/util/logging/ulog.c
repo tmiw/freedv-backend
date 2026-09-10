@@ -570,9 +570,13 @@ void ulog_log(int level, const char *file, int line, const char *topic, const ch
     }
 
 #ifdef ULOG_ASYNC
-    // On a real-time thread, capture the call without formatting, locking or
-    // touching stdio. The async consumer thread renders and emits it later.
-    if (ulog_async_is_realtime_thread()) {
+    // Capture the call without formatting, locking or touching stdio; the async
+    // consumer thread renders and emits it later. This applies to every thread
+    // once the consumer is running -- it starts automatically before main() and
+    // stops at process exit, so nothing needs to be called to enable it. The
+    // consumer thread itself, plus the brief windows before start-up and after
+    // shutdown, fall through to the synchronous path below.
+    if (ulog_async_is_active()) {
         va_list async_args;
         va_start(async_args, message);
         ulog_async_enqueue(level, file, line, message, async_args);

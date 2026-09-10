@@ -1,10 +1,18 @@
 //=========================================================================
 // Name:            ulog_async.h
 // Purpose:         Real-time-safe front end for ulog. Lets log_*() calls be
-//                  issued from audio/real-time threads without allocating
-//                  memory, taking locks, or touching stdio on the calling
-//                  thread. Messages are captured into a lock-free ring and
-//                  rendered/emitted later on a dedicated consumer thread.
+//                  issued from any thread -- audio/real-time threads included --
+//                  without allocating memory, taking locks, or touching stdio
+//                  on the calling thread. Messages are captured into a
+//                  lock-free ring and rendered/emitted later on a dedicated
+//                  consumer thread.
+//
+//                  Nothing needs to be called to turn this on. When ULOG_ASYNC
+//                  is defined the consumer thread starts automatically before
+//                  main() and stops at process exit, and every log_*() call
+//                  from every thread is routed through it. The functions below
+//                  are for diagnostics, tests, and deliberate early shutdown
+//                  only.
 //
 // Authors:         Mooneer Salem
 // License:
@@ -35,48 +43,42 @@
 extern "C" {
 #endif
 
-/// @brief Marks (or unmarks) the calling thread as a real-time thread.
+/// @brief True when ulog_log() should hand the calling thread's log calls to
+///        the async ring rather than format them inline.
 ///
-/// While a thread is marked real-time, any log_*()/ulog_log() call made from
-/// it is captured into a lock-free ring buffer instead of being formatted and
-/// written inline. The message is rendered and emitted later by the async
-/// consumer thread. The flag is thread-local; every other thread keeps ulog's
-/// normal synchronous behavior.
-///
-/// Safe to call from a real-time thread (no allocation, no locks). Typically
-/// called once with true right after a thread requests real-time scheduling,
-/// and once with false just before it returns to normal scheduling.
-///
-/// @param is_realtime - true to route this thread's logs through the async
-///                      path, false to restore synchronous logging.
-void ulog_set_thread_realtime(bool is_realtime);
-
-/// @brief Returns true if the calling thread is currently marked real-time.
-bool ulog_async_is_realtime_thread(void);
+/// True once the consumer thread is running (which it is, automatically, for
+/// essentially all of the process lifetime) and the caller is not the consumer
+/// thread itself. Used internally by ulog_log(); real-time safe (one atomic
+/// load plus a thread-local read). Applications do not normally need this.
+bool ulog_async_is_active(void);
 
 /// @brief Starts the async logging consumer thread.
 ///
-/// Must be called once during application start-up, from a normal
-/// (non-real-time) thread, before any real-time thread begins logging.
-/// Idempotent; a second call while already running is a no-op.
+/// Called automatically from a static constructor before main(); applications
+/// never need to call it. Idempotent. Exposed only for tests and for code that
+/// deliberately stops and later restarts async logging.
 void ulog_async_start(void);
 
 /// @brief Stops the async logging consumer thread after draining the ring.
 ///
-/// Must be called from a normal thread during shutdown, after all real-time
-/// threads have stopped. Idempotent.
+/// Called automatically at process exit; applications never need to call it.
+/// Idempotent. Call it explicitly only for an early, deterministic shutdown --
+/// for example just before tearing down a custom ulog lock. After it returns,
+/// log_*() falls back to synchronous logging until ulog_async_start() runs
+/// again.
 void ulog_async_stop(void);
 
 /// @brief Blocks (briefly, non-real-time) until the ring has been drained.
 ///
-/// Intended for shutdown and for tests. No-op if the consumer is not running.
+/// Optional. Useful before reading log output in tests, or immediately before a
+/// hard shutdown. No-op if the consumer is not running.
 void ulog_async_flush(void);
 
-/// @brief Number of real-time log records dropped because the ring was full
-///        (or because the consumer was not running). Monotonic.
+/// @brief Number of log records dropped because the ring was full (or because
+///        the consumer was not running). Monotonic.
 unsigned long ulog_async_dropped_count(void);
 
-/// @brief Captures one log record from a real-time thread.
+/// @brief Captures one log record for later rendering on the consumer thread.
 ///
 /// Real-time safe: no allocation, no locks, no stdio. The format string
 /// pointer is stored as-is (it must have static lifetime, which is true for
