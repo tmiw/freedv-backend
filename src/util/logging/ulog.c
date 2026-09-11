@@ -28,6 +28,26 @@
 #include "libfmemopen.h"
 #endif // defined(_WIN32)
 
+#ifdef ULOG_ASYNC
+#include "ulog_async.h"
+#endif
+
+// ulog_set_level() may be called from any thread (e.g. a settings UI) while the
+// async consumer thread -- and, with ULOG_ASYNC, every logging thread -- reads
+// the level unlocked on the hot path (the `level < ulog.level` early-out). Make
+// just this one field atomic so those accesses are race-free. Relaxed ordering
+// is enough: the level is an independent knob, not a gate on other state.
+#if defined(ULOG_ASYNC) && !defined(__STDC_NO_ATOMICS__)
+#include <stdatomic.h>
+typedef _Atomic int ulog_level_t;
+#define ULOG_LEVEL_LOAD()   atomic_load_explicit(&ulog.level, memory_order_relaxed)
+#define ULOG_LEVEL_STORE(v) atomic_store_explicit(&ulog.level, (v), memory_order_relaxed)
+#else
+typedef int ulog_level_t;
+#define ULOG_LEVEL_LOAD()   (ulog.level)
+#define ULOG_LEVEL_STORE(v) (ulog.level = (v))
+#endif
+
 #define ULOG_NEW_LINE_ON true
 #define ULOG_NEW_LINE_OFF false
 #define ULOG_COLOR_ON true
@@ -52,7 +72,7 @@ typedef struct {
 typedef struct {
     ulog_LockFn lock_function;  // Mutex function
     void *lock_arg;             // Mutex argument
-    int level;                  // Debug level
+    ulog_level_t level;         // Debug level (atomic under ULOG_ASYNC)
     bool quiet;                 // Quiet mode
     Callback callback_stdout;   // to stdout
 
@@ -494,7 +514,10 @@ static void write_formatted_message(ulog_Event *ev, FILE *file, bool full_time, 
     } else {
         print_time_sec(ev, file);
     }
-    free(ev->time);
+#ifdef ULOG_ASYNC
+    if (!ev->time_is_borrowed)
+#endif
+        free(ev->time);
 #else
     (void) full_time;
 #endif  // FEATURE_TIME
@@ -557,10 +580,27 @@ static void log_to_stdout(ulog_Event *ev) {
 
 /// @brief Logs the message
 void ulog_log(int level, const char *file, int line, const char *topic, const char *message, ...) {
-    
-    if (level < ulog.level) {
+
+    if (level < ULOG_LEVEL_LOAD()) {
         return;
     }
+
+#ifdef ULOG_ASYNC
+    // Capture the call without formatting, locking or touching stdio; the async
+    // consumer thread renders and emits it later. This applies to every thread
+    // once the consumer is running -- it starts automatically before main() and
+    // stops at process exit, so nothing needs to be called to enable it. The
+    // consumer thread itself, plus the brief windows before start-up and after
+    // shutdown, fall through to the synchronous path below.
+    if (ulog_async_is_active()) {
+        va_list async_args;
+        va_start(async_args, message);
+        ulog_async_enqueue(level, file, line, message, async_args);
+        va_end(async_args);
+        return;
+    }
+#endif
+
 #if !FEATURE_TOPICS
     (void) topic;
 #else
@@ -609,6 +649,70 @@ void ulog_log(int level, const char *file, int line, const char *topic, const ch
 
     va_end(ev.message_format_args);
 }
+
+#ifdef ULOG_ASYNC
+// Variadic shim so message_format_args is a genuine, va_start-initialised list.
+// The already-rendered text is passed through as the single "%s" argument, so
+// the normal output path (custom prefix, quiet, extra outputs, ...) is reused
+// verbatim and any '%' in the text is printed literally.
+static void emit_prerendered_(int level, const char *file, int line,
+                              struct tm *tm_buf, ...) {
+    ulog_Event ev = {
+            .message = "%s",
+            .file    = file,
+            .line    = line,
+            .level   = level,
+#if FEATURE_TOPICS
+            .topic = -1,
+#endif
+    };
+#if FEATURE_TIME
+    ev.time             = tm_buf;
+    ev.time_is_borrowed = true;
+#else
+    (void) tm_buf;
+#endif
+
+    va_start(ev.message_format_args, tm_buf);
+
+    lock();
+
+    log_to_stdout(&ev);
+
+#if FEATURE_EXTRA_OUTPUTS
+    log_to_extra_outputs(&ev);
+#endif
+
+    unlock();
+
+    va_end(ev.message_format_args);
+}
+
+void ulog_log_prerendered(int level, const char *file, int line,
+                          long tv_sec, long tv_nsec, const char *rendered_msg) {
+    (void) tv_nsec;
+
+    if (level < ULOG_LEVEL_LOAD()) {
+        return;
+    }
+
+#if FEATURE_TIME
+    // Only the single async consumer thread calls this, so a function-local
+    // static is safe and avoids the per-event malloc() in process_callback().
+    static struct tm tm_buf;
+    time_t t = (time_t) tv_sec;
+#if defined(WIN32)
+    localtime_s(&tm_buf, &t);
+#else
+    localtime_r(&t, &tm_buf);
+#endif
+    emit_prerendered_(level, file, line, &tm_buf, rendered_msg);
+#else
+    (void) tv_sec;
+    emit_prerendered_(level, file, line, NULL, rendered_msg);
+#endif
+}
+#endif // ULOG_ASYNC
 
 static void print_level(ulog_Event *ev, FILE *file) {
     fprintf(file, " %-1s", level_strings[ev->level]);
@@ -662,7 +766,7 @@ const char *ulog_get_level_string(int level) {
 
 /// @brief Sets the debug level
 void ulog_set_level(int level) {
-    ulog.level = level;
+    ULOG_LEVEL_STORE(level);
 }
 
 

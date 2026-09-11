@@ -1,0 +1,306 @@
+diff --git a/src/src_sinc.c b/src/src_sinc.c
+index 716c4a4..8b4e301 100644
+--- a/src/src_sinc.c
++++ b/src/src_sinc.c
+@@ -64,6 +64,10 @@ typedef struct
+ 	double	src_ratio, input_index ;
+ 
+ 	coeff_t const	*coeffs ;
++	/* coeff_deltas [i] == coeffs [i + 1] - coeffs [i], precomputed once at filter
++	** creation time so the tap interpolation in calc_output_single() doesn't have
++	** to subtract on every tap of every output sample. */
++	coeff_t			*coeff_deltas ;
+ 
+ 	int		b_current, b_end, b_real_end, b_len ;
+ 
+@@ -247,11 +251,22 @@ sinc_filter_new (int converter_type, int channels)
+ 
+ 
+ 		priv->buffer = (float *) calloc (priv->b_len + channels, sizeof (float)) ;
+-		if (!priv->buffer)
++
++		/* coeff_half_len + 2 is the number of entries in priv->coeffs; there is
++		** one delta between each adjacent pair. */
++		int coeff_delta_count = priv->coeff_half_len + 1 ;
++		priv->coeff_deltas = (coeff_t *) malloc (coeff_delta_count * sizeof (coeff_t)) ;
++
++		if (!priv->buffer || !priv->coeff_deltas)
+ 		{
++			free (priv->buffer) ;
++			free (priv->coeff_deltas) ;
+ 			free (priv) ;
+ 			priv = NULL ;
+ 		}
++		else
++			for (int i = 0 ; i < coeff_delta_count ; i++)
++				priv->coeff_deltas [i] = priv->coeffs [i + 1] - priv->coeffs [i] ;
+ 	}
+ 
+ 	return priv ;
+@@ -350,13 +365,18 @@ sinc_copy (SRC_STATE *state)
+ 	}
+ 	memcpy (to_filter, from_filter, sizeof (SINC_FILTER)) ;
+ 	to_filter->buffer = (float *) malloc (sizeof (float) * (from_filter->b_len + state->channels)) ;
+-	if (!to_filter->buffer)
++	int coeff_delta_count = from_filter->coeff_half_len + 1 ;
++	to_filter->coeff_deltas = (coeff_t *) malloc (coeff_delta_count * sizeof (coeff_t)) ;
++	if (!to_filter->buffer || !to_filter->coeff_deltas)
+ 	{
+-		free (to) ;
++		free (to_filter->buffer) ;
++		free (to_filter->coeff_deltas) ;
+ 		free (to_filter) ;
++		free (to) ;
+ 		return NULL ;
+ 	}
+ 	memcpy (to_filter->buffer, from_filter->buffer, sizeof (float) * (from_filter->b_len + state->channels)) ;
++	memcpy (to_filter->coeff_deltas, from_filter->coeff_deltas, coeff_delta_count * sizeof (coeff_t)) ;
+ 
+ 	to->private_data = to_filter ;
+ 
+@@ -367,14 +387,50 @@ sinc_copy (SRC_STATE *state)
+ **	Beware all ye who dare pass this point. There be dragons here.
+ */
+ 
++/* Portable prototype of calc_output_single(). Processes taps four at a time,
++** same batching structure as the NEON prototype this replaced, but written
++** in plain C with no intrinsics -- the goal is to let each compiler's own
++** SLP vectorizer (LLVM/GCC both have one) recognise the four independent,
++** isomorphic statements per group and emit vector code on whatever ISA it's
++** targeting, while staying correct (just scalar) anywhere it doesn't.
++**
++** The trick that makes this SLP-friendly: four SEPARATE accumulator
++** variables (acc0..acc3) rather than one running sum. A single accumulator
++** forces a serial reduction dependency (acc = acc + x) that blocks
++** vectorization; four independent ones let the compiler pack the four
++** multiply-adds into one vector FMA and only reduce to a scalar once, at the
++** end of each block. This is the standard idiom for coaxing SLP/loop
++** vectorizers into action without intrinsics.
++**
++** filter->coeffs[indx]/coeff_deltas[indx] are still a gather in spirit --
++** indx doesn't advance at a fixed stride -- but there's no way to hint that
++** to the compiler beyond writing the four lookups next to each other and
++** hoping SLP treats them as a vectorizable, if gather-shaped, group; whether
++** it actually does is an ISA/compiler-version question, not something this
++** source can guarantee. filter->buffer[data_index] is unit-stride for the
++** left half (real vectorizable load) and unit-stride *descending* for the
++** right half (vectorizable in principle, less consistently recognised in
++** practice). See the accompanying writeup for what the generated assembly
++** on this build actually shows.
++**
++** Accumulators are double, not float: an earlier float32 version of this
++** (matching the NEON prototype it replaced) passed every functional test but
++** failed libsamplerate's own snr_bw_test qualification suite -- specifically
++** the SRC_SINC_MEDIUM_QUALITY unity-ratio case, where the reference (double)
++** implementation itself only clears its 157.00dB requirement by 0.72dB
++** (157.72dB measured), and float32 lane accumulation cost ~0.77dB there,
++** enough to flip a pass into a fail. That test's margin is far tighter than
++** the converter's headline "121dB SNR" spec suggests -- checking against the
++** headline number instead of the actual qualification suite is what missed
++** this the first time. Double accumulators keep the same four-independent-
++** chains ILP structure (and, per measurement, effectively all of the speed)
++** while matching the original scalar path's precision. */
+ static inline double
+-calc_output_single (SINC_FILTER *filter, increment_t increment, increment_t start_filter_index)
++calc_output_single (SINC_FILTER *filter, increment_t max_filter_index, increment_t increment, increment_t start_filter_index)
+ {	double		fraction, left, right, icoeff ;
+-	increment_t	filter_index, max_filter_index ;
++	increment_t	filter_index ;
+ 	int			data_index, coeff_count, indx ;
+-
+-	/* Convert input parameters into fixed point. */
+-	max_filter_index = int_to_fp (filter->coeff_half_len) ;
++	double		acc0, acc1, acc2, acc3 ;
+ 
+ 	/* First apply the left half of the filter. */
+ 	filter_index = start_filter_index ;
+@@ -384,17 +440,54 @@ calc_output_single (SINC_FILTER *filter, increment_t increment, increment_t star
+ 
+ 	if (data_index < 0) /* Avoid underflow access to filter->buffer. */
+ 	{	int steps = -data_index ;
+-		/* If the assert triggers we would have to take care not to underflow/overflow */
+ 		assert (steps <= int_div_ceil (filter_index, increment)) ;
+ 		filter_index -= increment * steps ;
+ 		data_index += steps ;
+ 	}
+-	left = 0.0 ;
++
++	acc0 = acc1 = acc2 = acc3 = 0.0 ;
++	/* Batch of 4: same "filter_index >= 0" bound the scalar tail below checks
++	** per-tap, applied to all four taps in the group up front (increment is
++	** always > 0, so the k=3 tap is the binding constraint). */
++	while (filter_index - 3 * increment >= MAKE_INCREMENT_T (0))
++	{	increment_t fi0 = filter_index ;
++		increment_t fi1 = filter_index - increment ;
++		increment_t fi2 = filter_index - 2 * increment ;
++		increment_t fi3 = filter_index - 3 * increment ;
++		int i0 = fp_to_int (fi0), i1 = fp_to_int (fi1), i2 = fp_to_int (fi2), i3 = fp_to_int (fi3) ;
++		double base0, base1, base2, base3, delta0, delta1, delta2, delta3, frac0, frac1, frac2, frac3 ;
++		double samp0, samp1, samp2, samp3 ;
++
++		assert (i0 >= 0 && i0 + 1 < filter->coeff_half_len + 2) ;
++		assert (i3 >= 0 && i3 + 1 < filter->coeff_half_len + 2) ;
++		base0 = filter->coeffs [i0] ; delta0 = filter->coeff_deltas [i0] ; frac0 = fp_to_double (fi0) ;
++		base1 = filter->coeffs [i1] ; delta1 = filter->coeff_deltas [i1] ; frac1 = fp_to_double (fi1) ;
++		base2 = filter->coeffs [i2] ; delta2 = filter->coeff_deltas [i2] ; frac2 = fp_to_double (fi2) ;
++		base3 = filter->coeffs [i3] ; delta3 = filter->coeff_deltas [i3] ; frac3 = fp_to_double (fi3) ;
++
++		assert (data_index >= 0 && data_index + 3 < filter->b_len) ;
++		assert (data_index + 3 < filter->b_end) ;
++		samp0 = filter->buffer [data_index + 0] ; /* k ascending == data_index ascending: unit-stride */
++		samp1 = filter->buffer [data_index + 1] ;
++		samp2 = filter->buffer [data_index + 2] ;
++		samp3 = filter->buffer [data_index + 3] ;
++
++		acc0 += (base0 + frac0 * delta0) * samp0 ;
++		acc1 += (base1 + frac1 * delta1) * samp1 ;
++		acc2 += (base2 + frac2 * delta2) * samp2 ;
++		acc3 += (base3 + frac3 * delta3) * samp3 ;
++
++		filter_index -= 4 * increment ;
++		data_index += 4 ;
++		} ;
++	left = acc0 + acc1 + acc2 + acc3 ;
++
++	/* Scalar tail: 0-3 leftover taps, identical to the original loop body. */
+ 	while (filter_index >= MAKE_INCREMENT_T (0))
+ 	{	fraction = fp_to_double (filter_index) ;
+ 		indx = fp_to_int (filter_index) ;
+ 		assert (indx >= 0 && indx + 1 < filter->coeff_half_len + 2) ;
+-		icoeff = filter->coeffs [indx] + fraction * (filter->coeffs [indx + 1] - filter->coeffs [indx]) ;
++		icoeff = filter->coeffs [indx] + fraction * filter->coeff_deltas [indx] ;
+ 		assert (data_index >= 0 && data_index < filter->b_len) ;
+ 		assert (data_index < filter->b_end) ;
+ 		left += icoeff * filter->buffer [data_index] ;
+@@ -409,23 +502,71 @@ calc_output_single (SINC_FILTER *filter, increment_t increment, increment_t star
+ 	filter_index = filter_index + coeff_count * increment ;
+ 	data_index = filter->b_current + 1 + coeff_count ;
+ 
+-	right = 0.0 ;
+-	do
++	/* The original is a do-while: the first tap is unconditional. Peel it off
++	** so the batched loop below can use the same "> 0" pre-check the scalar
++	** tail uses, matching the do-while's post-check exactly (nothing else
++	** touches filter_index/data_index in between). */
++	fraction = fp_to_double (filter_index) ;
++	indx = fp_to_int (filter_index) ;
++	assert (indx < filter->coeff_half_len + 2) ;
++	icoeff = filter->coeffs [indx] + fraction * filter->coeff_deltas [indx] ;
++	assert (data_index >= 0 && data_index < filter->b_len) ;
++	assert (data_index < filter->b_end) ;
++	right = icoeff * filter->buffer [data_index] ;
++	filter_index -= increment ;
++	data_index -= 1 ;
++
++	acc0 = acc1 = acc2 = acc3 = 0.0 ;
++	while (filter_index - 3 * increment > MAKE_INCREMENT_T (0))
++	{	increment_t fi0 = filter_index ;
++		increment_t fi1 = filter_index - increment ;
++		increment_t fi2 = filter_index - 2 * increment ;
++		increment_t fi3 = filter_index - 3 * increment ;
++		int i0 = fp_to_int (fi0), i1 = fp_to_int (fi1), i2 = fp_to_int (fi2), i3 = fp_to_int (fi3) ;
++		double base0, base1, base2, base3, delta0, delta1, delta2, delta3, frac0, frac1, frac2, frac3 ;
++		double samp0, samp1, samp2, samp3 ;
++
++		assert (i0 < filter->coeff_half_len + 2) ;
++		assert (i3 < filter->coeff_half_len + 2) ;
++		base0 = filter->coeffs [i0] ; delta0 = filter->coeff_deltas [i0] ; frac0 = fp_to_double (fi0) ;
++		base1 = filter->coeffs [i1] ; delta1 = filter->coeff_deltas [i1] ; frac1 = fp_to_double (fi1) ;
++		base2 = filter->coeffs [i2] ; delta2 = filter->coeff_deltas [i2] ; frac2 = fp_to_double (fi2) ;
++		base3 = filter->coeffs [i3] ; delta3 = filter->coeff_deltas [i3] ; frac3 = fp_to_double (fi3) ;
++
++		assert (data_index - 3 >= 0 && data_index < filter->b_len) ;
++		assert (data_index < filter->b_end) ;
++		/* k ascending == data_index DEscending: still unit-stride, just backwards. */
++		samp0 = filter->buffer [data_index - 0] ;
++		samp1 = filter->buffer [data_index - 1] ;
++		samp2 = filter->buffer [data_index - 2] ;
++		samp3 = filter->buffer [data_index - 3] ;
++
++		acc0 += (base0 + frac0 * delta0) * samp0 ;
++		acc1 += (base1 + frac1 * delta1) * samp1 ;
++		acc2 += (base2 + frac2 * delta2) * samp2 ;
++		acc3 += (base3 + frac3 * delta3) * samp3 ;
++
++		filter_index -= 4 * increment ;
++		data_index -= 4 ;
++		} ;
++	right += acc0 + acc1 + acc2 + acc3 ;
++
++	/* Scalar tail, identical to the original loop body. */
++	while (filter_index > MAKE_INCREMENT_T (0))
+ 	{	fraction = fp_to_double (filter_index) ;
+ 		indx = fp_to_int (filter_index) ;
+ 		assert (indx < filter->coeff_half_len + 2) ;
+-		icoeff = filter->coeffs [indx] + fraction * (filter->coeffs [indx + 1] - filter->coeffs [indx]) ;
++		icoeff = filter->coeffs [indx] + fraction * filter->coeff_deltas [indx] ;
+ 		assert (data_index >= 0 && data_index < filter->b_len) ;
+ 		assert (data_index < filter->b_end) ;
+ 		right += icoeff * filter->buffer [data_index] ;
+ 
+ 		filter_index -= increment ;
+ 		data_index = data_index - 1 ;
+-		}
+-	while (filter_index > MAKE_INCREMENT_T (0)) ;
++		} ;
+ 
+ 	return (left + right) ;
+-} /* calc_output_single */
++} /* calc_output_single (portable, SLP-vectorizable) */
+ 
+ static SRC_ERROR
+ sinc_mono_vari_process (SRC_STATE *state, SRC_DATA *data)
+@@ -468,6 +609,19 @@ sinc_mono_vari_process (SRC_STATE *state, SRC_DATA *data)
+ 
+ 	terminate = 1.0 / src_ratio + 1e-20 ;
+ 
++	/* filter->index_inc and filter->coeff_half_len are constant for the life of
++	** the filter; hoist the values derived from them out of the per-sample loop
++	** instead of recomputing (and dividing/shifting) on every output sample. */
++	double inv_index_inc = 1.0 / filter->index_inc ;
++	increment_t max_filter_index = int_to_fp (filter->coeff_half_len) ;
++
++	/* float_increment/increment only depend on src_ratio, which changes only when
++	** ramping to data->src_ratio (see the fabs() check below) -- compute the
++	** initial value here and only refresh it inside the loop when it actually
++	** changes, rather than unconditionally on every output sample. */
++	float_increment = filter->index_inc * (src_ratio < 1.0 ? src_ratio : 1.0) ;
++	increment = double_to_fp (float_increment) ;
++
+ 	/* Main processing loop. */
+ 	while (filter->out_gen < filter->out_count)
+ 	{
+@@ -490,15 +644,16 @@ sinc_mono_vari_process (SRC_STATE *state, SRC_DATA *data)
+ 			} ;
+ 
+ 		if (filter->out_count > 0 && fabs (state->last_ratio - data->src_ratio) > 1e-10)
+-			src_ratio = state->last_ratio + filter->out_gen * (data->src_ratio - state->last_ratio) / filter->out_count ;
++		{	src_ratio = state->last_ratio + filter->out_gen * (data->src_ratio - state->last_ratio) / filter->out_count ;
+ 
+-		float_increment = filter->index_inc * (src_ratio < 1.0 ? src_ratio : 1.0) ;
+-		increment = double_to_fp (float_increment) ;
++			float_increment = filter->index_inc * (src_ratio < 1.0 ? src_ratio : 1.0) ;
++			increment = double_to_fp (float_increment) ;
++			} ;
+ 
+ 		start_filter_index = double_to_fp (input_index * float_increment) ;
+ 
+-		data->data_out [filter->out_gen] = (float) ((float_increment / filter->index_inc) *
+-										calc_output_single (filter, increment, start_filter_index)) ;
++		data->data_out [filter->out_gen] = (float) ((float_increment * inv_index_inc) *
++										calc_output_single (filter, max_filter_index, increment, start_filter_index)) ;
+ 		filter->out_gen ++ ;
+ 
+ 		/* Figure out the next index. */
+@@ -1243,6 +1398,11 @@ sinc_close (SRC_STATE *state)
+ 				free (sinc->buffer) ;
+ 				sinc->buffer = NULL ;
+ 			}
++			if (sinc->coeff_deltas)
++			{
++				free (sinc->coeff_deltas) ;
++				sinc->coeff_deltas = NULL ;
++			}
+ 			free (sinc) ;
+ 			sinc = NULL ;
+ 		}
