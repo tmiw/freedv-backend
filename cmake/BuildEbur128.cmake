@@ -32,12 +32,18 @@ ExternalProject_Get_Property(build_ebur128 SOURCE_DIR)
 add_library(ebur128 STATIC IMPORTED)
 add_dependencies(ebur128 build_ebur128)
 
-set(LIBEBUR128 "${BINARY_DIR}/libebur128${CMAKE_STATIC_LIBRARY_SUFFIX}")
-
 set_target_properties(ebur128 PROPERTIES
-    IMPORTED_LOCATION ${LIBEBUR128}
+    IMPORTED_LOCATION "${BINARY_DIR}/libebur128${CMAKE_STATIC_LIBRARY_SUFFIX}"
     IMPORTED_IMPLIB   "${BINARY_DIR}/libebur128${CMAKE_IMPORT_LIBRARY_SUFFIX}"
 )
+
+# src/pipeline/CMakeLists.txt links fdv_audio_pipeline against ${LIBEBUR128}.
+# It must resolve to the "ebur128" imported target above (not a raw path) so
+# that CMake's dependency graph actually orders fdv_audio_pipeline's build
+# (headers included) after build_ebur128 -- otherwise nothing ties the two
+# together and a parallel build can compile files that #include ebur128.h
+# before it's even been cloned.
+set(LIBEBUR128 ebur128)
 
 set(EBUR128_INCLUDE_DIRS ${CMAKE_CURRENT_BINARY_DIR}/ebur128_src/ebur128 ${CMAKE_CURRENT_BINARY_DIR}/ebur128_build)
 include_directories(${EBUR128_INCLUDE_DIRS})
