@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <algorithm>
 #include <atomic>
+#include <new>
 
 #ifdef __cpp_lib_hardware_interference_size
     using std::hardware_constructive_interference_size;

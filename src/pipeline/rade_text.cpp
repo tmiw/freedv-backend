@@ -35,6 +35,7 @@
 #include "rade_text.h"
 
 #include <assert.h>
+#include <cmath>
 #include <ctype.h>
 #include <math.h>
 #include <stdio.h>
