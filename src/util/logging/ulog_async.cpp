@@ -695,12 +695,23 @@ void nowTimespec(std::int64_t& sec, std::int32_t& nsec) FREEDV_NONBLOCKING
     struct timespec ts;
     ts.tv_sec = 0;
     ts.tv_nsec = 0;
-    // timespec_get()/clock_gettime() reads a monotonic/vDSO clock on all
-    // supported platforms: no syscall on the fast path, no allocation, no
-    // lock. Wrapped as verified-safe so RTSan keeps runtime checks without
+    // clock_gettime() reads a monotonic/vDSO clock on all supported
+    // platforms: no syscall on the fast path, no allocation, no lock.
+    // Deliberately not timespec_get(): on Windows, it's only declared once
+    // mingw-w64's headers see _UCRT defined, and satisfying it then pulls in
+    // libucrtbase.a's implementation alongside the classic msvcrt-targeted
+    // rest of the toolchain. That mixing is not safe -- ucrtbase's internal
+    // CRT-lock/stream-table plumbing (e.g. what backs __acrt_iob_func) isn't
+    // ABI-compatible with msvcrt's, and statically linking both into one
+    // binary let UCRT-side internals call into msvcrt's incompatible _lock()
+    // with a garbage index, corrupting the vtable-dispatch call in the very
+    // next indirect call and crashing. clock_gettime() avoids the whole
+    // problem: mingw-w64 provides it via winpthreads on the classic msvcrt
+    // target with no UCRT involved at all.
+    // Wrapped as verified-safe so RTSan keeps runtime checks without
     // flagging the interceptor.
     FREEDV_BEGIN_VERIFIED_SAFE
-    timespec_get(&ts, TIME_UTC);
+    clock_gettime(CLOCK_REALTIME, &ts);
     FREEDV_END_VERIFIED_SAFE
     sec = static_cast<std::int64_t>(ts.tv_sec);
     nsec = static_cast<std::int32_t>(ts.tv_nsec);
