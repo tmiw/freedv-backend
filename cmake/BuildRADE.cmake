@@ -1,5 +1,19 @@
 if(CMAKE_CROSSCOMPILING)
     set(RADE_CMAKE_ARGS ${RADE_CMAKE_ARGS} -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE})
+
+    # build_rade is a genuinely separate `cmake` invocation (ExternalProject),
+    # so it re-runs the toolchain file above and re-triggers CMake's own
+    # platform-default population of CMAKE_C_STANDARD_LIBRARIES/CMAKE_CXX_
+    # STANDARD_LIBRARIES (e.g. "-lkernel32 -luser32 ..."), clobbering
+    # anything the toolchain file itself tried to add there (see the
+    # comment in freedv-gui's cross-compile/freedv-mingw-gcc-x86_64.cmake).
+    # By the time this file runs, freedv-gui's own top-level CMakeLists.txt
+    # has already appended its extra libraries (e.g. -lssp/-lucrt for
+    # Ubuntu's gcc-mingw-w64) to these same variables in *this* (parent)
+    # configure, so forward the already-correct values through explicitly
+    # rather than relying on build_rade's own toolchain-file processing to
+    # reproduce them.
+    set(RADE_CMAKE_ARGS ${RADE_CMAKE_ARGS} -DCMAKE_C_STANDARD_LIBRARIES=${CMAKE_C_STANDARD_LIBRARIES} -DCMAKE_CXX_STANDARD_LIBRARIES=${CMAKE_CXX_STANDARD_LIBRARIES})
 endif()
 
 set(RADE_CMAKE_ARGS ${RADE_CMAKE_ARGS} -DBUILD_OSX_UNIVERSAL=${BUILD_OSX_UNIVERSAL} -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} -DOPUS_URL=https://github.com/xiph/opus/archive/940d4e5af64351ca8ba8390df3f555484c567fbb.zip)
