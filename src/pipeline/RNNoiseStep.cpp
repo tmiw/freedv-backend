@@ -32,6 +32,7 @@
 //
 //=========================================================================
 
+#include <algorithm>
 #include <atomic>
 
 #include "RNNoiseStep.h"
@@ -80,9 +81,22 @@ short* RNNoiseStep::execute(short* inputSamples, int numInputSamples, int* numOu
 
     while (numInputSamples > 0)
     {
-        inputSampleFifo_.write(inputSamples++, 1);
-        numInputSamples--;
-        if (inputSampleFifo_.numUsed() == RNNOISE_FRAME_SIZE)
+        int samplesToWrite = std::min(inputSampleFifo_.numFree(), numInputSamples);
+        if (samplesToWrite > 0)
+        {
+            inputSampleFifo_.write(inputSamples, samplesToWrite);
+            inputSamples += samplesToWrite;
+            numInputSamples -= samplesToWrite;
+        }
+
+        if (samplesToWrite == 0 && inputSampleFifo_.numUsed() < RNNOISE_FRAME_SIZE)
+        {
+            // Nothing left to write and not enough buffered for a frame --
+            // no further progress is possible this call.
+            break;
+        }
+
+        while (inputSampleFifo_.numUsed() >= RNNOISE_FRAME_SIZE)
         {
             *numOutputSamples += (!firstFrame_ ? 1 : 0) * RNNOISE_FRAME_SIZE;
             inputSampleFifo_.read(tmpOutput, RNNOISE_FRAME_SIZE);

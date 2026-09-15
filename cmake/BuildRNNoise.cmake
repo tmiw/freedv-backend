@@ -8,6 +8,25 @@ endif (CMAKE_CROSSCOMPILING)
 
 set(RNNOISE_REPO https://github.com/xiph/rnnoise.git)
 
+# Pinned to a specific commit (rather than the floating "main" branch) because
+# a local patch is applied below (see
+# cmake/patches/rnnoise-sparse-sgemv8x4-neon.patch). A patch generated against
+# one commit is not guaranteed to apply cleanly against whatever "main" happens
+# to point to later, so the two need to move together: bumping this SHA means
+# regenerating/re-verifying the patch against the new commit.
+set(RNNOISE_GIT_TAG 70f1d256acd4b34a572f999a05c87bf00b67730d)
+
+# vec_neon.h's sparse_sgemv8x4() (used for RNNoise's pruned GRU/dense weight
+# matrices -- the dominant cost in rnnoise_process_frame) is a plain scalar
+# loop upstream, explicitly marked "Temporarily use unoptimized version";
+# vec_avx.h's version of the same function is properly AVX2-vectorized. This
+# patch ports that same 8-row/4-column-unrolled approach to NEON (as two
+# float32x4_t accumulators, since NEON is 128-bit vs AVX's 256-bit), matching
+# the already-vectorized (and unaffected) sgemv8x1() a few lines above it in
+# the same file. Only affects the NEON branch of vec.h's arch dispatch, so it
+# has no effect on x86 builds.
+set(RNNOISE_PATCH_COMMAND ${CMAKE_COMMAND} -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/rnnoise-sparse-sgemv8x4-neon.patch -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply_if_needed.cmake)
+
 include(ExternalProject)
 
 if(APPLE)
@@ -24,8 +43,9 @@ ExternalProject_Add(build_rnnoise_x86
     BUILD_COMMAND $(MAKE)
     INSTALL_COMMAND ""
     GIT_REPOSITORY ${RNNOISE_REPO}
-    GIT_TAG main
+    GIT_TAG ${RNNOISE_GIT_TAG}
     UPDATE_DISCONNECTED 1
+    PATCH_COMMAND ${RNNOISE_PATCH_COMMAND}
 )
 ExternalProject_Add(build_rnnoise_arm
     DOWNLOAD_EXTRACT_TIMESTAMP NO
@@ -34,8 +54,9 @@ ExternalProject_Add(build_rnnoise_arm
     BUILD_COMMAND $(MAKE)
     INSTALL_COMMAND ""
     GIT_REPOSITORY ${RNNOISE_REPO}
-    GIT_TAG main
+    GIT_TAG ${RNNOISE_GIT_TAG}
     UPDATE_DISCONNECTED 1
+    PATCH_COMMAND ${RNNOISE_PATCH_COMMAND}
 )
 
 ExternalProject_Get_Property(build_rnnoise_arm BINARY_DIR)
@@ -81,8 +102,9 @@ ExternalProject_Add(build_rnnoise
     BUILD_COMMAND $(MAKE)
     INSTALL_COMMAND ""
     GIT_REPOSITORY ${RNNOISE_REPO}
-    GIT_TAG main
+    GIT_TAG ${RNNOISE_GIT_TAG}
     UPDATE_DISCONNECTED 1
+    PATCH_COMMAND ${RNNOISE_PATCH_COMMAND}
 )
 
 ExternalProject_Get_Property(build_rnnoise BINARY_DIR)
