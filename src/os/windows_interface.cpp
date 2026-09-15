@@ -93,5 +93,17 @@ void SetThreadName(std::string const& name)
     std::string fullName = "FDV ";
     fullName += name;
     std::wstring stemp = std::wstring(fullName.begin(), fullName.end());
-    SetThreadDescription(GetCurrentThread(), stemp.c_str());
+
+    // SetThreadDescription is Windows 10 1607+ only, and isn't even
+    // declared by every mingw-w64 header revision (e.g. the one Ubuntu
+    // 22.04's gcc-mingw-w64 package ships, versus llvm-mingw's much newer
+    // bundled headers) -- resolve it dynamically instead of calling it
+    // directly so this builds/runs regardless of toolchain or OS version.
+    using SetThreadDescriptionFn = HRESULT (WINAPI*)(HANDLE, PCWSTR);
+    static auto pSetThreadDescription = reinterpret_cast<SetThreadDescriptionFn>(
+        GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadDescription"));
+    if (pSetThreadDescription != nullptr)
+    {
+        pSetThreadDescription(GetCurrentThread(), stemp.c_str());
+    }
 }
