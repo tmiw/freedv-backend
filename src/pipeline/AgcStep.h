@@ -62,6 +62,8 @@ private:
     void* ebur128State_;
 
     int numSamplesPerRun_;
+    int blocksSinceLoudnessUpdate_;
+    bool lastMeasurementValid_;
     GenericFIFO<short> inputSampleFifo_;
     std::unique_ptr<short[]> outputSamples_;
     std::unique_ptr<short[]> tmpInput_;
