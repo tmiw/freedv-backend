@@ -32,6 +32,7 @@
 //
 //=========================================================================
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 
@@ -129,9 +130,22 @@ short* AgcStep::execute(short* inputSamples, int numInputSamples, int* numOutput
 
     while (numInputSamples > 0)
     {
-        inputSampleFifo_.write(inputSamples++, 1);
-        numInputSamples--;
-        if (inputSampleFifo_.numUsed() == numSamplesPerRun_)
+        int samplesToWrite = std::min(inputSampleFifo_.numFree(), numInputSamples);
+        if (samplesToWrite > 0)
+        {
+            inputSampleFifo_.write(inputSamples, samplesToWrite);
+            inputSamples += samplesToWrite;
+            numInputSamples -= samplesToWrite;
+        }
+
+        if (samplesToWrite == 0 && inputSampleFifo_.numUsed() < numSamplesPerRun_)
+        {
+            // Nothing left to write and not enough buffered for a block --
+            // no further progress is possible this call.
+            break;
+        }
+
+        while (inputSampleFifo_.numUsed() >= numSamplesPerRun_)
         {
             *numOutputSamples += numSamplesPerRun_;
             inputSampleFifo_.read(tmpInput, numSamplesPerRun_);
