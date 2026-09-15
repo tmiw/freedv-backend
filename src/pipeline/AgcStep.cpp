@@ -97,6 +97,8 @@ AgcStep::AgcStep(int sampleRate, bool enableLimiter, bool enableLeveler)
 
     tmpInput_ = std::make_unique<short[]>(numSamplesPerRun_);
     assert(tmpInput_ != nullptr);
+    tmpInputFloat_ = std::make_unique<float[]>(numSamplesPerRun_);
+    assert(tmpInputFloat_ != nullptr);
 }
 
 AgcStep::~AgcStep()
@@ -133,6 +135,8 @@ short* AgcStep::execute(short* inputSamples, int numInputSamples, int* numOutput
         {
             *numOutputSamples += numSamplesPerRun_;
             inputSampleFifo_.read(tmpInput, numSamplesPerRun_);
+
+            ConvertToFloatSampleType_<float, short>(tmpInput, tmpInputFloat_.get(), numSamplesPerRun_);
 
             if (enableLeveler_)
             {
@@ -174,31 +178,22 @@ short* AgcStep::execute(short* inputSamples, int numInputSamples, int* numOutput
     
                 // Scale samples based on current gain.
                 float scaleFactor = expf(currentGainDb_/20.0f * logf(10.0f));
-                float temp = 0;
                 for (auto ctr = 0; ctr < numSamplesPerRun_; ctr++)
                 {
-                    ConvertSingleSampleToFloatSampleType_<float, short>(&tmpInput[ctr], &temp);
-                    temp *= scaleFactor;
-                    ConvertSingleSampleToIntSampleType_<short, float>(&temp, &tmpInput[ctr]);
+                    tmpInputFloat_[ctr] *= scaleFactor;
                 }
             }
 
             // Run WebRTC to make sure we don't clip.
             if (enableLimiter_)
             {
-                int outMicLevel = 0;
-                int inMicLevel = 0;
-                short echo = 0;
-                unsigned char saturationWarning = 1;
-                WebRtcAgc_Process(
-                    agcState_, const_cast<const int16_t *const *>(&tmpInput), 1, numSamplesPerRun_, 
-                    const_cast<int16_t *const *>(&tmpOutput), inMicLevel, &outMicLevel, echo, &saturationWarning);
-            }
-            else
-            {
-                memcpy(tmpOutput, tmpInput, numSamplesPerRun_ * sizeof(short));
+                for (auto ctr = 0; ctr < numSamplesPerRun_; ctr++)
+                {
+                    tmpInputFloat_[ctr] -= (1.0f/3.0f) * std::pow(tmpInputFloat_[ctr], 3);
+                }
             }
 
+            ConvertToIntSampleType_<short, float>(tmpInputFloat_.get(), tmpOutput, numSamplesPerRun_);
             tmpOutput += numSamplesPerRun_;
         }
     }
