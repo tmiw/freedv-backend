@@ -11,7 +11,20 @@ if(CMAKE_CROSSCOMPILING)
     set(EBUR128_CMAKE_ARGS ${EBUR128_CMAKE_ARGS} -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE})
 endif()
 
-# Build ebur128 library 
+# libebur128 is itself a CMake project, built here as a nested
+# ExternalProject configure/build rather than via add_subdirectory(). That
+# nested cmake invocation gets its own fresh CMakeCache.txt and doesn't
+# inherit the parent project's CMAKE_C_COMPILER_LAUNCHER/
+# CMAKE_CXX_COMPILER_LAUNCHER (e.g. ccache) automatically, so forward it
+# explicitly.
+if(CMAKE_C_COMPILER_LAUNCHER)
+    set(EBUR128_CMAKE_ARGS ${EBUR128_CMAKE_ARGS} -DCMAKE_C_COMPILER_LAUNCHER=${CMAKE_C_COMPILER_LAUNCHER})
+endif()
+if(CMAKE_CXX_COMPILER_LAUNCHER)
+    set(EBUR128_CMAKE_ARGS ${EBUR128_CMAKE_ARGS} -DCMAKE_CXX_COMPILER_LAUNCHER=${CMAKE_CXX_COMPILER_LAUNCHER})
+endif()
+
+# Build ebur128 library
 include(ExternalProject)
 ExternalProject_Add(build_ebur128
    SOURCE_DIR ebur128_src

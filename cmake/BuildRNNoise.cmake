@@ -1,6 +1,24 @@
 message(STATUS "Will build RNNoise")
 
-set(CONFIGURE_COMMAND ./autogen.sh && ./configure --with-pic --disable-examples --disable-doc --disable-shared)
+# RNNoise builds via its own autotools ./configure && make invocation
+# below, which is a separate build system CMake just shells out to -- it
+# never sees CMAKE_C_COMPILER_LAUNCHER/CMAKE_CXX_COMPILER_LAUNCHER (e.g.
+# ccache), since those only apply to CMake's own compile rules. Bake the
+# launcher into CC/CXX instead so RNNoise's build gets cached the same way
+# as the rest of the project.
+if(CMAKE_C_COMPILER_LAUNCHER)
+    set(RNNOISE_CC "${CMAKE_C_COMPILER_LAUNCHER} ${CMAKE_C_COMPILER}")
+else()
+    set(RNNOISE_CC "${CMAKE_C_COMPILER}")
+endif()
+
+if(CMAKE_CXX_COMPILER_LAUNCHER)
+    set(RNNOISE_CXX "${CMAKE_CXX_COMPILER_LAUNCHER} ${CMAKE_CXX_COMPILER}")
+else()
+    set(RNNOISE_CXX "${CMAKE_CXX_COMPILER}")
+endif()
+
+set(CONFIGURE_COMMAND ./autogen.sh && ./configure --with-pic --disable-examples --disable-doc --disable-shared CC=${RNNOISE_CC} CXX=${RNNOISE_CXX})
 
 if (CMAKE_CROSSCOMPILING)
 set(CONFIGURE_COMMAND ${CONFIGURE_COMMAND} --host=${CMAKE_C_COMPILER_TARGET} --target=${CMAKE_C_COMPILER_TARGET})
