@@ -3,17 +3,29 @@ message(STATUS "Will build RNNoise")
 # RNNoise builds via its own autotools ./configure && make invocation
 # below, which is a separate build system CMake just shells out to -- it
 # never sees CMAKE_C_COMPILER_LAUNCHER/CMAKE_CXX_COMPILER_LAUNCHER (e.g.
-# ccache), since those only apply to CMake's own compile rules. Bake the
-# launcher into CC/CXX instead so RNNoise's build gets cached the same way
-# as the rest of the project.
+# ccache), since those only apply to CMake's own compile rules.
+#
+# Point CC/CXX at small generated wrapper scripts that exec the launcher
+# + real compiler, rather than baking "<launcher> <compiler>" directly
+# into CC/CXX as a two-word string. The two-word form is the standard
+# ccache+autotools idiom and passes RNNoise's own ./configure cleanly in
+# isolation, but this keeps CC/CXX a single, ordinary-looking path either
+# way (as if it were just the compiler) so nothing downstream -- configure
+# script, libtool, make -- ever has to deal with a compound value, which
+# is one less variable when tracking down a build failure under CI's
+# parallel load.
 if(CMAKE_C_COMPILER_LAUNCHER)
-    set(RNNOISE_CC "${CMAKE_C_COMPILER_LAUNCHER} ${CMAKE_C_COMPILER}")
+    set(RNNOISE_CC "${CMAKE_CURRENT_BINARY_DIR}/rnnoise-cc-wrapper.sh")
+    file(WRITE "${RNNOISE_CC}" "#!/bin/sh\nexec ${CMAKE_C_COMPILER_LAUNCHER} ${CMAKE_C_COMPILER} \"$@\"\n")
+    execute_process(COMMAND chmod +x "${RNNOISE_CC}")
 else()
     set(RNNOISE_CC "${CMAKE_C_COMPILER}")
 endif()
 
 if(CMAKE_CXX_COMPILER_LAUNCHER)
-    set(RNNOISE_CXX "${CMAKE_CXX_COMPILER_LAUNCHER} ${CMAKE_CXX_COMPILER}")
+    set(RNNOISE_CXX "${CMAKE_CURRENT_BINARY_DIR}/rnnoise-cxx-wrapper.sh")
+    file(WRITE "${RNNOISE_CXX}" "#!/bin/sh\nexec ${CMAKE_CXX_COMPILER_LAUNCHER} ${CMAKE_CXX_COMPILER} \"$@\"\n")
+    execute_process(COMMAND chmod +x "${RNNOISE_CXX}")
 else()
     set(RNNOISE_CXX "${CMAKE_CXX_COMPILER}")
 endif()
