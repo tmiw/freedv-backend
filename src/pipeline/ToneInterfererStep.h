@@ -35,6 +35,7 @@
 #ifndef AUDIO_PIPELINE__TONE_INTERFERER_STEP_H
 #define AUDIO_PIPELINE__TONE_INTERFERER_STEP_H
 
+#include <atomic>
 #include <memory>
 #include "../util/realtime_fp.h"
 #include "IPipelineStep.h"
@@ -44,7 +45,7 @@ class ToneInterfererStep : public IPipelineStep
 public:
     ToneInterfererStep(
         int sampleRate, realtime_fp<float()> const& toneFrequencyFn, 
-        realtime_fp<float()> const& toneAmplitudeFn, realtime_fp<float*()> const& tonePhaseFn);
+        realtime_fp<float()> const& toneAmplitudeFn, realtime_fp<std::atomic<float>*()> const& tonePhaseFn);
     virtual ~ToneInterfererStep();
     
     virtual int getInputSampleRate() const FREEDV_NONBLOCKING override;
@@ -55,7 +56,7 @@ private:
     int sampleRate_;
     realtime_fp<float()> toneFrequencyFn_;
     realtime_fp<float()> toneAmplitudeFn_;
-    realtime_fp<float*()> tonePhaseFn_;
+    realtime_fp<std::atomic<float>*()> tonePhaseFn_;
     std::unique_ptr<short[]> outputSamples_;
 };
 
