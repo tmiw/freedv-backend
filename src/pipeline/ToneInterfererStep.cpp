@@ -44,8 +44,8 @@
 #endif
 
 ToneInterfererStep::ToneInterfererStep(
-        int sampleRate, realtime_fp<float()> const& toneFrequencyFn, 
-        realtime_fp<float()> const& toneAmplitudeFn, realtime_fp<float*()> const& tonePhaseFn)
+        int sampleRate, realtime_fp<float()> const& toneFrequencyFn,
+        realtime_fp<float()> const& toneAmplitudeFn, realtime_fp<std::atomic<float>*()> const& tonePhaseFn)
     : sampleRate_(sampleRate)
     , toneFrequencyFn_(toneFrequencyFn)
     , toneAmplitudeFn_(toneAmplitudeFn)
@@ -80,14 +80,16 @@ short* ToneInterfererStep::execute(short* inputSamples, int numInputSamples, int
     auto toneFrequency = toneFrequencyFn_();
     auto toneAmplitude = toneAmplitudeFn_();
     auto tonePhase = tonePhaseFn_();
-    
+
+    float phase = tonePhase->load(std::memory_order_relaxed);
     float w = 2.0 * M_PI * toneFrequency / sampleRate_;
     for(int i = 0; i < numInputSamples; i++) {
-        float s = (float)toneAmplitude * cosf(*tonePhase);
+        float s = (float)toneAmplitude * cosf(phase);
         outputSamples_.get()[i] += (int)s;
-        *tonePhase += w;
+        phase += w;
     }
-    *tonePhase -= 2.0 * M_PI * floor(*tonePhase / (2.0 * M_PI));
+    phase -= 2.0 * M_PI * floor(phase / (2.0 * M_PI));
+    tonePhase->store(phase, std::memory_order_relaxed);
     
     return outputSamples_.get();
 }
