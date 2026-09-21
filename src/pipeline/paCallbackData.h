@@ -52,8 +52,8 @@ typedef struct paCallBackData
     audio_spin_mutex micEqLock;
     audio_spin_mutex spkEqLock;
 
-    bool            micInEQEnable;
-    bool            spkOutEQEnable;
+    std::atomic<bool> micInEQEnable;
+    std::atomic<bool> spkOutEQEnable;
 
     // optional loud tone on left channel to reliably trigger vox
     std::atomic<bool> leftChannelVoxTone;

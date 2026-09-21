@@ -33,12 +33,27 @@ if(RADE_C_SOURCE_DIR OR RADE_C_BINARY_DIR)
     set(BINARY_DIR ${RADE_C_BINARY_DIR})
     add_library(rade SHARED IMPORTED)
 else()
+    # rade_c is itself a CMake project, built here as a nested ExternalProject
+    # configure/build rather than via add_subdirectory(). That nested cmake
+    # invocation gets its own fresh CMakeCache.txt and doesn't inherit the
+    # parent project's CMAKE_C_COMPILER_LAUNCHER/CMAKE_CXX_COMPILER_LAUNCHER
+    # (e.g. ccache) automatically, so forward it explicitly. Note this only
+    # covers rade_c's own sources -- Opus is built inside rade_c via its own
+    # nested ExternalProject_Add (cmake/BuildOpus.cmake in that repo), which
+    # has the same gap but isn't addressed here.
+    if(CMAKE_C_COMPILER_LAUNCHER)
+        set(RADE_CMAKE_ARGS ${RADE_CMAKE_ARGS} -DCMAKE_C_COMPILER_LAUNCHER=${CMAKE_C_COMPILER_LAUNCHER})
+    endif()
+    if(CMAKE_CXX_COMPILER_LAUNCHER)
+        set(RADE_CMAKE_ARGS ${RADE_CMAKE_ARGS} -DCMAKE_CXX_COMPILER_LAUNCHER=${CMAKE_CXX_COMPILER_LAUNCHER})
+    endif()
+    
     include(ExternalProject)
     ExternalProject_Add(build_rade
        SOURCE_DIR rade_src
        BINARY_DIR rade_build
        GIT_REPOSITORY https://github.com/freedv/rade_c
-       GIT_TAG dr-tx-bpf
+       GIT_TAG main
        GIT_SUBMODULES ""
        GIT_SUBMODULES_RECURSE NO
        CMAKE_ARGS ${RADE_CMAKE_ARGS}
