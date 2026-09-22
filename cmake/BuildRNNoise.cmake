@@ -48,7 +48,17 @@ set(RNNOISE_PATCH_COMMAND ${CMAKE_COMMAND} -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR
 include(ExternalProject)
 
 if(APPLE)
-set(RNNOISE_APPLE_MIN_BUILD -mmacosx-version-min=10.11)
+set(RNNOISE_APPLE_MIN_BUILD -mmacosx-version-min=11.0)
+# autoconf's compiler-works check invokes CC (which CMake may resolve to the
+# Xcode toolchain's raw absolute cc path rather than /usr/bin/cc or `xcrun
+# cc`) without going through xcrun, so it doesn't auto-discover the default
+# SDK and fails with "ld: library 'System' not found". Pass -isysroot
+# explicitly so RNNoise's ./configure can actually link its test program.
+if(CMAKE_OSX_SYSROOT)
+    set(RNNOISE_APPLE_FLAGS -isysroot\ ${CMAKE_OSX_SYSROOT}\ ${RNNOISE_APPLE_MIN_BUILD})
+else()
+    set(RNNOISE_APPLE_FLAGS ${RNNOISE_APPLE_MIN_BUILD})
+endif(CMAKE_OSX_SYSROOT)
 endif(APPLE)
 
 if(APPLE AND BUILD_OSX_UNIVERSAL)
@@ -57,7 +67,7 @@ if(APPLE AND BUILD_OSX_UNIVERSAL)
 ExternalProject_Add(build_rnnoise_x86
     DOWNLOAD_EXTRACT_TIMESTAMP NO
     BUILD_IN_SOURCE 1
-    CONFIGURE_COMMAND ${CONFIGURE_COMMAND} --enable-x86-rtcd --host=x86_64-apple-darwin --target=x86_64-apple-darwin CFLAGS=-arch\ x86_64\ -O2\ ${RNNOISE_APPLE_MIN_BUILD}
+    CONFIGURE_COMMAND ${CONFIGURE_COMMAND} --enable-x86-rtcd --host=x86_64-apple-darwin --target=x86_64-apple-darwin CFLAGS=-arch\ x86_64\ -O2\ ${RNNOISE_APPLE_FLAGS}
     BUILD_COMMAND $(MAKE)
     INSTALL_COMMAND ""
     GIT_REPOSITORY ${RNNOISE_REPO}
@@ -68,7 +78,7 @@ ExternalProject_Add(build_rnnoise_x86
 ExternalProject_Add(build_rnnoise_arm
     DOWNLOAD_EXTRACT_TIMESTAMP NO
     BUILD_IN_SOURCE 1
-    CONFIGURE_COMMAND ${CONFIGURE_COMMAND} --host=aarch64-apple-darwin --target=aarch64-apple-darwin CFLAGS=-arch\ arm64\ -O2\ ${RNNOISE_APPLE_MIN_BUILD}
+    CONFIGURE_COMMAND ${CONFIGURE_COMMAND} --host=aarch64-apple-darwin --target=aarch64-apple-darwin CFLAGS=-arch\ arm64\ -O2\ ${RNNOISE_APPLE_FLAGS}
     BUILD_COMMAND $(MAKE)
     INSTALL_COMMAND ""
     GIT_REPOSITORY ${RNNOISE_REPO}
@@ -111,7 +121,7 @@ set(CONFIGURE_COMMAND ${CONFIGURE_COMMAND} --enable-x86-rtcd)
 endif(${CMAKE_SYSTEM_PROCESSOR} MATCHES "x86")
 
 if(APPLE)
-set(CONFIGURE_COMMAND ${CONFIGURE_COMMAND} CFLAGS=-O2\ ${RNNOISE_APPLE_MIN_BUILD})
+set(CONFIGURE_COMMAND ${CONFIGURE_COMMAND} CFLAGS=-O2\ ${RNNOISE_APPLE_FLAGS})
 endif(APPLE)
 
 ExternalProject_Add(build_rnnoise
