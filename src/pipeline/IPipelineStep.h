@@ -122,7 +122,7 @@ void IPipelineStep::ConvertToFloatSampleType_(SrcType* sourceSamples, DstType* d
     else
     {
         auto divider = SampleDivisor + 1;
-        if (SampleDivisor != std::numeric_limits<DstType>::max())
+        if (SampleDivisor != std::numeric_limits<SrcType>::max())
         {
             divider = SampleDivisor;
         }
