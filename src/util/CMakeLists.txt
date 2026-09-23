@@ -20,12 +20,21 @@ add_library(fdv_util STATIC
     TcpConnectionHandler.cpp
     UdpHandler.cpp
     logging/ulog.c
+    logging/ulog_async.cpp
     ${UTIL_LINUX_FILES}
     ${UTIL_WIN32_FILES}
 )
 
+# ULOG_ASYNC is also set via add_definitions() in ../CMakeLists.txt; repeated
+# here as a PUBLIC usage requirement so it reaches downstream projects that
+# link fdv_util through FetchContent (same rationale as ENABLE_TLS_SUPPORT
+# below). It changes ulog_Event's layout, so it must be seen wherever ulog.h is.
+target_compile_definitions(fdv_util PUBLIC ULOG_ASYNC)
+
+find_package(Threads REQUIRED)
+
 target_compile_options(fdv_util PRIVATE ${WARNINGS_AS_ERRORS_FLAGS})
-target_link_libraries(fdv_util yyjson fdv_os_wrapper)
+target_link_libraries(fdv_util yyjson fdv_os_wrapper Threads::Threads)
 if(WIN32)
     target_link_libraries(fdv_util iphlpapi)
 endif(WIN32)
@@ -56,5 +65,6 @@ endmacro()
 
 DefineUnitTest(ThreadedTimerTest)
 DefineUnitTest(GenericFIFOTest)
+DefineUnitTest(UlogAsyncTest)
 endif(BUILD_BACKEND_UNITTESTS)
 
