@@ -62,6 +62,12 @@ using namespace std::chrono_literals;
 #define INVALID_SOCKET (-1)
 #endif // INVALID_SOCKET
 
+// How long to wait in select() before checking whether a disconnect was requested.
+constexpr long SELECT_SLICE_US = 100000; // 100ms
+
+// How long to allow the TLS handshake before giving up and trying again later.
+constexpr auto TLS_HANDSHAKE_TIMEOUT = 10s;
+
 #if defined(ENABLE_TLS_SUPPORT)
 static std::string GetSSLError_()
 {
@@ -580,8 +586,11 @@ next_fd:
                         log_warn("Unable to assign hostname for certificate validation: %s", errStr.c_str());
                     }
 
-                    // Attempt SSL negotiation
+                    // Attempt SSL negotiation. The server may never respond, so give up
+                    // if it takes too long or if a disconnect is requested; otherwise
+                    // the disconnect waits behind us until the server closes the socket.
                     int sslRet = 0;
+                    auto handshakeDeadline = std::chrono::steady_clock::now() + TLS_HANDSHAKE_TIMEOUT;
                     while ((sslRet = SSL_connect(ssl_.load(std::memory_order_relaxed))) != 1)
                     {
                         fd_set writeSet;
@@ -591,12 +600,28 @@ next_fd:
                         auto sslErr = SSL_get_error(ssl_.load(std::memory_order_relaxed), sslRet);
                         if (sslErr == SSL_ERROR_WANT_READ || sslErr == SSL_ERROR_WANT_WRITE)
                         {
+                            if (cancelConnect_.load(std::memory_order_relaxed))
+                            {
+                                log_info("TLS negotiation cancelled");
+                                disconnectImpl_(false);
+                                connSucceeded = false;
+                                break;
+                            }
+                            else if (std::chrono::steady_clock::now() >= handshakeDeadline)
+                            {
+                                log_error("TLS negotiation timed out");
+                                disconnectImpl_(false);
+                                connSucceeded = false;
+                                break;
+                            }
+
                             // Block until we're able to continue.
                             auto rawSock = socket_.load(std::memory_order_relaxed);
                             if (sslErr == SSL_ERROR_WANT_READ) FD_SET(rawSock, &readSet);
                             else FD_SET(rawSock, &writeSet);
 
-                            select(socket_.load(std::memory_order_relaxed) + 1, &readSet, &writeSet, nullptr, nullptr);
+                            struct timeval tv = {0, SELECT_SLICE_US};
+                            select(socket_.load(std::memory_order_relaxed) + 1, &readSet, &writeSet, nullptr, &tv);
                         }
                         else
                         {
@@ -742,8 +767,15 @@ void TcpConnectionHandler::sendImpl_(const char* buf, int length)
             FD_ZERO(&writeSet);
             FD_SET(socket_.load(std::memory_order_relaxed), &writeSet);
 
-            int rv = select(socket_.load(std::memory_order_relaxed) + 1, nullptr, &writeSet, nullptr, nullptr);
-            if (rv > 0)
+            // Give up on the write if a disconnect is requested while we're waiting.
+            struct timeval tv = {0, SELECT_SLICE_US};
+            int rv = select(socket_.load(std::memory_order_relaxed) + 1, nullptr, &writeSet, nullptr, &tv);
+            if (rv == 0 && cancelConnect_.load(std::memory_order_relaxed))
+            {
+                log_warn("write abandoned due to disconnect");
+                break;
+            }
+            else if (rv > 0)
             {
                 int numWritten = 0;
 #if defined(ENABLE_TLS_SUPPORT)
@@ -767,7 +799,13 @@ void TcpConnectionHandler::sendImpl_(const char* buf, int length)
                             auto rawSock = socket_.load(std::memory_order_relaxed);
                             FD_SET(rawSock, &readSet);
 
-                            select(socket_.load(std::memory_order_relaxed) + 1, &readSet, nullptr, nullptr, nullptr);
+                            struct timeval tv = {0, SELECT_SLICE_US};
+                            if (select(socket_.load(std::memory_order_relaxed) + 1, &readSet, nullptr, nullptr, &tv) == 0 &&
+                                cancelConnect_.load(std::memory_order_relaxed))
+                            {
+                                log_warn("write abandoned due to disconnect");
+                                break;
+                            }
                             continue;
                         }
                         else
