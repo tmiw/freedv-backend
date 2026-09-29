@@ -18,32 +18,27 @@ else()
     set(RNNOISE_CXX "${CMAKE_CXX_COMPILER}")
 endif()
 
-set(CONFIGURE_COMMAND ./autogen.sh && ./configure --with-pic --disable-examples --disable-doc --disable-shared CC=${RNNOISE_CC} CXX=${RNNOISE_CXX})
+# --enable-rtcd builds RNNoise's DNN kernels for more than one instruction set and
+# picks the fastest one the CPU supports at runtime: SSE4.1/AVX2 on x86 and the dot
+# product instructions on AArch64 (it's a no-op anywhere else).
+set(CONFIGURE_COMMAND ./autogen.sh && ./configure --with-pic --disable-examples --disable-doc --disable-shared --enable-rtcd CC=${RNNOISE_CC} CXX=${RNNOISE_CXX})
 
 if (CMAKE_CROSSCOMPILING)
 set(CONFIGURE_COMMAND ${CONFIGURE_COMMAND} --host=${CMAKE_C_COMPILER_TARGET} --target=${CMAKE_C_COMPILER_TARGET})
 endif (CMAKE_CROSSCOMPILING)
 
-set(RNNOISE_REPO https://github.com/xiph/rnnoise.git)
-
-# Pinned to a specific commit (rather than the floating "main" branch) because
-# a local patch is applied below (see
-# cmake/patches/rnnoise-sparse-sgemv8x4-neon.patch). A patch generated against
-# one commit is not guaranteed to apply cleanly against whatever "main" happens
-# to point to later, so the two need to move together: bumping this SHA means
-# regenerating/re-verifying the patch against the new commit.
-set(RNNOISE_GIT_TAG 70f1d256acd4b34a572f999a05c87bf00b67730d)
-
-# vec_neon.h's sparse_sgemv8x4() (used for RNNoise's pruned GRU/dense weight
-# matrices -- the dominant cost in rnnoise_process_frame) is a plain scalar
-# loop upstream, explicitly marked "Temporarily use unoptimized version";
-# vec_avx.h's version of the same function is properly AVX2-vectorized. This
-# patch ports that same 8-row/4-column-unrolled approach to NEON (as two
-# float32x4_t accumulators, since NEON is 128-bit vs AVX's 256-bit), matching
-# the already-vectorized (and unaffected) sgemv8x1() a few lines above it in
-# the same file. Only affects the NEON branch of vec.h's arch dispatch, so it
-# has no effect on x86 builds.
-set(RNNOISE_PATCH_COMMAND ${CMAKE_COMMAND} -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/rnnoise-sparse-sgemv8x4-neon.patch -P ${CMAKE_CURRENT_LIST_DIR}/patches/apply_if_needed.cmake)
+# Our fork of xiph/rnnoise, which adds on top of upstream:
+# - AArch64 runtime CPU detection, so generic AArch64 builds (Linux, Windows on
+#   Arm) use the dot product instructions on CPUs that have them (-11 to -14%
+#   rnnoise_process_frame() time), behind a single --enable-rtcd option that also
+#   covers x86 (--enable-x86-rtcd is kept as an alias).
+# - A faster NEON sparse_cgemv8x4() (four accumulators instead of two; -7% on an
+#   Apple M1, bit-identical output).
+# - The NEON sparse_sgemv8x4() from xiph/rnnoise#234. (This has no effect in the
+#   default build, which compiles out the float weights it would be used with.)
+# Pinned to a commit so builds don't change underneath us.
+set(RNNOISE_REPO https://github.com/tmiw/rnnoise.git)
+set(RNNOISE_GIT_TAG 8b12912d0e4a4503ca7d83fd1111f00f7e8298e8)
 
 include(ExternalProject)
 
@@ -67,13 +62,12 @@ if(APPLE AND BUILD_OSX_UNIVERSAL)
 ExternalProject_Add(build_rnnoise_x86
     DOWNLOAD_EXTRACT_TIMESTAMP NO
     BUILD_IN_SOURCE 1
-    CONFIGURE_COMMAND ${CONFIGURE_COMMAND} --enable-x86-rtcd --host=x86_64-apple-darwin --target=x86_64-apple-darwin CFLAGS=-arch\ x86_64\ -O2\ ${RNNOISE_APPLE_FLAGS}
+    CONFIGURE_COMMAND ${CONFIGURE_COMMAND} --host=x86_64-apple-darwin --target=x86_64-apple-darwin CFLAGS=-arch\ x86_64\ -O2\ ${RNNOISE_APPLE_FLAGS}
     BUILD_COMMAND $(MAKE)
     INSTALL_COMMAND ""
     GIT_REPOSITORY ${RNNOISE_REPO}
     GIT_TAG ${RNNOISE_GIT_TAG}
     UPDATE_DISCONNECTED 1
-    PATCH_COMMAND ${RNNOISE_PATCH_COMMAND}
 )
 ExternalProject_Add(build_rnnoise_arm
     DOWNLOAD_EXTRACT_TIMESTAMP NO
@@ -84,7 +78,6 @@ ExternalProject_Add(build_rnnoise_arm
     GIT_REPOSITORY ${RNNOISE_REPO}
     GIT_TAG ${RNNOISE_GIT_TAG}
     UPDATE_DISCONNECTED 1
-    PATCH_COMMAND ${RNNOISE_PATCH_COMMAND}
 )
 
 ExternalProject_Get_Property(build_rnnoise_arm BINARY_DIR)
@@ -115,10 +108,15 @@ target_include_directories(rnnoise_inc INTERFACE ${SOURCE_DIR}/include)
 
 else(APPLE AND BUILD_OSX_UNIVERSAL)
 
-if(${CMAKE_SYSTEM_PROCESSOR} MATCHES "x86")
-message(STATUS "RNNoise: Enabling optimizations if available on user's system")
-set(CONFIGURE_COMMAND ${CONFIGURE_COMMAND} --enable-x86-rtcd)
-endif(${CMAKE_SYSTEM_PROCESSOR} MATCHES "x86")
+# RNNoise's configure defaults to -g -O2. With gcc on x86-64, -O3 vectorizes
+# its plain C FFT and pitch code, which -O2 mostly doesn't: rnnoise_process_frame()
+# went from 69.8 to 65.0 us per frame (-7%) with bit-identical output (gcc 16,
+# AMD EPYC-Milan). Not applied elsewhere: clang (macOS) showed no difference,
+# gcc on AArch64 showed no gain on a Raspberry Pi 4 and changed the output
+# slightly, and the Windows builds (clang via llvm-mingw) haven't been measured.
+if(${CMAKE_SYSTEM_PROCESSOR} MATCHES "x86" AND NOT APPLE AND NOT WIN32)
+set(CONFIGURE_COMMAND ${CONFIGURE_COMMAND} CFLAGS=-g\ -O3)
+endif(${CMAKE_SYSTEM_PROCESSOR} MATCHES "x86" AND NOT APPLE AND NOT WIN32)
 
 if(APPLE)
 set(CONFIGURE_COMMAND ${CONFIGURE_COMMAND} CFLAGS=-O2\ ${RNNOISE_APPLE_FLAGS})
@@ -132,7 +130,6 @@ ExternalProject_Add(build_rnnoise
     GIT_REPOSITORY ${RNNOISE_REPO}
     GIT_TAG ${RNNOISE_GIT_TAG}
     UPDATE_DISCONNECTED 1
-    PATCH_COMMAND ${RNNOISE_PATCH_COMMAND}
 )
 
 ExternalProject_Get_Property(build_rnnoise BINARY_DIR)
