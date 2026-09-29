@@ -1,5 +1,5 @@
 diff --git a/src/src_sinc.c b/src/src_sinc.c
-index 716c4a4..c11c094 100644
+index 716c4a4..6964b20 100644
 --- a/src/src_sinc.c
 +++ b/src/src_sinc.c
 @@ -53,6 +53,35 @@ typedef int _CHECK_SHIFT_BITS[2 * (SHIFT_BITS < sizeof (increment_t) * 8 - 1) -
@@ -38,7 +38,7 @@ index 716c4a4..c11c094 100644
  typedef struct
  {	int		sinc_magic_marker ;
  
-@@ -64,6 +93,21 @@ typedef struct
+@@ -64,6 +93,22 @@ typedef struct
  	double	src_ratio, input_index ;
  
  	coeff_t const	*coeffs ;
@@ -48,11 +48,12 @@ index 716c4a4..c11c094 100644
 +	coeff_t			*coeff_deltas ;
 +
 +	/* Per-phase tap weight cache for the mono path (see sinc_phase_lookup()).
++	** Weights are stored as float (see sinc_phase_dot() for why that's safe).
 +	** NULL for multi-channel filters. Slot i's weights live at
 +	** phase_weights [2 * i * phase_cap] (left half) and
 +	** phase_weights [(2 * i + 1) * phase_cap] (right half). */
 +	SINC_PHASE		*phases ;
-+	double			*phase_weights ;
++	float			*phase_weights ;
 +	int				phase_cap ;
 +	int				phase_mru ;
 +	unsigned		phase_clock ;
@@ -60,7 +61,7 @@ index 716c4a4..c11c094 100644
  
  	int		b_current, b_end, b_real_end, b_len ;
  
-@@ -247,11 +291,34 @@ sinc_filter_new (int converter_type, int channels)
+@@ -247,11 +292,34 @@ sinc_filter_new (int converter_type, int channels)
  
  
  		priv->buffer = (float *) calloc (priv->b_len + channels, sizeof (float)) ;
@@ -77,7 +78,7 @@ index 716c4a4..c11c094 100644
 +		if (channels == 1)
 +		{	priv->phase_cap = (priv->coeff_half_len + 2) * SINC_PHASE_CACHE_MAX_DOWNSAMPLE / priv->index_inc + 3 ;
 +			priv->phases = (SINC_PHASE *) calloc (SINC_PHASE_CACHE_SLOTS, sizeof (SINC_PHASE)) ;
-+			priv->phase_weights = (double *) malloc ((size_t) 2 * SINC_PHASE_CACHE_SLOTS * priv->phase_cap * sizeof (double)) ;
++			priv->phase_weights = (float *) malloc ((size_t) 2 * SINC_PHASE_CACHE_SLOTS * priv->phase_cap * sizeof (float)) ;
 +			phase_ok = priv->phases && priv->phase_weights ;
 +			} ;
 +
@@ -96,18 +97,18 @@ index 716c4a4..c11c094 100644
  	}
  
  	return priv ;
-@@ -350,13 +417,33 @@ sinc_copy (SRC_STATE *state)
+@@ -350,13 +418,33 @@ sinc_copy (SRC_STATE *state)
  	}
  	memcpy (to_filter, from_filter, sizeof (SINC_FILTER)) ;
  	to_filter->buffer = (float *) malloc (sizeof (float) * (from_filter->b_len + state->channels)) ;
 -	if (!to_filter->buffer)
 +	int coeff_delta_count = from_filter->coeff_half_len + 1 ;
 +	to_filter->coeff_deltas = (coeff_t *) malloc (coeff_delta_count * sizeof (coeff_t)) ;
-+	size_t phase_weights_size = (size_t) 2 * SINC_PHASE_CACHE_SLOTS * from_filter->phase_cap * sizeof (double) ;
++	size_t phase_weights_size = (size_t) 2 * SINC_PHASE_CACHE_SLOTS * from_filter->phase_cap * sizeof (float) ;
 +	int phase_ok = 1 ;
 +	if (from_filter->phases)
 +	{	to_filter->phases = (SINC_PHASE *) malloc (SINC_PHASE_CACHE_SLOTS * sizeof (SINC_PHASE)) ;
-+		to_filter->phase_weights = (double *) malloc (phase_weights_size) ;
++		to_filter->phase_weights = (float *) malloc (phase_weights_size) ;
 +		phase_ok = to_filter->phases && to_filter->phase_weights ;
 +		} ;
 +	if (!to_filter->buffer || !to_filter->coeff_deltas || !phase_ok)
@@ -132,7 +133,7 @@ index 716c4a4..c11c094 100644
  
  	to->private_data = to_filter ;
  
-@@ -367,14 +454,50 @@ sinc_copy (SRC_STATE *state)
+@@ -367,14 +455,50 @@ sinc_copy (SRC_STATE *state)
  **	Beware all ye who dare pass this point. There be dragons here.
  */
  
@@ -188,7 +189,7 @@ index 716c4a4..c11c094 100644
  
  	/* First apply the left half of the filter. */
  	filter_index = start_filter_index ;
-@@ -384,17 +507,54 @@ calc_output_single (SINC_FILTER *filter, increment_t increment, increment_t star
+@@ -384,17 +508,54 @@ calc_output_single (SINC_FILTER *filter, increment_t increment, increment_t star
  
  	if (data_index < 0) /* Avoid underflow access to filter->buffer. */
  	{	int steps = -data_index ;
@@ -246,7 +247,7 @@ index 716c4a4..c11c094 100644
  		assert (data_index >= 0 && data_index < filter->b_len) ;
  		assert (data_index < filter->b_end) ;
  		left += icoeff * filter->buffer [data_index] ;
-@@ -409,23 +569,237 @@ calc_output_single (SINC_FILTER *filter, increment_t increment, increment_t star
+@@ -409,23 +570,248 @@ calc_output_single (SINC_FILTER *filter, increment_t increment, increment_t star
  	filter_index = filter_index + coeff_count * increment ;
  	data_index = filter->b_current + 1 + coeff_count ;
  
@@ -321,14 +322,13 @@ index 716c4a4..c11c094 100644
 +
 +/* Fills phase slot `slot` with the tap weights calc_output_single() would
 +** interpolate for (start_filter_index, increment), using the identical
-+** expression (coeffs [indx] + fraction * coeff_deltas [indx], in double) so
-+** the cached path is bit-exact with the inline one. Returns 0 if the taps
-+** don't fit in the slot. */
++** expression (coeffs [indx] + fraction * coeff_deltas [indx], in double),
++** rounded to float for storage. Returns 0 if the taps don't fit in the slot. */
 +static int
 +sinc_phase_fill (SINC_FILTER *filter, int slot, increment_t max_filter_index, increment_t increment, increment_t start_filter_index)
 +{	SINC_PHASE	*phase = &filter->phases [slot] ;
-+	double		*left_w = filter->phase_weights + (size_t) 2 * slot * filter->phase_cap ;
-+	double		*right_w = left_w + filter->phase_cap ;
++	float		*left_w = filter->phase_weights + (size_t) 2 * slot * filter->phase_cap ;
++	float		*right_w = left_w + filter->phase_cap ;
 +	increment_t	filter_index ;
 +	int			coeff_count, n ;
 +
@@ -435,13 +435,46 @@ index 716c4a4..c11c094 100644
 +/* calc_output_single() using cached weights. Same batching and summation
 +** order as calc_output_single(), so the result is bit-exact with it; only the
 +** per-tap weight computation is replaced by a unit-stride load. */
++/* Dot product of cached float weights with the float input buffer (x advances
++** by `step`, +1 for the left half and -1 for the right half).
++**
++** The weights are stored as float to halve the cache's memory traffic, but
++** each product and the accumulation are done in double. A float * float
++** product is exact in double (24 + 24 significant bits < 53), so the only
++** precision lost versus the all-double version is the rounding of the
++** weights themselves. Accumulating in float as well would be about twice as
++** fast again, but that fails libsamplerate's snr_bw_test: its unity-ratio
++** SRC_SINC_MEDIUM_QUALITY case measures 155.7dB against a 157dB requirement
++** (157.7dB with double accumulators), and several SRC_SINC_BEST_QUALITY
++** cases have margins under 1dB. With double accumulators no snr_bw_test
++** case measures more than 0.3dB below the all-double version.
++**
++** Eight independent accumulators (vs four elsewhere in this file) give the
++** vectorizer two full vectors of double lanes per iteration on 128-bit SIMD. */
++static inline double
++sinc_phase_dot (const float *w, const float *x, int n, int step)
++{	double	a [8] = { 0 } ;
++	int		k = 0 ;
++
++	for ( ; k + 8 <= n ; k += 8)
++		for (int j = 0 ; j < 8 ; j++)
++			a [j] += (double) w [k + j] * x [step * (k + j)] ;
++
++	double r = ((a [0] + a [1]) + (a [2] + a [3])) + ((a [4] + a [5]) + (a [6] + a [7])) ;
++	for ( ; k < n ; k++)
++		r += (double) w [k] * x [step * k] ;
++	return r ;
++}
++
++/* calc_output_single() using cached weights: the per-tap weight computation
++** is replaced by a unit-stride load. Not bit-exact with calc_output_single()
++** since the cached weights are rounded to float (see sinc_phase_dot()). */
 +static inline double
 +calc_output_single_cached (const SINC_FILTER *filter, int slot)
 +{	const SINC_PHASE	*phase = &filter->phases [slot] ;
-+	const double		*w = filter->phase_weights + (size_t) 2 * slot * filter->phase_cap ;
-+	const float			*buffer = filter->buffer ;
-+	double				left, right, acc0, acc1, acc2, acc3 ;
-+	int					data_index, n, k ;
++	const float			*w = filter->phase_weights + (size_t) 2 * slot * filter->phase_cap ;
++	int					data_index, n ;
++	double				left, right ;
 +
 +	/* Left half. */
 +	n = phase->left_count ;
@@ -452,35 +485,14 @@ index 716c4a4..c11c094 100644
 +		data_index = 0 ;
 +		} ;
 +	assert (n <= 0 || (data_index + n - 1 < filter->b_len && data_index + n - 1 < filter->b_end)) ;
-+
-+	acc0 = acc1 = acc2 = acc3 = 0.0 ;
-+	for (k = 0 ; k + 4 <= n ; k += 4)
-+	{	acc0 += w [k + 0] * buffer [data_index + k + 0] ;
-+		acc1 += w [k + 1] * buffer [data_index + k + 1] ;
-+		acc2 += w [k + 2] * buffer [data_index + k + 2] ;
-+		acc3 += w [k + 3] * buffer [data_index + k + 3] ;
-+		} ;
-+	left = acc0 + acc1 + acc2 + acc3 ;
-+	for ( ; k < n ; k++)
-+		left += w [k] * buffer [data_index + k] ;
++	left = sinc_phase_dot (w, filter->buffer + data_index, n, 1) ;
 +
 +	/* Right half. */
 +	w = filter->phase_weights + (size_t) (2 * slot + 1) * filter->phase_cap ;
 +	n = phase->right_count ;
 +	data_index = filter->b_current + 1 + phase->right_offset ;
 +	assert (data_index < filter->b_len && data_index < filter->b_end && data_index - (n - 1) >= 0) ;
-+
-+	right = w [0] * buffer [data_index] ;
-+	acc0 = acc1 = acc2 = acc3 = 0.0 ;
-+	for (k = 1 ; k + 4 <= n ; k += 4)
-+	{	acc0 += w [k + 0] * buffer [data_index - k - 0] ;
-+		acc1 += w [k + 1] * buffer [data_index - k - 1] ;
-+		acc2 += w [k + 2] * buffer [data_index - k - 2] ;
-+		acc3 += w [k + 3] * buffer [data_index - k - 3] ;
-+		} ;
-+	right += acc0 + acc1 + acc2 + acc3 ;
-+	for ( ; k < n ; k++)
-+		right += w [k] * buffer [data_index - k] ;
++	right = sinc_phase_dot (w, filter->buffer + data_index, n, -1) ;
  
  	return (left + right) ;
 -} /* calc_output_single */
@@ -488,7 +500,7 @@ index 716c4a4..c11c094 100644
  
  static SRC_ERROR
  sinc_mono_vari_process (SRC_STATE *state, SRC_DATA *data)
-@@ -468,6 +842,19 @@ sinc_mono_vari_process (SRC_STATE *state, SRC_DATA *data)
+@@ -468,6 +854,19 @@ sinc_mono_vari_process (SRC_STATE *state, SRC_DATA *data)
  
  	terminate = 1.0 / src_ratio + 1e-20 ;
  
@@ -508,7 +520,7 @@ index 716c4a4..c11c094 100644
  	/* Main processing loop. */
  	while (filter->out_gen < filter->out_count)
  	{
-@@ -490,15 +877,19 @@ sinc_mono_vari_process (SRC_STATE *state, SRC_DATA *data)
+@@ -490,15 +889,19 @@ sinc_mono_vari_process (SRC_STATE *state, SRC_DATA *data)
  			} ;
  
  		if (filter->out_count > 0 && fabs (state->last_ratio - data->src_ratio) > 1e-10)
@@ -533,7 +545,7 @@ index 716c4a4..c11c094 100644
  		filter->out_gen ++ ;
  
  		/* Figure out the next index. */
-@@ -1243,6 +1634,15 @@ sinc_close (SRC_STATE *state)
+@@ -1243,6 +1646,15 @@ sinc_close (SRC_STATE *state)
  				free (sinc->buffer) ;
  				sinc->buffer = NULL ;
  			}
