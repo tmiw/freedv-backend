@@ -37,6 +37,7 @@
 #include <algorithm>
 #include <array>
 #include <assert.h>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <ctype.h>
@@ -45,12 +46,14 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "ldpc_encode.h"
-#include "ldpc_decode.h"
+#include "ldpc_code.h"
+#include "HRA_56_56.h"
 #include "../util/logging/ulog.h"
 
-static constexpr int LDPC_TOTAL_SIZE_BITS = 112;
-static constexpr int LDPC_PAYLOAD_BITS = LDPC_TOTAL_SIZE_BITS / 2; // 56
+using RadeTextLDPC = LDPCCode<56, 56>;
+
+static constexpr int LDPC_TOTAL_SIZE_BITS = RadeTextLDPC::CODEWORD_BITS; // 112
+static constexpr int LDPC_PAYLOAD_BITS = RadeTextLDPC::DATA_BITS; // 56
 
 // ---------------------------------------------------------------------------
 // 56-bit LDPC payload layout
@@ -113,6 +116,54 @@ static constexpr int RADE_TEXT_MAX_LENGTH = RADE_TEXT_CHARS_PER_BLOCK * RADE_TEX
 // so this directly cuts that dominant cost by 3x versus ldpc_decode()'s
 // default max_iter of 30.
 static constexpr int MAX_CONFIDENT_ITERATIONS = 10;
+
+// ---------------------------------------------------------------------------
+// Receive combining
+//
+// The transmitter repeats its block cycle back to back for as long as it's
+// keyed, so the symbol received at time k carries the same bit as the one
+// at k + P, where P is the cycle length (LDPC_TOTAL_SIZE_BITS * number of
+// blocks). Summing received symbols modulo P therefore coherently combines
+// every copy heard so far: the signal adds linearly while the noise adds
+// in power, for ~10log10(copies) dB of SNR gain in AWGN and considerably
+// more in fading (copies fade independently).
+//
+// The block count isn't known until something has decoded, so one
+// accumulator is kept for each possible cycle length (1..RADE_TEXT_MAX_BLOCKS
+// blocks). Accumulator b's sliding window -- its most recently written
+// LDPC_TOTAL_SIZE_BITS positions -- spans the same transmitted bit
+// positions as the raw sliding window, so it becomes codeword-aligned at
+// exactly the same moments; no separate rotation search is needed.
+//
+// Each position decays by RADE_TEXT_COMBINE_DECAY every time it's
+// rewritten, so a changed message (or any garbage that slipped in) ages out
+// rather than poisoning the sum forever. With decay a, the steady-state SNR
+// gain is equivalent to (1+a)/(1-a) equally-weighted copies.
+// rade_text_rx_reset() (e.g. on loss of modem sync, after which the cycle
+// position is unknown) clears all of it.
+// ---------------------------------------------------------------------------
+#ifndef RADE_TEXT_COMBINE_DECAY
+#define RADE_TEXT_COMBINE_DECAY 0.7f // ~5.7 equivalent copies
+#endif // RADE_TEXT_COMBINE_DECAY
+
+static constexpr int RADE_TEXT_COMBINE_MAX_PERIOD = LDPC_TOTAL_SIZE_BITS * RADE_TEXT_MAX_BLOCKS;
+
+// Combined decodes are only attempted once at least this many copies have
+// been accumulated -- with just one, the combined window is identical to
+// the raw one already tried.
+static constexpr int RADE_TEXT_COMBINE_MIN_COPIES = 2;
+
+// Each combined window is one more decode hypothesis per symbol, each with
+// CRC-8's ~1/256 chance of letting a spurious candidate through, so
+// combining raises the false decode rate (~0.5/hr -> ~0.8/hr on pure noise
+// in simulation). Optionally (see rade_text_enable_rx_combine_confirm()), a
+// decode that only a combining accumulator produced is held until the same
+// block (identical index, last-block flag and characters) decodes again a
+// whole number of codewords later -- i.e. at the same alignment within the
+// cycle -- within RADE_TEXT_COMBINE_CONFIRM_WINDOW symbols. That restores
+// the no-combining false decode rate at the cost of one extra repetition of
+// the block (>= 1 codeword) of latency near threshold.
+static constexpr int RADE_TEXT_COMBINE_CONFIRM_WINDOW = 2 * RADE_TEXT_COMBINE_MAX_PERIOD;
 
 // Fields extracted from one decoded, CRC-valid 56-bit LDPC payload.
 struct RadeTextBlockFields
@@ -181,6 +232,25 @@ typedef struct RadeTextImpl
 
     int enableStats;
 
+    // Per-instance decoder (owns its belief-propagation message buffers).
+    RadeTextLDPC ldpc;
+
+    // Receive combining state (see "Receive combining" above).
+    // rx_combine_acc[b] accumulates with period (b + 1) *
+    // LDPC_TOTAL_SIZE_BITS; rx_combine_idx[b] is its next write position.
+    // rx_total_syms counts symbols since the last reset, saturating.
+    bool rx_combine_enabled;
+    float rx_combine_acc[RADE_TEXT_MAX_BLOCKS][RADE_TEXT_COMBINE_MAX_PERIOD];
+    int rx_combine_idx[RADE_TEXT_MAX_BLOCKS];
+    int rx_total_syms;
+
+    // Confirmation of combined-only decodes (see
+    // RADE_TEXT_COMBINE_CONFIRM_WINDOW), tracked per block index.
+    bool rx_combine_confirm;
+    bool rx_confirm_pending[RADE_TEXT_MAX_BLOCKS];
+    RadeTextBlockFields rx_confirm_fields[RADE_TEXT_MAX_BLOCKS];
+    int rx_confirm_sym[RADE_TEXT_MAX_BLOCKS];
+
     RadeTextImpl()
         : text_rx_callback(nullptr)
         , callback_state(nullptr)
@@ -195,8 +265,17 @@ typedef struct RadeTextImpl
         , rx_asm_total_blocks(-1)
         , rx_asm_delivered(false)
         , enableStats(1)
+        , ldpc(HRA_56_56)
+        , rx_combine_enabled(true)
+        , rx_total_syms(0)
+        , rx_combine_confirm(false)
     {
         memset(tx_text, 0, sizeof(tx_text));
+        memset(rx_combine_acc, 0, sizeof(rx_combine_acc));
+        memset(rx_combine_idx, 0, sizeof(rx_combine_idx));
+        memset(rx_confirm_pending, 0, sizeof(rx_confirm_pending));
+        memset(rx_confirm_fields, 0, sizeof(rx_confirm_fields));
+        memset(rx_confirm_sym, 0, sizeof(rx_confirm_sym));
         memset(rx_circular_buf, 0, sizeof(rx_circular_buf));
         memset(rx_sweep_snapshot, 0, sizeof(rx_sweep_snapshot));
         memset(inbound_pending_syms, 0, sizeof(float) * LDPC_TOTAL_SIZE_BITS);
@@ -219,8 +298,17 @@ typedef struct RadeTextImpl
         , rx_asm_total_blocks(rhs.rx_asm_total_blocks)
         , rx_asm_delivered(rhs.rx_asm_delivered)
         , enableStats(rhs.enableStats)
+        , ldpc(HRA_56_56)
+        , rx_combine_enabled(rhs.rx_combine_enabled)
+        , rx_total_syms(rhs.rx_total_syms)
+        , rx_combine_confirm(rhs.rx_combine_confirm)
     {
         memcpy(tx_text, rhs.tx_text, sizeof(tx_text));
+        memcpy(rx_combine_acc, rhs.rx_combine_acc, sizeof(rx_combine_acc));
+        memcpy(rx_combine_idx, rhs.rx_combine_idx, sizeof(rx_combine_idx));
+        memcpy(rx_confirm_pending, rhs.rx_confirm_pending, sizeof(rx_confirm_pending));
+        memcpy(rx_confirm_fields, rhs.rx_confirm_fields, sizeof(rx_confirm_fields));
+        memcpy(rx_confirm_sym, rhs.rx_confirm_sym, sizeof(rx_confirm_sym));
         memcpy(rx_circular_buf, rhs.rx_circular_buf, sizeof(rx_circular_buf));
         memcpy(rx_sweep_snapshot, rhs.rx_sweep_snapshot, sizeof(rx_sweep_snapshot));
         memcpy(inbound_pending_syms, rhs.inbound_pending_syms, sizeof(float) * LDPC_TOTAL_SIZE_BITS);
@@ -468,7 +556,7 @@ static bool rade_text_ldpc_decode(rade_text_impl_t *obj, std::array<uint8_t, LDP
     float sigma2 = rade_text_estimate_noise_var_(window, LDPC_TOTAL_SIZE_BITS);
     if (sigma2 < 1e-6f) sigma2 = 1e-6f;
 
-    auto decodeResult = ldpc_decode(obj->inbound_pending_syms, obj->inbound_pending_amps, sigma2, MAX_CONFIDENT_ITERATIONS);
+    auto decodeResult = obj->ldpc.decode(obj->inbound_pending_syms, obj->inbound_pending_amps, sigma2, MAX_CONFIDENT_ITERATIONS);
 
     if (decodeResult.converged)
     {
@@ -628,18 +716,6 @@ static void rade_text_ingest_block_(rade_text_impl_t *obj, const RadeTextBlockFi
     }
 }
 
-// Attempts a decode of a single candidate window and, if it converges and
-// passes CRC, folds it into the reassembly (which may or may not result in
-// an RX callback -- see rade_text_ingest_block_()).
-static void rade_text_try_decode_block_and_ingest_(rade_text_impl_t *obj, float *window)
-{
-    RadeTextBlockFields fields;
-    if (rade_text_try_decode_block_(obj, window, &fields))
-    {
-        rade_text_ingest_block_(obj, fields);
-    }
-}
-
 /* Feed one streamed soft-decision symbol from the RADE decoder. */
 void rade_text_rx_symbol(rade_text_t ptr, float sym)
 {
@@ -648,6 +724,17 @@ void rade_text_rx_symbol(rade_text_t ptr, float sym)
 
     obj->rx_circular_buf[obj->rx_write_idx] = sym;
     obj->rx_write_idx = (obj->rx_write_idx + 1) % LDPC_TOTAL_SIZE_BITS;
+
+    for (int b = 0; b < RADE_TEXT_MAX_BLOCKS; b++)
+    {
+        float &acc = obj->rx_combine_acc[b][obj->rx_combine_idx[b]];
+        acc = RADE_TEXT_COMBINE_DECAY * acc + sym;
+        obj->rx_combine_idx[b] = (obj->rx_combine_idx[b] + 1) % ((b + 1) * LDPC_TOTAL_SIZE_BITS);
+    }
+    if (obj->rx_total_syms < INT_MAX)
+    {
+        obj->rx_total_syms++;
+    }
 
     // Tracks whether this call is the one that completes the buffer for
     // the first time (rx_filled reaching LDPC_TOTAL_SIZE_BITS).
@@ -740,8 +827,95 @@ void rade_text_rx_symbol(rade_text_t ptr, float sym)
         // naturally-sliding window on every new symbol, in case noise
         // caused every rotation tried during the sweep (or since) to fail
         // to converge/validate.
-        rade_text_try_decode_block_and_ingest_(obj, window);
+        RadeTextBlockFields fields;
+        bool decoded = rade_text_try_decode_block_(obj, window, &fields);
+
+        // If the raw window didn't decode, try the same window position in
+        // each combining accumulator that has enough copies. All of these
+        // windows are aligned at the same moments as the raw one, so
+        // stopping at the first success keeps it to at most one ingest per
+        // symbol (and thus one RX callback per cycle, as without
+        // combining). Shorter periods go first since they've accumulated
+        // more copies.
+        bool combinedOnly = false;
+        for (int b = 0; !decoded && obj->rx_combine_enabled && b < RADE_TEXT_MAX_BLOCKS; b++)
+        {
+            int period = (b + 1) * LDPC_TOTAL_SIZE_BITS;
+            if (obj->rx_total_syms < RADE_TEXT_COMBINE_MIN_COPIES * period)
+            {
+                break; // longer periods have even fewer copies
+            }
+
+            float combined[LDPC_TOTAL_SIZE_BITS];
+            int start = obj->rx_combine_idx[b] - LDPC_TOTAL_SIZE_BITS + period;
+            for (int index = 0; index < LDPC_TOTAL_SIZE_BITS; index++)
+            {
+                combined[index] = obj->rx_combine_acc[b][(start + index) % period];
+            }
+            decoded = rade_text_try_decode_block_(obj, combined, &fields);
+            combinedOnly = decoded;
+        }
+
+        if (decoded && combinedOnly && obj->rx_combine_confirm)
+        {
+            // Hold until the same block decodes again at the same alignment.
+            int bi = fields.blockIndex;
+            int elapsed = obj->rx_total_syms - obj->rx_confirm_sym[bi];
+            bool confirmed =
+                obj->rx_confirm_pending[bi] &&
+                elapsed > 0 && elapsed <= RADE_TEXT_COMBINE_CONFIRM_WINDOW &&
+                (elapsed % LDPC_TOTAL_SIZE_BITS) == 0 &&
+                obj->rx_confirm_fields[bi].lastBlock == fields.lastBlock &&
+                memcmp(obj->rx_confirm_fields[bi].chars, fields.chars, RADE_TEXT_CHARS_PER_BLOCK) == 0;
+
+            obj->rx_confirm_pending[bi] = !confirmed;
+            obj->rx_confirm_fields[bi] = fields;
+            obj->rx_confirm_sym[bi] = obj->rx_total_syms;
+            decoded = confirmed;
+        }
+
+        if (decoded)
+        {
+            rade_text_ingest_block_(obj, fields);
+        }
     }
+}
+
+void rade_text_rx_reset(rade_text_t ptr)
+{
+    rade_text_impl_t *obj = (rade_text_impl_t *)ptr;
+    assert(obj != NULL);
+
+    memset(obj->rx_circular_buf, 0, sizeof(obj->rx_circular_buf));
+    obj->rx_write_idx = 0;
+    obj->rx_filled = 0;
+    obj->rx_sweep_next_rot = LDPC_TOTAL_SIZE_BITS;
+    obj->rx_sweep_num_candidates = 0;
+
+    memset(obj->rx_combine_acc, 0, sizeof(obj->rx_combine_acc));
+    memset(obj->rx_combine_idx, 0, sizeof(obj->rx_combine_idx));
+    obj->rx_total_syms = 0;
+    memset(obj->rx_confirm_pending, 0, sizeof(obj->rx_confirm_pending));
+
+    memset(obj->rx_asm_received, 0, sizeof(obj->rx_asm_received));
+    obj->rx_asm_total_blocks = -1;
+    obj->rx_asm_delivered = false;
+}
+
+void rade_text_enable_rx_combine_confirm(rade_text_t ptr, int enable)
+{
+    rade_text_impl_t *obj = (rade_text_impl_t *)ptr;
+    assert(obj != NULL);
+
+    obj->rx_combine_confirm = enable != 0;
+}
+
+void rade_text_enable_rx_combining(rade_text_t ptr, int enable)
+{
+    rade_text_impl_t *obj = (rade_text_impl_t *)ptr;
+    assert(obj != NULL);
+
+    obj->rx_combine_enabled = enable != 0;
 }
 
 rade_text_t rade_text_create()
@@ -793,9 +967,9 @@ void rade_text_generate_tx_string(rade_text_t ptr, const char *str, int strlengt
         set_bits_lsb_first_(ibits.data(), RADE_TEXT_BLOCK_INDEX_BIT_OFFSET, RADE_TEXT_BLOCK_INDEX_BITS, (uint64_t)block);
         set_bits_lsb_first_(ibits.data(), RADE_TEXT_CHARS_BIT_OFFSET, RADE_TEXT_PACKED_CHAR_BITS, pack_chars_base38_(blockChars));
 
-        // ldpc_encode() is systematic ([s|p] with s == input), so the
+        // encode() is systematic ([s|p] with s == input), so the
         // returned codeword already has ibits verbatim in its first half.
-        auto totalBits = ldpc_encode(ibits);
+        auto totalBits = impl->ldpc.encode(ibits);
 
         char tmpbits[LDPC_TOTAL_SIZE_BITS];
         for (int index = 0; index < LDPC_TOTAL_SIZE_BITS; index++)

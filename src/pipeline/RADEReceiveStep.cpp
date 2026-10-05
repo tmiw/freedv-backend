@@ -284,7 +284,16 @@ short* RADEReceiveStep::execute(short* inputSamples, int numInputSamples, int* n
         sync = rade_sync(dv_);
     FREEDV_END_VERIFIED_SAFE
 
-    syncState_.store(sync, std::memory_order_release);
+    int prevSync = syncState_.exchange(sync, std::memory_order_acq_rel);
+
+    // Position within the text transmitter's cycle is lost along with sync,
+    // so previously received symbols can no longer be combined with new ones.
+    if (prevSync && !sync && textPtr_ != nullptr)
+    {
+        FREEDV_BEGIN_VERIFIED_SAFE
+            rade_text_rx_reset(textPtr_);
+        FREEDV_END_VERIFIED_SAFE
+    }
     
     // In RADEV1, SNR is only valid when in sync. It cannot be assumed
     // that the SNR remains valid when not in sync (for instance, we
