@@ -72,6 +72,22 @@ extern "C"
     /* Whether to enable output of stats (i.e. BER). */
     void rade_text_enable_stats_output(rade_text_t ptr, int enable);
 
+    /* Discard all RX state (partially received symbols, combined copies and
+       partially reassembled messages). Call when the modem loses sync, since
+       the position within the transmitter's cycle is unknown afterward. */
+    void rade_text_rx_reset(rade_text_t ptr);
+
+    /* Whether to coherently combine repeated copies of the transmitted
+       cycle to decode at lower SNR (enabled by default). */
+    void rade_text_enable_rx_combining(rade_text_t ptr, int enable);
+
+    /* Whether a decode that only receive combining produced must be
+       confirmed by a second decode of the same block at the same alignment
+       before it's delivered (disabled by default). Cancels out the extra
+       false decodes combining otherwise adds, at the cost of up to ~1 dB
+       and one more codeword (~4.5s) of latency near threshold. */
+    void rade_text_enable_rx_combine_confirm(rade_text_t ptr, int enable);
+
 #ifdef __cplusplus
 }
 #endif // __cplusplus

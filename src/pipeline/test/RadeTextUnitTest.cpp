@@ -914,6 +914,113 @@ static bool test17_multi_block_mid_cycle_join()
 }
 
 // ---------------------------------------------------------------------------
+// Test 18: Receive combining recovers a callsign below the single-copy
+// threshold.
+//
+// At sigma=1.2 (Es/N0 ~ -4.6 dB) a single codeword essentially never
+// decodes, but the transmitter repeats it continuously, so the receiver's
+// combining accumulators should build up enough SNR over several cycles to
+// recover it -- with or without the confirmation filter, which only adds
+// one codeword of latency. The same noisy symbols are fed to a receiver with
+// combining disabled for comparison (informational only -- it's expected to
+// mostly fail).
+// ---------------------------------------------------------------------------
+static bool test18_rx_combining_low_snr()
+{
+    printf("=== Test 18: receive combining below single-copy threshold ===\n");
+
+    const char* callsign = "KG6AOV";
+    const float sigma = 1.2f;
+    const int TRIALS = 6;
+    const int CYCLES = 12;
+    int combinedOk = 0, confirmedOk = 0, plainOk = 0, wrong = 0;
+
+    rade_text_t tx = rade_text_create();
+    rade_text_generate_tx_string(tx, callsign, (int)strlen(callsign));
+    auto clean = pullSymbols(tx, CODEWORD_SYMS);
+    rade_text_destroy(tx);
+
+    for (int t = 0; t < TRIALS; t++)
+    {
+        std::mt19937 rng(1800 + t);
+        std::vector<float> syms(CODEWORD_SYMS * CYCLES);
+        for (int i = 0; i < (int)syms.size(); i++)
+            syms[i] = clean[(i + 37 * t) % CODEWORD_SYMS]; // vary join point
+        addNoiseToSyms(syms, sigma, rng);
+
+        // 0 = no combining, 1 = combining, 2 = combining + confirmation filter
+        for (int combine = 0; combine <= 2; combine++)
+        {
+            rade_text_t rx = rade_text_create();
+            rade_text_enable_rx_combining(rx, combine != 0);
+            rade_text_enable_rx_combine_confirm(rx, combine == 2);
+            RxState state;
+            rade_text_set_rx_callback(rx, onTextRx, &state);
+            for (float s : syms)
+                rade_text_rx_symbol(rx, s);
+            rade_text_destroy(rx);
+
+            for (auto& r : state.allReceived)
+                if (r != callsign) wrong++;
+            if (state.received == callsign)
+                (combine == 2 ? confirmedOk : combine == 1 ? combinedOk : plainOk)++;
+        }
+    }
+
+    bool ok = combinedOk >= TRIALS - 1 && confirmedOk >= TRIALS - 1 && wrong == 0;
+    printf("  combining: %d/%d  with confirm: %d/%d  without: %d/%d  wrong decodes: %d\n",
+           combinedOk, TRIALS, confirmedOk, TRIALS, plainOk, TRIALS, wrong);
+    printf("Receive combining low SNR: %s\n\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Test 19: rade_text_rx_reset() discards everything from before the reset.
+//
+// After receiving one callsign, a reset followed by a different callsign
+// must deliver only the new one -- nothing left in the raw window,
+// combining accumulators or reassembly state may resurface the old one.
+// ---------------------------------------------------------------------------
+static bool test19_rx_reset()
+{
+    printf("=== Test 19: rx reset discards previous state ===\n");
+
+    rade_text_t txA = rade_text_create();
+    rade_text_t txB = rade_text_create();
+    rade_text_generate_tx_string(txA, "W1AW", 4);
+    rade_text_generate_tx_string(txB, "K6AQ", 4);
+    auto symsA = pullSymbols(txA, CODEWORD_SYMS * 4);
+    auto symsB = pullSymbols(txB, CODEWORD_SYMS * 4);
+    rade_text_destroy(txA);
+    rade_text_destroy(txB);
+
+    rade_text_t rx = rade_text_create();
+    RxState state;
+    rade_text_set_rx_callback(rx, onTextRx, &state);
+
+    for (float s : symsA)
+        rade_text_rx_symbol(rx, s);
+    bool gotA = state.received == "W1AW";
+
+    rade_text_rx_reset(rx);
+    state = RxState();
+
+    for (float s : symsB)
+        rade_text_rx_symbol(rx, s);
+    rade_text_destroy(rx);
+
+    bool onlyB = state.callCount > 0;
+    for (auto& r : state.allReceived)
+        if (r != "K6AQ") onlyB = false;
+
+    bool ok = gotA && onlyB;
+    printf("  before reset: '%s'  after reset: %d callbacks, all K6AQ: %s\n",
+           gotA ? "W1AW" : "(none)", state.callCount, onlyB ? "yes" : "no");
+    printf("RX reset: %s\n\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 int main()
@@ -937,6 +1044,8 @@ int main()
     success &= test15_rotated_first_shot();
     success &= test16_multi_block_compound_callsigns();
     success &= test17_multi_block_mid_cycle_join();
+    success &= test18_rx_combining_low_snr();
+    success &= test19_rx_reset();
 
     printf("=== Overall: %s ===\n", success ? "PASS" : "FAIL");
     return success ? 0 : 1;
