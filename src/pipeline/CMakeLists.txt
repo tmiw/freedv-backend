@@ -66,9 +66,12 @@ target_include_directories(RadeTextSim PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMA
 
 # Time-to-decode of rade_text callsigns through the real RADE V2 modem and a
 # simulated HF channel (not run by ctest; see test/RadeTextOtaSim.cpp).
-add_executable(RadeTextOtaSim test/RadeTextOtaSim.cpp rade_text.cpp)
+# Linked like RadeTextTest: fdv_audio_pipeline must come first, otherwise
+# configuring a clean tree fails because the rade IMPORTED target's include
+# directory doesn't exist until build_rade has run.
+add_executable(RadeTextOtaSim test/RadeTextOtaSim.cpp)
 target_compile_options(RadeTextOtaSim PRIVATE -O2)
-target_link_libraries(RadeTextOtaSim PRIVATE fdv_util rade opus)
+target_link_libraries(RadeTextOtaSim PRIVATE fdv_audio_pipeline fdv_util rade opus)
 target_include_directories(RadeTextOtaSim PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/..)
 set_target_properties(RadeTextOtaSim PROPERTIES BUILD_RPATH "${CMAKE_BUILD_RPATH};${rade_BINARY_DIR}/src")
 #endif(LINUX)
