@@ -38,6 +38,30 @@ target_link_libraries(fdv_util yyjson fdv_os_wrapper Threads::Threads)
 if(WIN32)
     target_link_libraries(fdv_util iphlpapi)
 endif(WIN32)
+
+# Some toolchains turn std::atomic operations into libatomic calls rather
+# than inline code (e.g. clang with libstdc++ leaves is_lock_free() as a call
+# when not optimizing), so link libatomic when atomics don't link without it.
+include(CheckCXXSourceCompiles)
+include(CMakePushCheckState)
+set(FDV_ATOMIC_TEST_SOURCE "
+#include <atomic>
+#include <cstdint>
+std::atomic<int> i;
+std::atomic<std::int64_t> l;
+int main() { return (i.is_lock_free() && l.is_lock_free()) ? (int)++l : 0; }")
+check_cxx_source_compiles("${FDV_ATOMIC_TEST_SOURCE}" FDV_ATOMICS_WITHOUT_LIBATOMIC)
+if(NOT FDV_ATOMICS_WITHOUT_LIBATOMIC)
+    cmake_push_check_state()
+    list(APPEND CMAKE_REQUIRED_LIBRARIES atomic)
+    check_cxx_source_compiles("${FDV_ATOMIC_TEST_SOURCE}" FDV_ATOMICS_WITH_LIBATOMIC)
+    cmake_pop_check_state()
+    if(FDV_ATOMICS_WITH_LIBATOMIC)
+        target_link_libraries(fdv_util atomic)
+    else(FDV_ATOMICS_WITH_LIBATOMIC)
+        message(WARNING "std::atomic doesn't link with or without libatomic; the build may fail")
+    endif(FDV_ATOMICS_WITH_LIBATOMIC)
+endif(NOT FDV_ATOMICS_WITHOUT_LIBATOMIC)
 if(NOT DISABLE_TLS_SUPPORT)
     target_compile_definitions(fdv_util PUBLIC ENABLE_TLS_SUPPORT)
 

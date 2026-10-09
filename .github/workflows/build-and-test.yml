@@ -92,8 +92,6 @@ jobs:
         . ./rade-venv/bin/activate
         pip install torch matplotlib
 
-    # Unoptimized, clang leaves std::atomic::is_lock_free() as a libatomic
-    # call (GCC folds it), so libatomic has to be linked.
     - name: Configure build
       run: |
         mkdir build
@@ -102,7 +100,6 @@ jobs:
           -DCMAKE_C_FLAGS="-fprofile-instr-generate -fcoverage-mapping" \
           -DCMAKE_CXX_FLAGS="-fprofile-instr-generate -fcoverage-mapping" \
           -DCMAKE_EXE_LINKER_FLAGS="-fprofile-instr-generate" \
-          -DCMAKE_CXX_STANDARD_LIBRARIES="-latomic" \
           -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
           -DRADAE_PYTHON_EXECUTABLE=${{ github.workspace }}/rade-venv/bin/python3 -DBUILD_BACKEND_UNITTESTS=1 ..
 
