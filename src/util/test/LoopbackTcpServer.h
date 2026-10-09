@@ -32,12 +32,14 @@
 class LoopbackTcpServer
 {
 public:
-    LoopbackTcpServer()
+    // Listens on 127.0.0.1, or on ::1 if family is AF_INET6 (valid() is
+    // false if the machine has no IPv6 loopback).
+    explicit LoopbackTcpServer(int family = AF_INET)
         : listenFd_(-1)
         , peerFd_(-1)
         , port_(-1)
     {
-        listenFd_ = testOpenSocket(AF_INET, SOCK_STREAM);
+        listenFd_ = testOpenSocket(family, SOCK_STREAM);
         if (listenFd_ < 0)
         {
             return;
@@ -46,14 +48,25 @@ public:
         int on = 1;
         testSetSockOpt(listenFd_, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
 
-        struct sockaddr_in addr;
+        struct sockaddr_storage addr;
+        socklen_t addrLen;
         memset(&addr, 0, sizeof(addr));
-        addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        addr.sin_port = 0;
+        if (family == AF_INET6)
+        {
+            auto addr6 = (struct sockaddr_in6*)&addr;
+            addr6->sin6_family = AF_INET6;
+            addr6->sin6_addr = in6addr_loopback;
+            addrLen = sizeof(struct sockaddr_in6);
+        }
+        else
+        {
+            auto addr4 = (struct sockaddr_in*)&addr;
+            addr4->sin_family = AF_INET;
+            addr4->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            addrLen = sizeof(struct sockaddr_in);
+        }
 
-        socklen_t addrLen = sizeof(addr);
-        if (bind(listenFd_, (struct sockaddr*)&addr, sizeof(addr)) < 0 ||
+        if (bind(listenFd_, (struct sockaddr*)&addr, addrLen) < 0 ||
             listen(listenFd_, 4) < 0 ||
             getsockname(listenFd_, (struct sockaddr*)&addr, &addrLen) < 0)
         {
@@ -61,7 +74,8 @@ public:
             listenFd_ = -1;
             return;
         }
-        port_ = ntohs(addr.sin_port);
+        port_ = ntohs(family == AF_INET6 ? ((struct sockaddr_in6*)&addr)->sin6_port
+                                         : ((struct sockaddr_in*)&addr)->sin_port);
     }
 
     ~LoopbackTcpServer()
@@ -158,9 +172,9 @@ public:
 
     // Returns an unused port: binds an ephemeral port and releases it again,
     // so a connection attempt to it is refused.
-    static int GetClosedPort()
+    static int GetClosedPort(int family = AF_INET)
     {
-        LoopbackTcpServer tmp;
+        LoopbackTcpServer tmp(family);
         return tmp.port();
     }
 

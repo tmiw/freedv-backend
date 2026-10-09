@@ -59,6 +59,7 @@ inline const bool TestWinsockInitialized = []() {
 #else
 
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>

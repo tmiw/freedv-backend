@@ -109,7 +109,9 @@ private:
     void sendImpl_(const char* buf, int length);
     void receiveImpl_();
     
-    void resolveAddresses_(int addressFamily, const char* host, const char* port, struct addrinfo** result);
+    // Virtual so unit tests can script DNS answers and timing. The result
+    // is released with freeaddrinfo().
+    virtual void resolveAddresses_(int addressFamily, const char* host, const char* port, struct addrinfo** result);
 #if defined(WIN32)
     void checkConnections_(std::vector<SOCKET>& sockets);
 #else

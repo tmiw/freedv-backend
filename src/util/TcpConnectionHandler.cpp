@@ -431,13 +431,18 @@ next_fd:
         results[whichIndex] = results[whichIndex]->ai_next;
         whichIndex = (whichIndex + 1) % 2;
 
-        // See if we got any new DNS results.
-        if (whichIndex == 0 && ipv6ResultFuture.valid())
+        // See if we got any new DNS results. Only take results that are
+        // already in: blocking on a slow lookup here would hold up trying
+        // the other family's remaining addresses (and noticing that an
+        // attempt already in flight has connected) until it finished.
+        if (whichIndex == 0 && ipv6ResultFuture.valid() &&
+            ipv6ResultFuture.wait_for(0s) == std::future_status::ready)
         {
             heads[0] = ipv6ResultFuture.get();
             results[0] = heads[0];
         }
-        if (whichIndex == 1 && ipv4ResultFuture.valid())
+        if (whichIndex == 1 && ipv4ResultFuture.valid() &&
+            ipv4ResultFuture.wait_for(0s) == std::future_status::ready)
         {
             heads[1] = ipv4ResultFuture.get();
             results[1] = heads[1];
@@ -450,11 +455,27 @@ next_fd:
             if (results[whichIndex] == nullptr && (ipv4Complete_.load(std::memory_order_relaxed) == false || ipv6Complete_.load(std::memory_order_relaxed) == false))
             {
                 // No more addresses to go through, so we *really* need to make sure
-                // we're done with DNS before exiting the loop.
+                // we're done with DNS before exiting the loop. Keep watching the
+                // attempts already in flight meanwhile: one of them may connect
+                // long before a slow lookup finishes.
                 log_info("ran out of addresses to check but DNS requests are still pending");
-                while (ipv4Complete_.load(std::memory_order_relaxed) == false || ipv6Complete_.load(std::memory_order_relaxed) == false)
+                while ((ipv4Complete_.load(std::memory_order_relaxed) == false || ipv6Complete_.load(std::memory_order_relaxed) == false) &&
+                       !cancelConnect_.load(std::memory_order_relaxed) &&
+                       socket_.load(std::memory_order_relaxed) == INVALID_SOCKET)
                 {
-                    std::this_thread::sleep_for(1ms);
+                    if (pendingSockets.empty())
+                    {
+                        std::this_thread::sleep_for(1ms);
+                    }
+                    else
+                    {
+                        checkConnections_(pendingSockets); // waits up to 250ms
+                    }
+                }
+                if (socket_.load(std::memory_order_relaxed) != INVALID_SOCKET ||
+                    cancelConnect_.load(std::memory_order_relaxed))
+                {
+                    break;
                 }
                 
                 if (ipv4ResultFuture.valid())

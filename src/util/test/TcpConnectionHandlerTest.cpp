@@ -12,6 +12,8 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 
 #include "../TcpConnectionHandler.h"
@@ -564,6 +566,234 @@ bool testConnectWhileConnected()
     result &= CHECK(conn.waitForReceived(msg.size()));
     result &= CHECK(conn.received() == msg);
     result &= CHECK(conn.disconnectCount() == 0);
+
+    return report(result);
+}
+
+// One address family's scripted DNS answer: how long the lookup takes and
+// the (numeric) addresses it returns.
+struct DnsAnswer
+{
+    std::chrono::milliseconds delay{0};
+    std::vector<std::pair<std::string, int>> addresses; // address, port
+};
+
+// Answers the handler's DNS lookups from a script instead of the network, so
+// tests can control which addresses each family returns and when.
+class ScriptedDnsConnection : public TestConnection
+{
+public:
+    ScriptedDnsConnection(DnsAnswer ipv6, DnsAnswer ipv4)
+        : ipv6_(std::move(ipv6))
+        , ipv4_(std::move(ipv4))
+    {
+    }
+
+    virtual ~ScriptedDnsConnection()
+    {
+        // Lookups run on the handler's threads until its connect attempt
+        // finishes, so finish it while the script still exists.
+        enableReconnect_.store(false, std::memory_order_relaxed);
+        disconnect().wait();
+        waitForAllTasksComplete_();
+    }
+
+private:
+    DnsAnswer ipv6_;
+    DnsAnswer ipv4_;
+
+    virtual void resolveAddresses_(int addressFamily, const char*, const char*, struct addrinfo** result) override
+    {
+        const DnsAnswer& answer = addressFamily == AF_INET6 ? ipv6_ : ipv4_;
+        std::this_thread::sleep_for(answer.delay);
+
+        // Chain one getaddrinfo() result per address, so the handler can
+        // release the list with freeaddrinfo() as usual.
+        *result = nullptr;
+        struct addrinfo** tail = result;
+        for (auto& address : answer.addresses)
+        {
+            struct addrinfo hints;
+            memset(&hints, 0, sizeof(hints));
+            hints.ai_family = addressFamily;
+            hints.ai_socktype = SOCK_STREAM;
+            hints.ai_protocol = IPPROTO_TCP;
+            hints.ai_flags = AI_NUMERICHOST;
+            std::string port = std::to_string(address.second);
+            if (getaddrinfo(address.first.c_str(), port.c_str(), &hints, tail) == 0)
+            {
+                while (*tail != nullptr)
+                {
+                    tail = &(*tail)->ai_next;
+                }
+            }
+        }
+    }
+};
+
+// Scripted hosts don't go to DNS, so the name is never looked up.
+constexpr const char* SCRIPTED_HOST = "scripted.test";
+
+// Most of these tests need an IPv6 loopback address; skip them without one.
+bool skipWithoutIpv6(LoopbackTcpServer& server6)
+{
+    if (!server6.valid())
+    {
+        std::cout << "SKIP (no IPv6 loopback)\n";
+        return true;
+    }
+    return false;
+}
+
+bool testDualStackPrefersIpv6()
+{
+    std::cout << "Test 27 (both families resolve at once: IPv6 is used): ";
+
+    LoopbackTcpServer server6(AF_INET6);
+    if (skipWithoutIpv6(server6)) return true;
+    LoopbackTcpServer server4;
+    ScriptedDnsConnection conn({0ms, {{"::1", server6.port()}}}, {0ms, {{"127.0.0.1", server4.port()}}});
+
+    bool result = CHECK(server4.valid());
+    conn.connect(SCRIPTED_HOST, 0, false);
+    result &= CHECK(server6.accept(ACCEPT_TIMEOUT_MS));
+    result &= CHECK(conn.waitForConnects(1));
+    result &= CHECK(!server4.accept(300));
+
+    return report(result);
+}
+
+bool testDualStackWaitsBrieflyForIpv6()
+{
+    std::cout << "Test 28 (IPv6 DNS answers just after IPv4: IPv6 is still used): ";
+
+    // RFC 8305 gives IPv6 a short head start (50 ms here) once IPv4 answers.
+    LoopbackTcpServer server6(AF_INET6);
+    if (skipWithoutIpv6(server6)) return true;
+    LoopbackTcpServer server4;
+    ScriptedDnsConnection conn({5ms, {{"::1", server6.port()}}}, {0ms, {{"127.0.0.1", server4.port()}}});
+
+    bool result = CHECK(server4.valid());
+    conn.connect(SCRIPTED_HOST, 0, false);
+    result &= CHECK(server6.accept(ACCEPT_TIMEOUT_MS));
+    result &= CHECK(conn.waitForConnects(1));
+    result &= CHECK(!server4.accept(300));
+
+    return report(result);
+}
+
+bool testSlowIpv6DnsDoesNotDelayIpv4()
+{
+    std::cout << "Test 29 (slow IPv6 DNS doesn't hold up an IPv4 connection): ";
+
+    LoopbackTcpServer server4;
+    ScriptedDnsConnection conn({2000ms, {}}, {0ms, {{"127.0.0.1", server4.port()}}});
+
+    bool result = CHECK(server4.valid());
+    conn.connect(SCRIPTED_HOST, 0, false);
+    result &= CHECK(server4.accept(1000));
+    result &= CHECK(conn.waitForConnects(1));
+
+    return report(result);
+}
+
+bool testSlowIpv6DnsDoesNotDelayIpv4Fallback()
+{
+    std::cout << "Test 30 (slow IPv6 DNS doesn't hold up trying the next IPv4 address): ";
+
+    // The first IPv4 address refuses the connection. The second must be
+    // tried straight away, not once the IPv6 lookup finally finishes.
+    LoopbackTcpServer server4;
+    int closedPort = LoopbackTcpServer::GetClosedPort();
+    ScriptedDnsConnection conn({2000ms, {}}, {0ms, {{"127.0.0.1", closedPort}, {"127.0.0.1", server4.port()}}});
+
+    bool result = CHECK(server4.valid());
+    conn.connect(SCRIPTED_HOST, 0, false);
+    result &= CHECK(server4.accept(1000));
+    result &= CHECK(conn.waitForConnects(1));
+
+    return report(result);
+}
+
+bool testRefusedIpv6FallsBackToIpv4()
+{
+    std::cout << "Test 31 (IPv6 address refuses the connection: IPv4 is used): ";
+
+    LoopbackTcpServer probe6(AF_INET6);
+    if (skipWithoutIpv6(probe6)) return true;
+    int closedPort6 = LoopbackTcpServer::GetClosedPort(AF_INET6);
+    LoopbackTcpServer server4;
+    ScriptedDnsConnection conn({0ms, {{"::1", closedPort6}}}, {0ms, {{"127.0.0.1", server4.port()}}});
+
+    bool result = CHECK(server4.valid());
+    conn.connect(SCRIPTED_HOST, 0, false);
+    result &= CHECK(server4.accept(ACCEPT_TIMEOUT_MS));
+    result &= CHECK(conn.waitForConnects(1));
+
+    return report(result);
+}
+
+bool testNoIpv6AnswerWaitsForIpv4()
+{
+    std::cout << "Test 32 (IPv6 DNS returns nothing: waits for the slower IPv4 answer): ";
+
+    LoopbackTcpServer server4;
+    ScriptedDnsConnection conn({0ms, {}}, {300ms, {{"127.0.0.1", server4.port()}}});
+
+    bool result = CHECK(server4.valid());
+    conn.connect(SCRIPTED_HOST, 0, false);
+    result &= CHECK(server4.accept(ACCEPT_TIMEOUT_MS));
+    result &= CHECK(conn.waitForConnects(1));
+
+    return report(result);
+}
+
+bool testNoAddressesFailsCleanly()
+{
+    std::cout << "Test 33 (neither family returns an address: the attempt ends without connecting): ";
+
+    ScriptedDnsConnection conn({0ms, {}}, {0ms, {}});
+    auto fut = conn.connect(SCRIPTED_HOST, 0, false);
+
+    bool result = CHECK(fut.wait_for(2s) == std::future_status::ready);
+    result &= CHECK(conn.connectCount() == 0);
+
+    return report(result);
+}
+
+bool testUnansweredAddressDoesNotBlockNext()
+{
+    std::cout << "Test 34 (an address that never answers doesn't stop the next one being tried): ";
+
+    // 192.0.2.1 (TEST-NET-1, RFC 5737) is never routed, so the attempt either
+    // hangs or fails at once depending on the network. Either way the next
+    // address must be tried within a moment (250 ms here), and the stalled
+    // attempt dropped once that one connects.
+    LoopbackTcpServer server4;
+    ScriptedDnsConnection conn({0ms, {}}, {0ms, {{"192.0.2.1", 9}, {"127.0.0.1", server4.port()}}});
+
+    bool result = CHECK(server4.valid());
+    conn.connect(SCRIPTED_HOST, 0, false);
+    result &= CHECK(server4.accept(2000));
+    result &= CHECK(conn.waitForConnects(1));
+
+    return report(result);
+}
+
+bool testDisconnectDuringDnsCancelsConnect()
+{
+    std::cout << "Test 35 (disconnect() during DNS lookups cancels the connection attempt): ";
+
+    LoopbackTcpServer server4;
+    ScriptedDnsConnection conn({500ms, {}}, {500ms, {{"127.0.0.1", server4.port()}}});
+
+    bool result = CHECK(server4.valid());
+    auto connectFut = conn.connect(SCRIPTED_HOST, 0, false);
+    auto disconnectFut = conn.disconnect();
+    result &= CHECK(connectFut.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
+    result &= CHECK(disconnectFut.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
+    result &= CHECK(!server4.accept(500));
+    result &= CHECK(conn.connectCount() == 0);
 
     return report(result);
 }
@@ -1283,6 +1513,15 @@ int main(int, char**)
     result &= testPlainReadFromResetPeer();
     result &= testPlainBurstToSlowReceiver();
     result &= testConnectWhileConnected();
+    result &= testDualStackPrefersIpv6();
+    result &= testDualStackWaitsBrieflyForIpv6();
+    result &= testSlowIpv6DnsDoesNotDelayIpv4();
+    result &= testSlowIpv6DnsDoesNotDelayIpv4Fallback();
+    result &= testRefusedIpv6FallsBackToIpv4();
+    result &= testNoIpv6AnswerWaitsForIpv4();
+    result &= testNoAddressesFailsCleanly();
+    result &= testUnansweredAddressDoesNotBlockNext();
+    result &= testDisconnectDuringDnsCancelsConnect();
 
     return result ? 0 : -1;
 }
