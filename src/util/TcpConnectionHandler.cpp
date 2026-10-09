@@ -820,7 +820,7 @@ void TcpConnectionHandler::sendImpl_(const char* buf, int length)
                         else
                         {
                             auto errStr = GetSSLError_();
-                            log_error("Unable to read from TLS connection: %s", errStr.c_str());
+                            log_error("Unable to write to TLS connection: %s", errStr.c_str());
                             break;
                         }
                     }

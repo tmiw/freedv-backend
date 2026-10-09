@@ -6,6 +6,7 @@
 #include <functional>
 #include <future>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -445,12 +446,16 @@ struct TestCertificate
 class TlsServerSession
 {
 public:
-    explicit TlsServerSession(TestCertificate& cert)
+    explicit TlsServerSession(TestCertificate& cert, bool tls12Only = false)
         : ctx_(SSL_CTX_new(TLS_server_method()))
         , ssl_(nullptr)
     {
         SSL_CTX_use_certificate(ctx_, cert.cert);
         SSL_CTX_use_PrivateKey(ctx_, cert.key);
+        if (tls12Only)
+        {
+            SSL_CTX_set_max_proto_version(ctx_, TLS1_2_VERSION);
+        }
     }
 
     ~TlsServerSession()
@@ -497,10 +502,41 @@ public:
         return SSL_read(ssl_, buf, sizeof(buf)) <= 0;
     }
 
+    // TLS 1.2 only: sends a HelloRequest, so the client has to start a new
+    // handshake from inside SSL_read() (i.e. reading obliges it to write).
+    // Returns false if this TLS library won't renegotiate.
+    bool startRenegotiation()
+    {
+        if (SSL_renegotiate(ssl_) != 1)
+        {
+            return false;
+        }
+        int rv = SSL_do_handshake(ssl_);
+        int err = SSL_get_error(ssl_, rv);
+        return rv == 1 || err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE;
+    }
+
+#if defined(SSL_KEY_UPDATE_REQUESTED)
+    // Asks the client to update its keys too (TLS 1.3), which it must answer
+    // with a KeyUpdate of its own -- i.e. reading obliges it to write.
+    bool requestKeyUpdate()
+    {
+        return SSL_key_update(ssl_, SSL_KEY_UPDATE_REQUESTED) == 1;
+    }
+#endif // defined(SSL_KEY_UPDATE_REQUESTED)
+
 private:
     SSL_CTX* ctx_;
     SSL* ssl_;
 };
+
+// Closes the socket with an RST instead of a FIN, so the peer's next send
+// fails outright rather than being accepted into a buffer.
+void resetConnection(int fd)
+{
+    struct linger lingerOpt = {1, 0};
+    setsockopt(fd, SOL_SOCKET, SO_LINGER, &lingerOpt, sizeof(lingerOpt));
+}
 
 void setPeerRecvTimeout(int fd, int seconds)
 {
@@ -646,6 +682,219 @@ bool testTlsHandshakeTimeout()
     return report(result);
 }
 
+// Common setup for the tests below: a verified TLS connection to a loopback
+// server whose SSL object the test drives directly.
+struct TlsFixture
+{
+    LoopbackTcpServer server;
+    TestConnection conn;
+    TlsServerSession tls;
+    bool ok = false;
+
+    explicit TlsFixture(TestCertificate& cert, bool tls12Only = false)
+        : tls(cert, tls12Only)
+    {
+        setenv("SSL_CERT_FILE", cert.path.c_str(), 1);
+        conn.connect("localhost", server.port(), false, true);
+        ok = server.valid() && server.accept(ACCEPT_TIMEOUT_MS);
+        if (ok)
+        {
+            setPeerRecvTimeout(server.peerFd(), 10);
+            ok = tls.handshake(server.peerFd()) && conn.waitForConnects(1);
+        }
+    }
+};
+
+bool testTlsSendToSlowReader(TestCertificate& cert)
+{
+    std::cout << "Test 15 (TLS send blocks on a full socket buffer, then completes): ";
+
+    // 8 MB is far more than the loopback socket buffers hold, so SSL_write()
+    // keeps returning SSL_ERROR_WANT_WRITE until the server starts reading.
+    TlsFixture f(cert);
+    bool result = CHECK(f.ok);
+
+    const std::string big = makePattern(8 * 1024 * 1024);
+    auto sendFuture = f.conn.send(big.c_str(), big.size());
+    std::this_thread::sleep_for(500ms);
+    result &= CHECK(sendFuture.wait_for(0ms) == std::future_status::timeout);
+
+    std::string got;
+    result &= CHECK(f.tls.readExact(got, big.size()));
+    result &= CHECK(got == big);
+    result &= CHECK(sendFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
+    result &= CHECK(f.conn.disconnectCount() == 0);
+
+    return report(result);
+}
+
+bool testBlockedSendAbandonedOnDisconnect(TestCertificate& cert)
+{
+    std::cout << "Test 16 (disconnect abandons a send blocked on a full buffer): ";
+
+    bool result = true;
+
+    // Plain TCP and TLS: the peer never reads, so the send can't finish; a
+    // disconnect must give up on it promptly instead of waiting forever.
+    for (bool useTls : {false, true})
+    {
+        std::unique_ptr<TlsFixture> tlsFixture;
+        LoopbackTcpServer plainServer;
+        TestConnection plainConn;
+        TestConnection* conn = &plainConn;
+        if (useTls)
+        {
+            tlsFixture = std::make_unique<TlsFixture>(cert);
+            result &= CHECK(tlsFixture->ok);
+            conn = &tlsFixture->conn;
+        }
+        else
+        {
+            plainConn.connect("127.0.0.1", plainServer.port(), false);
+            result &= CHECK(plainServer.accept(ACCEPT_TIMEOUT_MS));
+            result &= CHECK(plainConn.waitForConnects(1));
+        }
+
+        const std::string big = makePattern(8 * 1024 * 1024);
+        auto sendFuture = conn->send(big.c_str(), big.size());
+        std::this_thread::sleep_for(300ms);
+        result &= CHECK(sendFuture.wait_for(0ms) == std::future_status::timeout);
+
+        auto start = std::chrono::steady_clock::now();
+        auto disconnectFuture = conn->disconnect();
+        result &= CHECK(sendFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
+        result &= CHECK(disconnectFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
+        result &= CHECK(std::chrono::steady_clock::now() - start < 3s);
+    }
+
+    return report(result);
+}
+
+bool testTlsSendToResetPeer(TestCertificate& cert)
+{
+    std::cout << "Test 17 (TLS send to a reset connection fails and disconnects): ";
+
+    TlsFixture f(cert);
+    bool result = CHECK(f.ok);
+
+    // The server resets the connection while the client is mid-way through a
+    // large send: SSL_write() must fail (not hang) and the client must treat
+    // it as a disconnect.
+    const std::string big = makePattern(8 * 1024 * 1024);
+    auto sendFuture = f.conn.send(big.c_str(), big.size());
+    std::this_thread::sleep_for(300ms);
+    resetConnection(f.server.peerFd());
+    f.server.closePeer();
+
+    result &= CHECK(sendFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
+    result &= CHECK(f.conn.waitForDisconnects(1));
+
+    return report(result);
+}
+
+bool testTlsCorruptRecord(TestCertificate& cert)
+{
+    std::cout << "Test 18 (corrupted TLS record from the server disconnects): ";
+
+    TlsFixture f(cert);
+    bool result = CHECK(f.ok);
+
+    // A well-formed TLS 1.2+ application-data record header followed by bytes
+    // that won't decrypt, written straight to the socket behind SSL's back.
+    std::string bogus = "\x17\x03\x03";
+    bogus += (char)0x00;
+    bogus += (char)0x40;
+    bogus += std::string(0x40, '\xAA');
+    result &= CHECK(f.server.sendAll(bogus));
+
+    result &= CHECK(f.conn.waitForDisconnects(1));
+    result &= CHECK(f.conn.received().empty());
+
+    return report(result);
+}
+
+#if defined(SSL_KEY_UPDATE_REQUESTED)
+bool testTlsKeyUpdateWhileSendBlocked(TestCertificate& cert)
+{
+    std::cout << "Test 19 (TLS 1.3 key update while the client's send is blocked): ";
+
+    TlsFixture f(cert);
+    bool result = CHECK(f.ok);
+
+    // Request a key update while the client's send is stalled on a full
+    // buffer. (OpenSSL queues the client's KeyUpdate response for its next
+    // write rather than sending it from SSL_read().) Once the server drains
+    // the connection, everything must complete with data intact and the
+    // connection must keep working under the new keys.
+    const std::string big = makePattern(8 * 1024 * 1024);
+    auto sendFuture = f.conn.send(big.c_str(), big.size());
+    std::this_thread::sleep_for(300ms);
+
+    result &= CHECK(f.tls.requestKeyUpdate());
+    const std::string msg = "after key update";
+    result &= CHECK(f.tls.write(msg));
+    std::this_thread::sleep_for(300ms);
+
+    std::string got;
+    result &= CHECK(f.tls.readExact(got, big.size()));
+    result &= CHECK(got == big);
+    result &= CHECK(sendFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
+    result &= CHECK(f.conn.waitForReceived(msg.size()));
+    result &= CHECK(f.conn.received() == msg);
+
+    // The connection must still work in both directions after the update.
+    const std::string after = "still alive";
+    f.conn.send(after.c_str(), after.size());
+    result &= CHECK(f.tls.readExact(got, after.size()) && got == after);
+
+    return report(result);
+}
+
+#endif // defined(SSL_KEY_UPDATE_REQUESTED)
+
+// TLS 1.2 renegotiation while the client's send is stalled on a full buffer:
+// the stalled SSL_write() picks up the new handshake and has to wait for the
+// server's half of it (SSL_write() -> SSL_ERROR_WANT_READ) before it can
+// continue sending application data.
+bool testTlsRenegotiationWhileSendBlocked(TestCertificate& cert)
+{
+    std::cout << "Test 20 (TLS 1.2 renegotiation while the client's send is blocked): ";
+
+    TlsFixture f(cert, true);
+    bool result = CHECK(f.ok);
+
+    const std::string big = makePattern(8 * 1024 * 1024);
+    auto sendFuture = f.conn.send(big.c_str(), big.size());
+    std::this_thread::sleep_for(300ms);
+
+    if (!f.tls.startRenegotiation())
+    {
+        std::cout << "SKIP (TLS library won't renegotiate) ";
+        std::string drain;
+        f.tls.readExact(drain, big.size());
+        return report(result);
+    }
+    std::this_thread::sleep_for(300ms);
+
+    // Drain the client's data (SSL_read() on the server also completes the
+    // renegotiation handshake), then check it arrived intact.
+    std::string got;
+    result &= CHECK(f.tls.readExact(got, big.size()));
+    result &= CHECK(got == big);
+    result &= CHECK(sendFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
+
+    // And the renegotiated connection works in both directions.
+    const std::string msg = "after renegotiation";
+    result &= CHECK(f.tls.write(msg));
+    result &= CHECK(f.conn.waitForReceived(msg.size()));
+    result &= CHECK(f.conn.received() == msg);
+    f.conn.send(msg.c_str(), msg.size());
+    result &= CHECK(f.tls.readExact(got, msg.size()) && got == msg);
+    result &= CHECK(f.conn.disconnectCount() == 0);
+
+    return report(result);
+}
+
 #endif // defined(ENABLE_TLS_SUPPORT)
 
 } // namespace
@@ -681,6 +930,14 @@ int main(int, char**)
     result &= testTlsGarbageFromServer();
     result &= testTlsHandshakeCancelled();
     result &= testTlsHandshakeTimeout();
+    result &= testTlsSendToSlowReader(cert);
+    result &= testBlockedSendAbandonedOnDisconnect(cert);
+    result &= testTlsSendToResetPeer(cert);
+    result &= testTlsCorruptRecord(cert);
+#if defined(SSL_KEY_UPDATE_REQUESTED)
+    result &= testTlsKeyUpdateWhileSendBlocked(cert);
+#endif // defined(SSL_KEY_UPDATE_REQUESTED)
+    result &= testTlsRenegotiationWhileSendBlocked(cert);
 #endif // defined(ENABLE_TLS_SUPPORT)
 
     return result ? 0 : -1;
