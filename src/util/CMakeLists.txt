@@ -67,5 +67,6 @@ DefineUnitTest(ThreadedTimerTest)
 DefineUnitTest(GenericFIFOTest)
 DefineUnitTest(UlogAsyncTest)
 DefineUnitTest(TcpConnectionHandlerTest)
+DefineUnitTest(UdpHandlerTest)
 endif(BUILD_BACKEND_UNITTESTS)
 

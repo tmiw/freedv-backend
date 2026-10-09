@@ -620,6 +620,31 @@ bool testTlsHandshakeCancelled()
     return report(result);
 }
 
+bool testTlsHandshakeTimeout()
+{
+    std::cout << "Test 14 (stalled TLS handshake times out after ~10 s): ";
+
+    // As in test 13 the server never answers, but nobody calls disconnect():
+    // the client must give up on its own after TLS_HANDSHAKE_TIMEOUT (10 s)
+    // and close the socket, rather than waiting forever.
+    LoopbackTcpServer server;
+    TestConnection conn;
+
+    bool result = CHECK(server.valid());
+    auto start = std::chrono::steady_clock::now();
+    auto connectFuture = conn.connect("localhost", server.port(), false, true);
+    result &= CHECK(server.accept(ACCEPT_TIMEOUT_MS));
+
+    result &= CHECK(connectFuture.wait_for(20s) == std::future_status::ready);
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    result &= CHECK(elapsed >= 9s);
+    result &= CHECK(elapsed < 15s);
+    result &= CHECK(conn.connectCount() == 0);
+    result &= CHECK(server.waitForPeerClose(IO_TIMEOUT_MS));
+
+    return report(result);
+}
+
 #endif // defined(ENABLE_TLS_SUPPORT)
 
 } // namespace
@@ -649,6 +674,7 @@ int main(int, char**)
     result &= testTlsUntrustedCertificate(cert);
     result &= testTlsGarbageFromServer();
     result &= testTlsHandshakeCancelled();
+    result &= testTlsHandshakeTimeout();
 #endif // defined(ENABLE_TLS_SUPPORT)
 
     return result ? 0 : -1;

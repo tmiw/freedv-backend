@@ -1,8 +1,15 @@
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <ctime>
 #include <iostream>
 #include <string>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include "../pskreporter.h"
 
@@ -19,10 +26,91 @@ public:
     static void encodeTx(PskReporter& reporter, char* buf) { reporter.encodeSenderRecords_(buf); }
     static bool reportCommon(PskReporter& reporter) { return reporter.reportCommon_(); }
     static void clearRecords(PskReporter& reporter) { reporter.recordList_.clear(); }
-    static size_t recordCount(PskReporter& reporter) { return reporter.recordList_.size(); }
+    static size_t recordCount(PskReporter& reporter)
+    {
+        std::unique_lock<std::mutex> lock(reporter.recordListMutex_);
+        return reporter.recordList_.size();
+    }
+    static void setServer(PskReporter& reporter, const std::string& host, int port)
+    {
+        reporter.serverHostname_ = host;
+        reporter.serverPort_ = std::to_string(port);
+    }
 };
 
 namespace {
+
+// UDP socket on an ephemeral 127.0.0.1 port standing in for the PSK Reporter
+// server, so tests that send reports never touch the network.
+class FakePskServer
+{
+public:
+    FakePskServer()
+        : fd_(socket(AF_INET, SOCK_DGRAM, 0))
+        , port_(-1)
+    {
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        socklen_t addrLen = sizeof(addr);
+        if (fd_ >= 0 &&
+            bind(fd_, (struct sockaddr*)&addr, sizeof(addr)) == 0 &&
+            getsockname(fd_, (struct sockaddr*)&addr, &addrLen) == 0)
+        {
+            port_ = ntohs(addr.sin_port);
+        }
+    }
+
+    ~FakePskServer()
+    {
+        if (fd_ >= 0) close(fd_);
+    }
+
+    int port() const { return port_; }
+
+    // Returns the next datagram, or an empty string if none arrives in time.
+    std::string receive(int timeoutMs)
+    {
+        struct pollfd pfd = {fd_, POLLIN, 0};
+        if (poll(&pfd, 1, timeoutMs) <= 0)
+        {
+            return "";
+        }
+        char buf[65536];
+        ssize_t len = recv(fd_, buf, sizeof(buf), 0);
+        return len > 0 ? std::string(buf, len) : "";
+    }
+
+private:
+    int fd_;
+    int port_;
+};
+
+size_t countOccurrences(const std::string& haystack, const std::string& needle)
+{
+    size_t count = 0;
+    for (size_t pos = haystack.find(needle); pos != std::string::npos; pos = haystack.find(needle, pos + 1))
+    {
+        count++;
+    }
+    return count;
+}
+
+uint32_t readU32(const std::string& data, size_t offset)
+{
+    return ((uint32_t)(unsigned char)data[offset] << 24) | ((uint32_t)(unsigned char)data[offset + 1] << 16) |
+           ((uint32_t)(unsigned char)data[offset + 2] << 8) | (uint32_t)(unsigned char)data[offset + 3];
+}
+
+// Checks the IPFIX message header: version 0x000A and a length field that
+// matches the datagram.
+bool validHeader(const std::string& datagram)
+{
+    return datagram.size() > 16 &&
+           datagram[0] == 0x00 && datagram[1] == 0x0A &&
+           (size_t)(((unsigned char)datagram[2] << 8) | (unsigned char)datagram[3]) == datagram.size();
+}
 
 uint64_t readBigEndian(const char* p, int bytes)
 {
@@ -167,15 +255,20 @@ bool testReportCommonClearsPendingRecords()
 {
     std::cout << "Test 5 (reportCommon_ drains the pending record list): ";
 
+    FakePskServer server;
     PskReporter reporter("TEST1", "DM12kw", "FreeDV Test");
+    PskReporterTest::setServer(reporter, "127.0.0.1", server.port());
     reporter.addReceiveRecord("TEST2", "1600X", 14236000, 5);
     reporter.addReceiveRecord("TEST3", "1600X", 14236000, 6);
     bool result = (PskReporterTest::recordCount(reporter) == 2);
 
-    // Return value depends on network reachability of the real PSK Reporter
-    // server, so only the record-list drain is asserted here.
-    PskReporterTest::reportCommon(reporter);
+    result &= PskReporterTest::reportCommon(reporter);
     result &= (PskReporterTest::recordCount(reporter) == 0);
+
+    std::string datagram = server.receive(2000);
+    result &= validHeader(datagram);
+    result &= (countOccurrences(datagram, "TEST2") == 1);
+    result &= (countOccurrences(datagram, "TEST3") == 1);
 
     std::cout << (result ? "PASS" : "FAIL") << "\n";
     return result;
@@ -200,6 +293,91 @@ bool testAutoFlushThresholdBoundary()
     return result;
 }
 
+bool testAutoFlushAtFiftyRecords()
+{
+    std::cout << "Test 7 (50th record triggers a background flush of all 50): ";
+
+    FakePskServer server;
+    PskReporter reporter("TEST1", "DM12kw", "FreeDV Test");
+    PskReporterTest::setServer(reporter, "127.0.0.1", server.port());
+
+    bool result = (server.port() > 0);
+    for (int i = 0; i < 49; i++)
+    {
+        reporter.addReceiveRecord("AUTO1", "1600X", 14236000, 5);
+    }
+    result &= server.receive(300).empty();
+
+    reporter.addReceiveRecord("AUTO1", "1600X", 14236000, 5);
+    std::string datagram = server.receive(2000);
+    result &= validHeader(datagram);
+    result &= (countOccurrences(datagram, "AUTO1") == 50);
+    result &= (PskReporterTest::recordCount(reporter) == 0);
+
+    // Records after the flush start a new batch.
+    reporter.addReceiveRecord("AUTO2", "1600X", 14236000, 5);
+    result &= (PskReporterTest::recordCount(reporter) == 1);
+    reporter.send();
+    std::string second = server.receive(2000);
+    result &= validHeader(second);
+    result &= (countOccurrences(second, "AUTO2") == 1);
+    result &= (countOccurrences(second, "AUTO1") == 0);
+
+    // Sequence numbers advance between reports (header offset 8).
+    result &= (readU32(second, 8) == readU32(datagram, 8) + 1);
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
+bool testDestroyRightAfterAutoFlush()
+{
+    std::cout << "Test 8 (destroying the reporter waits for an in-flight flush): ";
+
+    FakePskServer server;
+    bool result = (server.port() > 0);
+
+    // Destroy the reporter immediately after the 50th record starts a
+    // background send. The send must complete (and must not touch the freed
+    // reporter), and the destructor must not report the same records again.
+    {
+        PskReporter reporter("TEST1", "DM12kw", "FreeDV Test");
+        PskReporterTest::setServer(reporter, "127.0.0.1", server.port());
+        for (int i = 0; i < 50; i++)
+        {
+            reporter.addReceiveRecord("GONE1", "1600X", 14236000, 5);
+        }
+    }
+
+    std::string datagram = server.receive(2000);
+    result &= validHeader(datagram);
+    result &= (countOccurrences(datagram, "GONE1") == 50);
+    result &= server.receive(300).empty();
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
+bool testDestructorFlushesPendingRecords()
+{
+    std::cout << "Test 9 (destructor reports records that were never sent): ";
+
+    FakePskServer server;
+    bool result = (server.port() > 0);
+    {
+        PskReporter reporter("TEST1", "DM12kw", "FreeDV Test");
+        PskReporterTest::setServer(reporter, "127.0.0.1", server.port());
+        reporter.addReceiveRecord("LAST1", "1600X", 7177000, -3);
+    }
+
+    std::string datagram = server.receive(2000);
+    result &= validHeader(datagram);
+    result &= (countOccurrences(datagram, "LAST1") == 1);
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -212,6 +390,9 @@ int main(int argc, char** argv)
     result &= testSenderRecordsEncoding();
     result &= testReportCommonClearsPendingRecords();
     result &= testAutoFlushThresholdBoundary();
+    result &= testAutoFlushAtFiftyRecords();
+    result &= testDestroyRightAfterAutoFlush();
+    result &= testDestructorFlushesPendingRecords();
 
     return result ? 0 : -1;
 }
