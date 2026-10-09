@@ -4,6 +4,7 @@
 // WebSocket (RFC 6455), engine.io v4 and socket.io v5 to drive the client.
 
 #include <chrono>
+#include <csignal>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
@@ -726,6 +727,11 @@ bool testAlternateRoles()
 
 int main(int, char**)
 {
+    // The fake servers here write to clients that may already have hung up
+    // (e.g. after rejecting a TLS certificate). Report that as a failed write
+    // rather than letting SIGPIPE kill the test.
+    signal(SIGPIPE, SIG_IGN);
+
     bool result = true;
 
     result &= testHandshakeAndInitialReport();

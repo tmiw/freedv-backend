@@ -1,4 +1,5 @@
 #include <chrono>
+#include <csignal>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
@@ -651,6 +652,11 @@ bool testTlsHandshakeTimeout()
 
 int main(int, char**)
 {
+    // The fake servers here write to clients that may already have hung up
+    // (e.g. after rejecting a TLS certificate). Report that as a failed write
+    // rather than letting SIGPIPE kill the test.
+    signal(SIGPIPE, SIG_IGN);
+
     bool result = true;
 
     result &= testConnectSendReceive();
