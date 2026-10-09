@@ -52,7 +52,11 @@ CsvReporter::CsvReporter(std::string const& filename)
 
     log_info("CsvReporter: opening log file %s", filename.c_str());
 
-    // Write header only when creating a new (empty) file.
+    // Write header only when creating a new (empty) file. Seek to the end
+    // first: right after opening in append mode, some C++ libraries (e.g. on
+    // Windows) report position 0 until the first write, even for a
+    // non-empty file.
+    file_.seekp(0, std::ios::end);
     if (file_.tellp() == 0)
     {
         file_ << "date,time,callsign,mode,frequency_hz,snr_db\n";

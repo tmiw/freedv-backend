@@ -525,8 +525,9 @@ next_fd:
                 // Set up root certificate locations. Note that on Windows,
                 // we use the Windows certificate store, so we need to manually
                 // import those root certificates. For non-Windows platforms, we
-                // query SSL_CERT_DIR/SSL_CERT_FILE from the environment and override
-                // the default paths as needed. (OpenSSL does this for us, but LibreSSL does not,
+                // use the default paths. On all platforms, we then also query
+                // SSL_CERT_DIR/SSL_CERT_FILE from the environment and add those
+                // locations as needed. (OpenSSL does this for us, but LibreSSL does not,
                 // hence the need to manually query the environment here.)
 #if defined(WIN32)
                 {
@@ -575,6 +576,7 @@ next_fd:
                     log_warn("Unable to set TLS certificate validation paths: %s", errStr.c_str());
 #endif // defined(__APPLE__) && defined(ENABLE_TLS_SUPPORT_WITH_OPENSSL)
                 }
+#endif // defined(WIN32)
 
                 auto sslCertDirEnv = getenv("SSL_CERT_DIR"); // NOLINT
                 auto sslCertFileEnv = getenv("SSL_CERT_FILE"); // NOLINT
@@ -583,8 +585,6 @@ next_fd:
                     auto errStr = GetSSLError_();
                     log_warn("Unable to set TLS certificate locations: %s", errStr.c_str());
                 }
-
-#endif // defined(WIN32)
 
                 // Force >= TLS 1.2
                 if (!SSL_CTX_set_min_proto_version(sslCtx_.load(std::memory_order_relaxed), TLS1_2_VERSION)) 
@@ -1123,10 +1123,14 @@ void TcpConnectionHandler::checkConnections_(std::vector<int>& sockets)
 #endif // defined(WIN32)
 {
     fd_set writeSet;
+    // Windows reports a failed connect (e.g. refused) in the exception set
+    // rather than the write set; elsewhere the socket becomes writable.
+    fd_set exceptSet;
     struct timeval tv = {0, 250000}; // 250ms
     int err = 0;
 
     FD_ZERO(&writeSet);
+    FD_ZERO(&exceptSet);
 #if defined(WIN32)
     SOCKET maxSocket = INVALID_SOCKET;
 #else
@@ -1135,10 +1139,13 @@ void TcpConnectionHandler::checkConnections_(std::vector<int>& sockets)
     for (auto& sock : sockets)
     {
         FD_SET(sock, &writeSet);
+#if defined(WIN32)
+        FD_SET(sock, &exceptSet);
+#endif // defined(WIN32)
         if (sock > maxSocket) maxSocket = sock;
     }
     
-    if (select(maxSocket + 1, nullptr, &writeSet, nullptr, &tv) > 0)
+    if (select(maxSocket + 1, nullptr, &writeSet, &exceptSet, &tv) > 0)
     {
         int sockErrCode = 0;
         socklen_t resultLength = sizeof(sockErrCode);
@@ -1146,13 +1153,18 @@ void TcpConnectionHandler::checkConnections_(std::vector<int>& sockets)
         std::vector<int> socketsToDelete;
         for (auto& sock : sockets)
         {
-            if (FD_ISSET(sock, &writeSet))
+            if (FD_ISSET(sock, &writeSet) || FD_ISSET(sock, &exceptSet))
             {
 #if defined(WIN32)
                 auto sockOptError = getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&sockErrCode, &resultLength);
-                if (sockOptError != 0 && WSAGetLastError() != WSAEINPROGRESS)
+                if (sockOptError != 0)
                 {
                     err = WSAGetLastError();
+                    goto socket_error;
+                }
+                else if (sockErrCode != 0)
+                {
+                    err = sockErrCode;
                     goto socket_error;
                 }
 #else
