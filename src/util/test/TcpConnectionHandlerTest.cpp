@@ -11,6 +11,7 @@
 #include <string>
 #include <thread>
 
+#include <fcntl.h>
 #include <sys/select.h>
 
 #include "../TcpConnectionHandler.h"
@@ -27,7 +28,8 @@
 using namespace std::chrono_literals;
 
 #if defined(ENABLE_TLS_SUPPORT)
-// Lets tests observe the handler's TLS state (see TcpConnectionHandler.h).
+// Lets tests observe and manipulate the handler's TLS state (see
+// TcpConnectionHandler.h).
 class TcpConnectionHandlerTest
 {
 public:
@@ -37,6 +39,31 @@ public:
         std::unique_lock<std::mutex> lk(conn.sslMutex_);
         SSL* ssl = conn.ssl_.load(std::memory_order_relaxed);
         return ssl != nullptr && SSL_want_write(ssl);
+    }
+
+    // From now on, every TLS write the client attempts reports "try again
+    // later" (as on a full socket buffer), however much room the OS has.
+    static bool blockSslWrites(TcpConnectionHandler& conn)
+    {
+        std::unique_lock<std::mutex> lk(conn.sslMutex_);
+        SSL* ssl = conn.ssl_.load(std::memory_order_relaxed);
+        if (ssl == nullptr)
+        {
+            return false;
+        }
+
+        // The socket BIO (read and write share it). A callback that fails a
+        // write before it happens leaves the BIO's ownership untouched.
+        BIO_set_callback_ex(SSL_get_rbio(ssl), [](BIO* b, int oper, const char*, size_t, int, long, int ret, size_t*) -> long {
+            if (oper == BIO_CB_WRITE)
+            {
+                BIO_clear_retry_flags(b);
+                BIO_set_retry_write(b);
+                return -1;
+            }
+            return ret;
+        });
+        return true;
     }
 };
 #endif // defined(ENABLE_TLS_SUPPORT)
@@ -533,6 +560,15 @@ public:
         return rv == 1 || err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE;
     }
 
+    // As startRenegotiation(), but returns as soon as the HelloRequest is
+    // sent instead of blocking until the client answers.
+    bool startRenegotiationNonBlocking()
+    {
+        int fd = SSL_get_fd(ssl_);
+        fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+        return startRenegotiation();
+    }
+
 #if defined(SSL_KEY_UPDATE_REQUESTED)
     // Asks the client to update its keys too (TLS 1.3), which it must answer
     // with a KeyUpdate of its own -- i.e. reading obliges it to write.
@@ -935,42 +971,28 @@ bool testTlsRenegotiationWhileSendBlocked(TestCertificate& cert)
     return report(result);
 }
 
-// TLS 1.2 renegotiation while the client's socket buffer is full but no TLS
-// write is pending: the client's SSL_read() has to send a ClientHello and
-// can't (SSL_read() -> SSL_ERROR_WANT_WRITE). A disconnect must still
-// complete promptly rather than waiting forever for the socket to drain.
+// TLS 1.2 renegotiation while the client can't write: its SSL_read() has to
+// send a ClientHello and can't (SSL_read() -> SSL_ERROR_WANT_WRITE), and the
+// socket isn't writable either. A disconnect must still complete promptly
+// rather than waiting for the socket to drain.
 bool testTlsReadWantsWriteThenDisconnect(TestCertificate& cert)
 {
     std::cout << "Test 21 (disconnect while SSL_read() waits to write): ";
 
     TlsFixture f(cert, true);
     bool result = CHECK(f.ok);
-
-    // Fill the client's send buffer with raw bytes. The server never reads
-    // them, so the stream's integrity doesn't matter for this test.
     int clientFd = findClientFd(f.server.peerFd());
     result &= CHECK(clientFd >= 0);
-    if (clientFd >= 0)
-    {
-        char junk[4096];
-        memset(junk, 0, sizeof(junk));
-        while (::send(clientFd, junk, sizeof(junk), MSG_DONTWAIT) > 0)
-        {
-            // empty
-        }
-        while (::send(clientFd, junk, 1, MSG_DONTWAIT) > 0)
-        {
-            // fill the last few bytes too
-        }
-    }
 
-    if (!f.tls.startRenegotiation())
+    // Make the client's TLS writes fail as if its socket were full, then ask
+    // it to renegotiate: SSL_read() has to send a ClientHello and can't.
+    result &= CHECK(TcpConnectionHandlerTest::blockSslWrites(f.conn));
+    if (!f.tls.startRenegotiationNonBlocking())
     {
         std::cout << "SKIP (TLS library won't renegotiate) ";
         return report(result);
     }
 
-    // Wait for the client's SSL_read() to get stuck wanting to write.
     auto waitStart = std::chrono::steady_clock::now();
     while (!TcpConnectionHandlerTest::sslWantsWrite(f.conn) && f.conn.disconnectCount() == 0 &&
            std::chrono::steady_clock::now() - waitStart < EVENT_TIMEOUT)
@@ -983,6 +1005,30 @@ bool testTlsReadWantsWriteThenDisconnect(TestCertificate& cert)
         return report(result);
     }
     result &= CHECK(TcpConnectionHandlerTest::sslWantsWrite(f.conn));
+
+    // Now really fill the client's socket buffer (with raw bytes the server
+    // never reads, so the stream's integrity doesn't matter), so its receive
+    // thread waits for the socket to become writable. Data keeps draining
+    // into the server's receive buffer for a while, which the OS may also
+    // grow, so keep topping up until nothing more fits for a few rounds.
+    if (clientFd >= 0)
+    {
+        char junk[4096];
+        memset(junk, 0, sizeof(junk));
+        for (int quietRounds = 0; quietRounds < 3;)
+        {
+            bool wroteAny = false;
+            for (int chunk : {(int)sizeof(junk), 1})
+            {
+                while (::send(clientFd, junk, chunk, MSG_DONTWAIT) > 0)
+                {
+                    wroteAny = true;
+                }
+            }
+            quietRounds = wroteAny ? 0 : quietRounds + 1;
+            std::this_thread::sleep_for(100ms);
+        }
+    }
 
     auto start = std::chrono::steady_clock::now();
     auto disconnectFuture = f.conn.disconnect();
