@@ -1,0 +1,430 @@
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <iostream>
+#include <string>
+
+#include "../FreeDVReporter.h"
+
+// Grants access to FreeDVReporter's private event handlers and state so the
+// socket.io message plumbing can be exercised without a live server. Kept at
+// namespace scope to match the friend declaration in FreeDVReporter.h.
+class FreeDVReporterTest
+{
+public:
+    static void fireNewConnection(FreeDVReporter& reporter, yyjson_val* params) { reporter.onFreeDVReporterNewConnection_(params); }
+    static void fireConnectionSuccessful(FreeDVReporter& reporter) { reporter.onFreeDVReporterConnectionSuccessful_(nullptr); }
+    static void fireRemoveConnection(FreeDVReporter& reporter, yyjson_val* params) { reporter.onFreeDVReporterRemoveConnection_(params); }
+    static void fireTxReport(FreeDVReporter& reporter, yyjson_val* params) { reporter.onFreeDVReporterTransmitReport_(params); }
+    static void fireRxReport(FreeDVReporter& reporter, yyjson_val* params) { reporter.onFreeDVReporterReceiveReport_(params); }
+    static void fireFreqChange(FreeDVReporter& reporter, yyjson_val* params) { reporter.onFreeDVReporterFrequencyChange_(params); }
+    static void fireMessageUpdate(FreeDVReporter& reporter, yyjson_val* params) { reporter.onFreeDVReporterMessageUpdate_(params); }
+    static void fireQsyRequest(FreeDVReporter& reporter, yyjson_val* params) { reporter.onFreeDVReporterQsyRequest_(params); }
+    static void fireBulkUpdate(FreeDVReporter& reporter, yyjson_val* params) { reporter.onFreeDVReporterBulkUpdate_(params); }
+
+    static uint64_t lastFrequency(const FreeDVReporter& reporter) { return reporter.lastFrequency_; }
+    static std::string mode(const FreeDVReporter& reporter) { return reporter.mode_; }
+    static bool tx(const FreeDVReporter& reporter) { return reporter.tx_; }
+    static std::string message(const FreeDVReporter& reporter) { return reporter.message_; }
+    static bool hidden(const FreeDVReporter& reporter) { return reporter.hidden_; }
+    static bool fullyConnected(const FreeDVReporter& reporter) { return reporter.isFullyConnected_.load(std::memory_order_relaxed); }
+};
+
+namespace {
+// Parses a JSON payload, hands the root value to the handler under test,
+// then frees the document. Handlers must not retain yyjson_val pointers.
+template <typename HandlerFn>
+void withParsedJson(const char* json, HandlerFn&& handler)
+{
+    yyjson_doc* doc = yyjson_read(json, strlen(json), 0);
+    if (doc == nullptr)
+    {
+        return;
+    }
+    handler(yyjson_doc_get_root(doc));
+    yyjson_doc_free(doc);
+}
+
+bool testValidForReportingGating()
+{
+    std::cout << "Test 1 (isValidForReporting gates all updates): ";
+
+    FreeDVReporter valid("localhost", "N1DQ", "CN98", "FreeDV Test", false);
+    FreeDVReporter noCallsign("localhost", "", "CN98", "FreeDV Test", false);
+    FreeDVReporter noGrid("localhost", "N1DQ", "", "FreeDV Test", false);
+
+    bool result = valid.isValidForReporting();
+    result &= !noCallsign.isValidForReporting();
+    result &= !noGrid.isValidForReporting();
+
+    // With an invalid identity, public update methods must be inert.
+    noCallsign.freqChange(14236000);
+    noCallsign.transmit("1600X", true);
+    noCallsign.updateMessage("ignored");
+    noCallsign.inAnalogMode(true);
+    result &= (FreeDVReporterTest::lastFrequency(noCallsign) == 0);
+    result &= (FreeDVReporterTest::mode(noCallsign) == "");
+    result &= (FreeDVReporterTest::message(noCallsign) == "");
+    result &= (FreeDVReporterTest::hidden(noCallsign) == false);
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
+bool testNewConnectionHandler()
+{
+    std::cout << "Test 2 (new_connection dispatch and type validation): ";
+
+    FreeDVReporter reporter("localhost", "N1DQ", "CN98", "FreeDV Test", false);
+
+    int calls = 0;
+    std::string gotSid, gotLastUpdate, gotCallsign, gotGrid, gotVersion, gotConnectTime;
+    bool gotRxOnly = false;
+    reporter.setOnUserConnectFn([&](std::string sid, std::string lastUpdate, std::string callsign,
+                                    std::string grid, std::string version, bool rxOnly, std::string connectTime) {
+        calls++;
+        gotSid = sid; gotLastUpdate = lastUpdate; gotCallsign = callsign; gotGrid = grid;
+        gotVersion = version; gotRxOnly = rxOnly; gotConnectTime = connectTime;
+    });
+
+    bool result = true;
+
+    withParsedJson(
+        R"({"sid":"abc123","last_update":"2026-10-08 12:00:00","callsign":"K6AQ",)"
+        R"("grid_square":"DM12kw","version":"1.4","rx_only":true,"connect_time":"2026-10-08 11:00:00"})",
+        [&](yyjson_val* root) { FreeDVReporterTest::fireNewConnection(reporter, root); });
+
+    result &= (calls == 1);
+    result &= (gotSid == "abc123");
+    result &= (gotLastUpdate == "2026-10-08 12:00:00");
+    result &= (gotCallsign == "K6AQ");
+    result &= (gotGrid == "DM12kw");
+    result &= (gotVersion == "1.4");
+    result &= (gotRxOnly == true);
+    result &= (gotConnectTime == "2026-10-08 11:00:00");
+
+    // Wrong type for rx_only: handler must not fire.
+    withParsedJson(
+        R"({"sid":"abc123","last_update":"u","callsign":"K6AQ","grid_square":"DM12kw",)"
+        R"("version":"1.4","rx_only":"yes","connect_time":"t"})",
+        [&](yyjson_val* root) { FreeDVReporterTest::fireNewConnection(reporter, root); });
+    result &= (calls == 1);
+
+    // Missing connect_time: handler must not fire.
+    withParsedJson(
+        R"({"sid":"abc123","last_update":"u","callsign":"K6AQ","grid_square":"DM12kw",)"
+        R"("version":"1.4","rx_only":false})",
+        [&](yyjson_val* root) { FreeDVReporterTest::fireNewConnection(reporter, root); });
+    result &= (calls == 1);
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
+bool testRemoveConnectionHandler()
+{
+    std::cout << "Test 3 (remove_connection dispatch, empty connect_time): ";
+
+    FreeDVReporter reporter("localhost", "N1DQ", "CN98", "FreeDV Test", false);
+
+    int calls = 0;
+    std::string gotConnectTime = "unset";
+    reporter.setOnUserDisconnectFn([&](std::string sid, std::string, std::string,
+                                       std::string, std::string, bool, std::string connectTime) {
+        calls++;
+        gotConnectTime = connectTime;
+    });
+
+    bool result = true;
+
+    withParsedJson(
+        R"({"sid":"abc123","last_update":"u","callsign":"K6AQ","grid_square":"DM12kw",)"
+        R"("version":"1.4","rx_only":false})",
+        [&](yyjson_val* root) { FreeDVReporterTest::fireRemoveConnection(reporter, root); });
+    result &= (calls == 1);
+    result &= (gotConnectTime == "");
+
+    // sid with the wrong type: handler must not fire.
+    withParsedJson(
+        R"({"sid":123,"last_update":"u","callsign":"K6AQ","grid_square":"DM12kw",)"
+        R"("version":"1.4","rx_only":false})",
+        [&](yyjson_val* root) { FreeDVReporterTest::fireRemoveConnection(reporter, root); });
+    result &= (calls == 1);
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
+bool testTxReportHandler()
+{
+    std::cout << "Test 4 (tx_report dispatch, null last_tx tolerated): ";
+
+    FreeDVReporter reporter("localhost", "N1DQ", "CN98", "FreeDV Test", false);
+
+    int calls = 0;
+    std::string gotMode, gotLastTx;
+    bool gotTransmitting = false;
+    reporter.setOnTransmitUpdateFn([&](std::string, std::string, std::string, std::string,
+                                       std::string mode, bool transmitting, std::string lastTx) {
+        calls++;
+        gotMode = mode; gotTransmitting = transmitting; gotLastTx = lastTx;
+    });
+
+    bool result = true;
+
+    withParsedJson(
+        R"({"sid":"s","last_update":"u","callsign":"K6AQ","grid_square":"DM12kw",)"
+        R"("mode":"1600X","transmitting":true,"last_tx":"2026-10-08 12:00:00"})",
+        [&](yyjson_val* root) { FreeDVReporterTest::fireTxReport(reporter, root); });
+    result &= (calls == 1);
+    result &= (gotMode == "1600X");
+    result &= (gotTransmitting == true);
+    result &= (gotLastTx == "2026-10-08 12:00:00");
+
+    // last_tx may legitimately be null (station has never transmitted).
+    withParsedJson(
+        R"({"sid":"s","last_update":"u","callsign":"K6AQ","grid_square":"DM12kw",)"
+        R"("mode":"1600X","transmitting":false,"last_tx":null})",
+        [&](yyjson_val* root) { FreeDVReporterTest::fireTxReport(reporter, root); });
+    result &= (calls == 2);
+    result &= (gotLastTx == "");
+    result &= (gotTransmitting == false);
+
+    // transmitting with the wrong type: handler must not fire.
+    withParsedJson(
+        R"({"sid":"s","last_update":"u","callsign":"K6AQ","grid_square":"DM12kw",)"
+        R"("mode":"1600X","transmitting":"yes","last_tx":null})",
+        [&](yyjson_val* root) { FreeDVReporterTest::fireTxReport(reporter, root); });
+    result &= (calls == 2);
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
+bool testRxReportHandler()
+{
+    std::cout << "Test 5 (rx_report dispatch, integer and float SNR): ";
+
+    FreeDVReporter reporter("localhost", "N1DQ", "CN98", "FreeDV Test", false);
+
+    int calls = 0;
+    float gotSnr = 0;
+    std::string gotReceiverCallsign, gotSenderCallsign, gotMode;
+    reporter.setOnReceiveUpdateFn([&](std::string, std::string, std::string receiverCallsign,
+                                      std::string, std::string senderCallsign, float snr, std::string mode) {
+        calls++;
+        gotReceiverCallsign = receiverCallsign; gotSenderCallsign = senderCallsign;
+        gotSnr = snr; gotMode = mode;
+    });
+
+    bool result = true;
+
+    withParsedJson(
+        R"({"sid":"s","last_update":"u","receiver_callsign":"K6AQ","receiver_grid_square":"DM12kw",)"
+        R"("callsign":"N1DQ","snr":5,"mode":"1600X"})",
+        [&](yyjson_val* root) { FreeDVReporterTest::fireRxReport(reporter, root); });
+    result &= (calls == 1);
+    result &= (gotReceiverCallsign == "K6AQ");
+    result &= (gotSenderCallsign == "N1DQ");
+    result &= (std::fabs(gotSnr - 5.0f) < 1e-6f);
+    result &= (gotMode == "1600X");
+
+    // SNR as a JSON real must also be accepted.
+    withParsedJson(
+        R"({"sid":"s","last_update":"u","receiver_callsign":"K6AQ","receiver_grid_square":"DM12kw",)"
+        R"("callsign":"N1DQ","snr":-2.5,"mode":"1600X"})",
+        [&](yyjson_val* root) { FreeDVReporterTest::fireRxReport(reporter, root); });
+    result &= (calls == 2);
+    result &= (std::fabs(gotSnr + 2.5f) < 1e-6f);
+
+    // SNR as a string: handler must not fire.
+    withParsedJson(
+        R"({"sid":"s","last_update":"u","receiver_callsign":"K6AQ","receiver_grid_square":"DM12kw",)"
+        R"("callsign":"N1DQ","snr":"5","mode":"1600X"})",
+        [&](yyjson_val* root) { FreeDVReporterTest::fireRxReport(reporter, root); });
+    result &= (calls == 2);
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
+bool testFreqChangeHandler()
+{
+    std::cout << "Test 6 (freq_change dispatch, non-uint freq rejected): ";
+
+    FreeDVReporter reporter("localhost", "N1DQ", "CN98", "FreeDV Test", false);
+
+    int calls = 0;
+    uint64_t gotFreq = 0;
+    reporter.setOnFrequencyChangeFn([&](std::string, std::string, std::string, std::string, uint64_t freq) {
+        calls++;
+        gotFreq = freq;
+    });
+
+    bool result = true;
+
+    withParsedJson(
+        R"({"sid":"s","last_update":"u","callsign":"K6AQ","grid_square":"DM12kw","freq":14236000})",
+        [&](yyjson_val* root) { FreeDVReporterTest::fireFreqChange(reporter, root); });
+    result &= (calls == 1);
+    result &= (gotFreq == 14236000ULL);
+
+    withParsedJson(
+        R"({"sid":"s","last_update":"u","callsign":"K6AQ","grid_square":"DM12kw","freq":-100})",
+        [&](yyjson_val* root) { FreeDVReporterTest::fireFreqChange(reporter, root); });
+    result &= (calls == 1);
+
+    withParsedJson(
+        R"({"sid":"s","last_update":"u","callsign":"K6AQ","grid_square":"DM12kw","freq":14236000.5})",
+        [&](yyjson_val* root) { FreeDVReporterTest::fireFreqChange(reporter, root); });
+    result &= (calls == 1);
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
+bool testMessageAndQsyHandlers()
+{
+    std::cout << "Test 7 (message_update and qsy_request dispatch): ";
+
+    FreeDVReporter reporter("localhost", "N1DQ", "CN98", "FreeDV Test", false);
+
+    int messageCalls = 0;
+    std::string gotMessage;
+    reporter.setMessageUpdateFn([&](std::string, std::string, std::string message) {
+        messageCalls++;
+        gotMessage = message;
+    });
+
+    int qsyCalls = 0;
+    std::string gotQsyCallsign, gotQsyMessage;
+    uint64_t gotQsyFreq = 0;
+    reporter.setOnQSYRequestFn([&](std::string callsign, uint64_t freq, std::string message) {
+        qsyCalls++;
+        gotQsyCallsign = callsign; gotQsyFreq = freq; gotQsyMessage = message;
+    });
+
+    bool result = true;
+
+    withParsedJson(R"({"sid":"s","last_update":"u","message":"CQ test"})",
+        [&](yyjson_val* root) { FreeDVReporterTest::fireMessageUpdate(reporter, root); });
+    result &= (messageCalls == 1);
+    result &= (gotMessage == "CQ test");
+
+    withParsedJson(R"({"sid":"s","last_update":"u","message":42})",
+        [&](yyjson_val* root) { FreeDVReporterTest::fireMessageUpdate(reporter, root); });
+    result &= (messageCalls == 1);
+
+    withParsedJson(R"({"callsign":"K6AQ","frequency":7100000,"message":"QSY please"})",
+        [&](yyjson_val* root) { FreeDVReporterTest::fireQsyRequest(reporter, root); });
+    result &= (qsyCalls == 1);
+    result &= (gotQsyCallsign == "K6AQ");
+    result &= (gotQsyFreq == 7100000ULL);
+    result &= (gotQsyMessage == "QSY please");
+
+    withParsedJson(R"({"callsign":"K6AQ","frequency":"7100000","message":"QSY please"})",
+        [&](yyjson_val* root) { FreeDVReporterTest::fireQsyRequest(reporter, root); });
+    result &= (qsyCalls == 1);
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
+bool testBulkUpdateToleratesMalformedEntries()
+{
+    std::cout << "Test 8 (bulk_update survives malformed entries and unknown events): ";
+
+    FreeDVReporter reporter("localhost", "N1DQ", "CN98", "FreeDV Test", false);
+    bool result = true;
+
+    // No event handlers are registered (connect() was never called), so every
+    // dispatch is a no-op; the point is that parsing/dispatch must not crash
+    // on non-array entries or non-string event names.
+    withParsedJson(R"([["new_connection",{"sid":"s"}], "garbage", [42], []])",
+        [&](yyjson_val* root) { FreeDVReporterTest::fireBulkUpdate(reporter, root); });
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
+bool testStateSavedBeforeConnectionAndReplayedOnSuccess()
+{
+    std::cout << "Test 9 (state saved pre-connect, connection_successful flips gate): ";
+
+    FreeDVReporter reporter("localhost", "N1DQ", "CN98", "FreeDV Test", false);
+
+    bool connectionSuccessfulCalled = false;
+    reporter.setConnectionSuccessfulFn([&]() { connectionSuccessfulCalled = true; });
+
+    bool result = !FreeDVReporterTest::fullyConnected(reporter);
+
+    // Before connecting, updates must be saved for replay but not emitted.
+    reporter.freqChange(14236000);
+    reporter.transmit("1600X", true);
+    reporter.updateMessage("CQ test");
+    result &= (FreeDVReporterTest::lastFrequency(reporter) == 14236000ULL);
+    result &= (FreeDVReporterTest::mode(reporter) == "1600X");
+    result &= (FreeDVReporterTest::tx(reporter) == true);
+    result &= (FreeDVReporterTest::message(reporter) == "CQ test");
+
+    // addReceiveRecord is gated on full connection: must be inert here.
+    reporter.addReceiveRecord("K6AQ", "1600X", 14236000, 5);
+
+    FreeDVReporterTest::fireConnectionSuccessful(reporter);
+    result &= FreeDVReporterTest::fullyConnected(reporter);
+    result &= connectionSuccessfulCalled;
+
+    // Re-report path ran through the (unguarded-by-connection) emit calls
+    // without crashing; saved state must be intact.
+    result &= (FreeDVReporterTest::lastFrequency(reporter) == 14236000ULL);
+    result &= (FreeDVReporterTest::mode(reporter) == "1600X");
+
+    // Now fully connected: addReceiveRecord takes the emit path.
+    reporter.addReceiveRecord("K6AQ", "1600X", 14236000, 5);
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
+bool testHideShowAnalogMode()
+{
+    std::cout << "Test 10 (inAnalogMode hides in analog, shows in digital): ";
+
+    FreeDVReporter reporter("localhost", "N1DQ", "CN98", "FreeDV Test", false);
+
+    bool aboutToShowSelfCalled = false;
+    reporter.setAboutToShowSelfFn([&]() { aboutToShowSelfCalled = true; });
+
+    bool result = !FreeDVReporterTest::hidden(reporter);
+
+    reporter.inAnalogMode(true);
+    result &= FreeDVReporterTest::hidden(reporter);
+    result &= !aboutToShowSelfCalled;
+
+    reporter.inAnalogMode(false);
+    result &= !FreeDVReporterTest::hidden(reporter);
+    result &= aboutToShowSelfCalled;
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
+} // namespace
+
+int main(int argc, char** argv)
+{
+    bool result = true;
+
+    result &= testValidForReportingGating();
+    result &= testNewConnectionHandler();
+    result &= testRemoveConnectionHandler();
+    result &= testTxReportHandler();
+    result &= testRxReportHandler();
+    result &= testFreqChangeHandler();
+    result &= testMessageAndQsyHandlers();
+    result &= testBulkUpdateToleratesMalformedEntries();
+    result &= testStateSavedBeforeConnectionAndReplayedOnSuccess();
+    result &= testHideShowAnalogMode();
+
+    return result ? 0 : -1;
+}

@@ -35,6 +35,7 @@
 //
 //=========================================================================
 
+#include <vector>
 #include <mutex>
 #include "IReporter.h"
 
@@ -68,6 +69,7 @@ public:
     virtual void inAnalogMode(bool) override { }
 
 private:
+    friend class PskReporterTest; // grants unit tests access to encoding helpers
     unsigned int currentSequenceNumber_;
     unsigned int randomIdentifier_;
     

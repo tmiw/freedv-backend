@@ -123,6 +123,7 @@ public:
     bool isValidForReporting();
     
 private:
+    friend class FreeDVReporterTest; // grants unit tests access to event handlers/state
     enum {
         FREEDV_REPORTER_PROTOCOL_VERSION = 2
     };
