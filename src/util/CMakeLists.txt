@@ -71,5 +71,6 @@ DefineUnitTest(UdpHandlerTest)
 DefineUnitTest(AudioSpinMutexTest)
 DefineUnitTest(UlogConfigTest)
 DefineUnitTest(ThreadedObjectTest)
+DefineUnitTest(SemaphoreTest)
 endif(BUILD_BACKEND_UNITTESTS)
 

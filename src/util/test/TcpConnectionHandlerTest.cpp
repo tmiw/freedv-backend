@@ -11,6 +11,8 @@
 #include <string>
 #include <thread>
 
+#include <sys/select.h>
+
 #include "../TcpConnectionHandler.h"
 #include "LoopbackTcpServer.h"
 
@@ -545,6 +547,29 @@ void setPeerRecvTimeout(int fd, int seconds)
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
 
+// Finds this process's client-side socket for the connection the server
+// accepted on peerFd, so a test can manipulate it behind the handler's back.
+int findClientFd(int peerFd)
+{
+    struct sockaddr_storage peer;
+    socklen_t peerLen = sizeof(peer);
+    if (getpeername(peerFd, (struct sockaddr*)&peer, &peerLen) != 0)
+    {
+        return -1;
+    }
+    for (int fd = 0; fd < FD_SETSIZE; fd++)
+    {
+        struct sockaddr_storage local;
+        socklen_t localLen = sizeof(local);
+        if (fd != peerFd && getsockname(fd, (struct sockaddr*)&local, &localLen) == 0 &&
+            localLen == peerLen && memcmp(&local, &peer, peerLen) == 0)
+        {
+            return fd;
+        }
+    }
+    return -1;
+}
+
 bool testTlsRoundTrip(TestCertificate& cert)
 {
     std::cout << "Test 10 (TLS handshake, verified certificate, data both ways): ";
@@ -895,6 +920,57 @@ bool testTlsRenegotiationWhileSendBlocked(TestCertificate& cert)
     return report(result);
 }
 
+// TLS 1.2 renegotiation while the client's socket buffer is full but no TLS
+// write is pending: the client's SSL_read() has to send a ClientHello and
+// can't (SSL_read() -> SSL_ERROR_WANT_WRITE). A disconnect must still
+// complete promptly rather than waiting forever for the socket to drain.
+bool testTlsReadWantsWriteThenDisconnect(TestCertificate& cert)
+{
+    std::cout << "Test 21 (disconnect while SSL_read() waits to write): ";
+
+    TlsFixture f(cert, true);
+    bool result = CHECK(f.ok);
+
+    // Fill the client's send buffer with raw bytes. The server never reads
+    // them, so the stream's integrity doesn't matter for this test.
+    int clientFd = findClientFd(f.server.peerFd());
+    result &= CHECK(clientFd >= 0);
+    if (clientFd >= 0)
+    {
+        char junk[4096];
+        memset(junk, 0, sizeof(junk));
+        while (::send(clientFd, junk, sizeof(junk), MSG_DONTWAIT) > 0)
+        {
+            // empty
+        }
+        while (::send(clientFd, junk, 1, MSG_DONTWAIT) > 0)
+        {
+            // fill the last few bytes too
+        }
+    }
+
+    if (!f.tls.startRenegotiation())
+    {
+        std::cout << "SKIP (TLS library won't renegotiate) ";
+        return report(result);
+    }
+    std::this_thread::sleep_for(500ms);
+
+    auto start = std::chrono::steady_clock::now();
+    auto disconnectFuture = f.conn.disconnect();
+    bool finished = disconnectFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready;
+    result &= CHECK(finished);
+    result &= CHECK(std::chrono::steady_clock::now() - start < 3s);
+    if (!finished)
+    {
+        // The handler can't be destroyed while its receive thread is stuck.
+        std::cout << "FAIL (disconnect hung)" << std::endl;
+        _exit(1);
+    }
+
+    return report(result);
+}
+
 #endif // defined(ENABLE_TLS_SUPPORT)
 
 } // namespace
@@ -938,6 +1014,7 @@ int main(int, char**)
     result &= testTlsKeyUpdateWhileSendBlocked(cert);
 #endif // defined(SSL_KEY_UPDATE_REQUESTED)
     result &= testTlsRenegotiationWhileSendBlocked(cert);
+    result &= testTlsReadWantsWriteThenDisconnect(cert);
 #endif // defined(ENABLE_TLS_SUPPORT)
 
     return result ? 0 : -1;

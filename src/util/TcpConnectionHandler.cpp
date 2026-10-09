@@ -961,11 +961,15 @@ void TcpConnectionHandler::receiveImpl_()
                         }
                         else if (sslErr == SSL_ERROR_WANT_WRITE && socket_.load(std::memory_order_relaxed) != INVALID_SOCKET)
                         {
-                            // Block until we're able to continue writing.
+                            // Wait until we're able to continue writing. Wait in
+                            // slices so that a disconnect (which clears ssl_ and
+                            // then joins this thread) isn't stuck behind a peer
+                            // that has stopped reading.
                             auto rawSock = socket_.load(std::memory_order_relaxed);
                             FD_SET(rawSock, &writeSet);
 
-                            select(socket_.load(std::memory_order_relaxed) + 1, nullptr, &writeSet, nullptr, nullptr);
+                            struct timeval tv = {0, SELECT_SLICE_US};
+                            select(rawSock + 1, nullptr, &writeSet, nullptr, &tv);
                             continue;
                         }
                         else
