@@ -781,13 +781,13 @@ void TcpConnectionHandler::sendImpl_(const char* buf, int length)
 #if defined(ENABLE_TLS_SUPPORT)
                 if (usingTLS_ && ssl_.load(std::memory_order_relaxed) != nullptr)
                 {
+                    int sslErr = SSL_ERROR_NONE;
                     while (
                         (ssl_.load(std::memory_order_relaxed) != nullptr) &&
-                        (numWritten = SSL_write(ssl_.load(std::memory_order_relaxed), buf, length)) < 0)
+                        (numWritten = sslWrite_(buf, length, sslErr)) < 0)
                     {
                         fd_set readSet;
                         FD_ZERO(&readSet);
-                        auto sslErr = SSL_get_error(ssl_.load(std::memory_order_relaxed), numWritten);
                         if (sslErr == SSL_ERROR_WANT_WRITE)
                         {
                             // Can be handled by the top level loop. Not an error.
@@ -869,6 +869,40 @@ tryAgain:
     }
 }
 
+#if defined(ENABLE_TLS_SUPPORT)
+// SSL_write()/SSL_read() run on different threads (the ThreadedObject worker and
+// receiveThread_), and an SSL object must not be used by two threads at once.
+// Hold sslMutex_ only around the non-blocking calls themselves, never across
+// select(), so neither side can stall the other.
+int TcpConnectionHandler::sslWrite_(const char* buf, int length, int& sslErr)
+{
+    std::unique_lock<std::mutex> lk(sslMutex_);
+    SSL* ssl = ssl_.load(std::memory_order_relaxed);
+    if (ssl == nullptr)
+    {
+        sslErr = SSL_ERROR_SSL;
+        return -1;
+    }
+    int rv = SSL_write(ssl, buf, length);
+    sslErr = (rv <= 0) ? SSL_get_error(ssl, rv) : SSL_ERROR_NONE;
+    return rv;
+}
+
+int TcpConnectionHandler::sslRead_(char* buf, int length, int& sslErr)
+{
+    std::unique_lock<std::mutex> lk(sslMutex_);
+    SSL* ssl = ssl_.load(std::memory_order_relaxed);
+    if (ssl == nullptr)
+    {
+        sslErr = SSL_ERROR_SSL;
+        return -1;
+    }
+    int rv = SSL_read(ssl, buf, length);
+    sslErr = (rv <= 0) ? SSL_get_error(ssl, rv) : SSL_ERROR_NONE;
+    return rv;
+}
+#endif // defined(ENABLE_TLS_SUPPORT)
+
 constexpr int READ_SIZE_BYTES = 1024;
 
 void TcpConnectionHandler::receiveImpl_()
@@ -898,12 +932,12 @@ void TcpConnectionHandler::receiveImpl_()
 #if defined(ENABLE_TLS_SUPPORT)
                 if (usingTLS_ && ssl_.load(std::memory_order_relaxed) != nullptr)
                 {
-                    numRead = SSL_read(ssl_.load(std::memory_order_relaxed), buf, READ_SIZE_BYTES);
+                    int sslErr = SSL_ERROR_NONE;
+                    numRead = sslRead_(buf, READ_SIZE_BYTES, sslErr);
                     if (numRead < 0 && ssl_.load(std::memory_order_relaxed))
                     {
                         fd_set writeSet;
                         FD_ZERO(&writeSet);
-                        auto sslErr = SSL_get_error(ssl_.load(std::memory_order_relaxed), numRead);
                         if (sslErr == SSL_ERROR_WANT_READ)
                         {
                             // This case can be handled by the top-level select()

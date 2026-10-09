@@ -30,6 +30,7 @@
 #include <vector>
 #include <future>
 #include <atomic>
+#include <mutex>
 
 #if defined(ENABLE_TLS_SUPPORT)
 #include <openssl/ssl.h>
@@ -91,6 +92,11 @@ private:
 #if defined(ENABLE_TLS_SUPPORT)
     std::atomic<SSL_CTX*> sslCtx_;
     std::atomic<SSL*> ssl_;
+    // Serializes SSL_read()/SSL_write() between receiveThread_ and the worker.
+    std::mutex sslMutex_;
+
+    int sslWrite_(const char* buf, int length, int& sslErr);
+    int sslRead_(char* buf, int length, int& sslErr);
 #endif // defined(ENABLE_TLS_SUPPORT)
 
     void connectImpl_();
