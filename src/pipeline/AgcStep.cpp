@@ -107,7 +107,9 @@ AgcStep::AgcStep(int sampleRate)
     assert(ebur128State_ != nullptr);
 
     // Pre-allocate buffers so we don't have to do so during real-time operation.
-    outputSamples_ = std::make_unique<short[]>(sampleRate);
+    // Sized for the rate we actually run at: an unsupported sampleRate falls
+    // back to 48 kHz, and callers then send audio at that rate.
+    outputSamples_ = std::make_unique<short[]>(sampleRate_);
     assert(outputSamples_ != nullptr);
 
     tmpInput_ = std::make_unique<short[]>(numSamplesPerRun_);
