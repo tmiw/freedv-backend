@@ -14,7 +14,25 @@
 #include <iostream>
 #include <string>
 
+#if defined(_WIN32)
+#include <io.h>
+#include <fcntl.h>
+#define DUP _dup
+#define DUP2 _dup2
+#define FILENO _fileno
+#define CLOSE _close
+#define READ _read
+#define LSEEK _lseek
+#else
+#include <fcntl.h>
 #include <unistd.h>
+#define DUP dup
+#define DUP2 dup2
+#define FILENO fileno
+#define CLOSE close
+#define READ read
+#define LSEEK lseek
+#endif
 
 #include "../logging/ulog.h"
 #include "../logging/ulog_async.h"
@@ -43,32 +61,39 @@ bool report(bool result)
 std::string captureStderr(const std::function<void()>& fn)
 {
     std::fflush(stderr);
+#if defined(_WIN32)
+    char path[L_tmpnam];
+    tmpnam(path);
+    int fd = _open(path, _O_CREAT | _O_RDWR | _O_BINARY, 0600);
+#else
     char path[] = "/tmp/ulog_config_test_XXXXXX";
     int fd = mkstemp(path);
+#endif
     if (fd < 0)
     {
         return "<capture failed>";
     }
-    int saved = dup(fileno(stderr));
-    dup2(fd, fileno(stderr));
+    int saved = DUP(FILENO(stderr));
+    DUP2(fd, FILENO(stderr));
 
     fn();
     ulog_async_flush();
 
     std::fflush(stderr);
-    dup2(saved, fileno(stderr));
-    close(saved);
+    DUP2(saved, FILENO(stderr));
+    CLOSE(saved);
 
-    lseek(fd, 0, SEEK_SET);
+    LSEEK(fd, 0, SEEK_SET);
     std::string out;
     char buf[4096];
-    ssize_t n;
-    while ((n = read(fd, buf, sizeof buf)) > 0)
+    for (;;)
     {
-        out.append(buf, n);
+        auto n = READ(fd, buf, sizeof buf);
+        if (n <= 0) break;
+        out.append(buf, static_cast<size_t>(n));
     }
-    close(fd);
-    unlink(path);
+    CLOSE(fd);
+    std::remove(path);
     return out;
 }
 

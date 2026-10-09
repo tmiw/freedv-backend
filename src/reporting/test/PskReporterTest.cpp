@@ -5,11 +5,7 @@
 #include <iostream>
 #include <string>
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <poll.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#include "../../util/test/TestSocketCompat.h"
 
 #include "../pskreporter.h"
 
@@ -46,7 +42,7 @@ class FakePskServer
 {
 public:
     FakePskServer()
-        : fd_(socket(AF_INET, SOCK_DGRAM, 0))
+        : fd_(testOpenSocket(AF_INET, SOCK_DGRAM))
         , port_(-1)
     {
         struct sockaddr_in addr;
@@ -64,7 +60,7 @@ public:
 
     ~FakePskServer()
     {
-        if (fd_ >= 0) close(fd_);
+        if (fd_ >= 0) testCloseSocket(fd_);
     }
 
     int port() const { return port_; }
@@ -72,8 +68,7 @@ public:
     // Returns the next datagram, or an empty string if none arrives in time.
     std::string receive(int timeoutMs)
     {
-        struct pollfd pfd = {fd_, POLLIN, 0};
-        if (poll(&pfd, 1, timeoutMs) <= 0)
+        if (!testWaitReadable(fd_, timeoutMs))
         {
             return "";
         }

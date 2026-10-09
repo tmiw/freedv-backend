@@ -24,11 +24,7 @@
 #include <cstring>
 #include <string>
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <poll.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#include "TestSocketCompat.h"
 
 // Listens on an ephemeral port on 127.0.0.1 and accepts one peer at a time.
 // All waits are bounded so a misbehaving client fails the test rather than
@@ -41,14 +37,14 @@ public:
         , peerFd_(-1)
         , port_(-1)
     {
-        listenFd_ = socket(AF_INET, SOCK_STREAM, 0);
+        listenFd_ = testOpenSocket(AF_INET, SOCK_STREAM);
         if (listenFd_ < 0)
         {
             return;
         }
 
         int on = 1;
-        setsockopt(listenFd_, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+        testSetSockOpt(listenFd_, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
 
         struct sockaddr_in addr;
         memset(&addr, 0, sizeof(addr));
@@ -61,7 +57,7 @@ public:
             listen(listenFd_, 4) < 0 ||
             getsockname(listenFd_, (struct sockaddr*)&addr, &addrLen) < 0)
         {
-            close(listenFd_);
+            testCloseSocket(listenFd_);
             listenFd_ = -1;
             return;
         }
@@ -73,7 +69,7 @@ public:
         closePeer();
         if (listenFd_ >= 0)
         {
-            close(listenFd_);
+            testCloseSocket(listenFd_);
         }
     }
 
@@ -92,7 +88,7 @@ public:
             return false;
         }
         closePeer();
-        peerFd_ = ::accept(listenFd_, nullptr, nullptr);
+        peerFd_ = testAccept(listenFd_);
         return peerFd_ >= 0;
     }
 
@@ -100,7 +96,7 @@ public:
     {
         if (peerFd_ >= 0)
         {
-            close(peerFd_);
+            testCloseSocket(peerFd_);
             peerFd_ = -1;
         }
     }
@@ -175,15 +171,7 @@ private:
 
     static bool waitReadable_(int fd, int timeoutMs)
     {
-        if (fd < 0)
-        {
-            return false;
-        }
-        struct pollfd pfd;
-        pfd.fd = fd;
-        pfd.events = POLLIN;
-        pfd.revents = 0;
-        return poll(&pfd, 1, timeoutMs) > 0;
+        return testWaitReadable(fd, timeoutMs);
     }
 };
 

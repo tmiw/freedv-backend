@@ -11,11 +11,7 @@
 #include <iostream>
 #include <string>
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <poll.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#include "TestSocketCompat.h"
 
 #include "../UdpHandler.h"
 
@@ -59,7 +55,7 @@ class Listener
 public:
     explicit Listener(int family = AF_INET)
         : family_(family)
-        , fd_(socket(family, SOCK_DGRAM, 0))
+        , fd_(testOpenSocket(family, SOCK_DGRAM))
         , port_(-1)
     {
         if (fd_ < 0)
@@ -67,7 +63,7 @@ public:
             return;
         }
         int on = 1;
-        setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+        testSetSockOpt(fd_, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
 
         struct sockaddr_storage addr;
         socklen_t addrLen = 0;
@@ -96,7 +92,7 @@ public:
 
     ~Listener()
     {
-        if (fd_ >= 0) close(fd_);
+        if (fd_ >= 0) testCloseSocket(fd_);
     }
 
     int port() const { return port_; }
@@ -109,19 +105,18 @@ public:
             memset(&req, 0, sizeof(req));
             inet_pton(AF_INET, group, &req.imr_multiaddr);
             req.imr_interface.s_addr = htonl(INADDR_ANY);
-            return setsockopt(fd_, IPPROTO_IP, IP_ADD_MEMBERSHIP, &req, sizeof(req)) == 0;
+            return testSetSockOpt(fd_, IPPROTO_IP, IP_ADD_MEMBERSHIP, &req, sizeof(req)) == 0;
         }
         struct ipv6_mreq req;
         memset(&req, 0, sizeof(req));
         inet_pton(AF_INET6, group, &req.ipv6mr_multiaddr);
         req.ipv6mr_interface = 0;
-        return setsockopt(fd_, IPPROTO_IPV6, IPV6_JOIN_GROUP, &req, sizeof(req)) == 0;
+        return testSetSockOpt(fd_, IPPROTO_IPV6, IPV6_JOIN_GROUP, &req, sizeof(req)) == 0;
     }
 
     std::string receive(int timeoutMs)
     {
-        struct pollfd pfd = {fd_, POLLIN, 0};
-        if (poll(&pfd, 1, timeoutMs) <= 0)
+        if (!testWaitReadable(fd_, timeoutMs))
         {
             return "";
         }
@@ -140,7 +135,7 @@ private:
 // environment delivers multicast back to local listeners at all.
 bool plainSend(int family, const char* host, int port, const std::string& payload)
 {
-    int fd = socket(family, SOCK_DGRAM, 0);
+    int fd = testOpenSocket(family, SOCK_DGRAM);
     if (fd < 0)
     {
         return false;
@@ -165,7 +160,7 @@ bool plainSend(int family, const char* host, int port, const std::string& payloa
         addrLen = sizeof(*in6);
     }
     bool ok = sendto(fd, payload.data(), payload.size(), 0, (struct sockaddr*)&addr, addrLen) == (ssize_t)payload.size();
-    close(fd);
+    testCloseSocket(fd);
     return ok;
 }
 

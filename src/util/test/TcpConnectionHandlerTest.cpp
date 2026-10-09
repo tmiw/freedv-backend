@@ -12,8 +12,6 @@
 #include <string>
 #include <thread>
 
-#include <fcntl.h>
-#include <sys/select.h>
 
 #include "../TcpConnectionHandler.h"
 #include "LoopbackTcpServer.h"
@@ -34,6 +32,12 @@ using namespace std::chrono_literals;
 class TcpConnectionHandlerTest
 {
 public:
+    // The client's socket, so a test can manipulate it behind the handler's back.
+    static int clientSocket(TcpConnectionHandler& conn)
+    {
+        return (int)conn.socket_.load(std::memory_order_relaxed);
+    }
+
     // True if the client's last TLS operation is waiting to write.
     static bool sslWantsWrite(TcpConnectionHandler& conn)
     {
@@ -357,9 +361,9 @@ bool testReconnectAfterRefusal()
     bool result = CHECK((fut.wait_for(EVENT_TIMEOUT) == std::future_status::ready));
     result &= CHECK((conn.connectCount() == 0));
 
-    int listenFd = socket(AF_INET, SOCK_STREAM, 0);
+    int listenFd = testOpenSocket(AF_INET, SOCK_STREAM);
     int on = 1;
-    setsockopt(listenFd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+    testSetSockOpt(listenFd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
@@ -369,7 +373,7 @@ bool testReconnectAfterRefusal()
     if (!listening)
     {
         // Another process grabbed the port in the meantime; not a client bug.
-        close(listenFd);
+        testCloseSocket(listenFd);
         std::cout << "SKIP (port reused) ";
         return report(true);
     }
@@ -377,7 +381,7 @@ bool testReconnectAfterRefusal()
     result &= CHECK(conn.waitForConnects(1, 10s));
 
     conn.disconnect().wait();
-    close(listenFd);
+    testCloseSocket(listenFd);
 
     return report(result);
 }
@@ -419,7 +423,7 @@ bool testUnresolvableHost()
 void resetConnection(int fd)
 {
     struct linger lingerOpt = {1, 0};
-    setsockopt(fd, SOL_SOCKET, SO_LINGER, &lingerOpt, sizeof(lingerOpt));
+    testSetSockOpt(fd, SOL_SOCKET, SO_LINGER, &lingerOpt, sizeof(lingerOpt));
 }
 
 bool testPlainSendToResetPeer()
@@ -592,16 +596,14 @@ struct TestCertificate
             return false;
         }
 
-        char tmpl[] = "/tmp/fdv_tcp_test_cert_XXXXXX";
-        int fd = mkstemp(tmpl);
-        if (fd < 0)
+        path = testMakeTempFile("fdvcert");
+        FILE* fp = path.empty() ? nullptr : fopen(path.c_str(), "w");
+        if (fp == nullptr)
         {
             return false;
         }
-        FILE* fp = fdopen(fd, "w");
         PEM_write_X509(fp, cert);
         fclose(fp);
-        path = tmpl;
         return true;
     }
 
@@ -609,7 +611,7 @@ struct TestCertificate
     {
         if (!path.empty())
         {
-            unlink(path.c_str());
+            std::remove(path.c_str());
         }
         X509_free(cert);
         EVP_PKEY_free(key);
@@ -695,8 +697,7 @@ public:
     // sent instead of blocking until the client answers.
     bool startRenegotiationNonBlocking()
     {
-        int fd = SSL_get_fd(ssl_);
-        fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+        testSetNonBlocking(SSL_get_fd(ssl_));
         return startRenegotiation();
     }
 
@@ -716,39 +717,15 @@ private:
 
 void setPeerRecvTimeout(int fd, int seconds)
 {
-    struct timeval tv = {seconds, 0};
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-}
-
-// Finds this process's client-side socket for the connection the server
-// accepted on peerFd, so a test can manipulate it behind the handler's back.
-int findClientFd(int peerFd)
-{
-    struct sockaddr_storage peer;
-    socklen_t peerLen = sizeof(peer);
-    if (getpeername(peerFd, (struct sockaddr*)&peer, &peerLen) != 0)
-    {
-        return -1;
-    }
-    for (int fd = 0; fd < FD_SETSIZE; fd++)
-    {
-        struct sockaddr_storage local;
-        socklen_t localLen = sizeof(local);
-        if (fd != peerFd && getsockname(fd, (struct sockaddr*)&local, &localLen) == 0 &&
-            localLen == peerLen && memcmp(&local, &peer, peerLen) == 0)
-        {
-            return fd;
-        }
-    }
-    return -1;
+    testSetRecvTimeout(fd, seconds * 1000);
+    testSetSendTimeout(fd, seconds * 1000);
 }
 
 bool testTlsRoundTrip(TestCertificate& cert)
 {
     std::cout << "Test 10 (TLS handshake, verified certificate, data both ways): ";
 
-    setenv("SSL_CERT_FILE", cert.path.c_str(), 1);
+    testSetEnv("SSL_CERT_FILE", cert.path.c_str());
 
     LoopbackTcpServer server;
     TestConnection conn;
@@ -789,10 +766,8 @@ bool testTlsUntrustedCertificate(TestCertificate& cert)
 
     // Point the client at an empty trust file so our self-signed cert fails
     // validation.
-    char tmpl[] = "/tmp/fdv_tcp_test_empty_XXXXXX";
-    int fd = mkstemp(tmpl);
-    close(fd);
-    setenv("SSL_CERT_FILE", tmpl, 1);
+    std::string emptyTrustFile = testMakeTempFile("fdvempty");
+    testSetEnv("SSL_CERT_FILE", emptyTrustFile.c_str());
 
     LoopbackTcpServer server;
     TestConnection conn;
@@ -807,8 +782,8 @@ bool testTlsUntrustedCertificate(TestCertificate& cert)
     result &= CHECK((fut.wait_for(EVENT_TIMEOUT) == std::future_status::ready));
     result &= CHECK((conn.connectCount() == 0));
 
-    unlink(tmpl);
-    setenv("SSL_CERT_FILE", cert.path.c_str(), 1);
+    std::remove(emptyTrustFile.c_str());
+    testSetEnv("SSL_CERT_FILE", cert.path.c_str());
 
     return report(result);
 }
@@ -893,7 +868,7 @@ struct TlsFixture
     explicit TlsFixture(TestCertificate& cert, bool tls12Only = false)
         : tls(cert, tls12Only)
     {
-        setenv("SSL_CERT_FILE", cert.path.c_str(), 1);
+        testSetEnv("SSL_CERT_FILE", cert.path.c_str());
         conn.connect("localhost", server.port(), false, true);
         ok = server.valid() && server.accept(ACCEPT_TIMEOUT_MS);
         if (ok)
@@ -1104,7 +1079,7 @@ bool testTlsReadWantsWriteThenDisconnect(TestCertificate& cert)
 
     TlsFixture f(cert, true);
     bool result = CHECK(f.ok);
-    int clientFd = findClientFd(f.server.peerFd());
+    int clientFd = TcpConnectionHandlerTest::clientSocket(f.conn);
     result &= CHECK(clientFd >= 0);
 
     // Make the client's TLS writes fail as if its socket were full, then ask
@@ -1143,7 +1118,8 @@ bool testTlsReadWantsWriteThenDisconnect(TestCertificate& cert)
             bool wroteAny = false;
             for (int chunk : {(int)sizeof(junk), 1})
             {
-                while (::send(clientFd, junk, chunk, MSG_DONTWAIT) > 0)
+                // The handler's socket is non-blocking, so this stops when full.
+                while (::send(clientFd, junk, chunk, 0) > 0)
                 {
                     wroteAny = true;
                 }
@@ -1232,7 +1208,9 @@ int main(int, char**)
     // The fake servers here write to clients that may already have hung up
     // (e.g. after rejecting a TLS certificate). Report that as a failed write
     // rather than letting SIGPIPE kill the test.
+#if !defined(_WIN32)
     signal(SIGPIPE, SIG_IGN);
+#endif // !defined(_WIN32)
 
     bool result = true;
 

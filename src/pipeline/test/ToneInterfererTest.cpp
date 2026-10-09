@@ -8,6 +8,10 @@
 #include "ToneInterfererStep.h"
 #include "PipelineTestCommon.h"
 
+#ifndef M_PI // not defined by every C library (e.g. on Windows)
+#define M_PI 3.14159265358979323846
+#endif
+
 namespace {
 
 std::atomic<float> g_phase(0);

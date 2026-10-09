@@ -4,11 +4,7 @@
 #include <iostream>
 #include <string>
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <unistd.h>
+#include "../../util/test/TestSocketCompat.h"
 
 #include "../UdpReporter.h"
 #include "../../3rdparty/yyjson/yyjson.h"
@@ -20,7 +16,7 @@ namespace {
 // writes the chosen port to outPort (-1 on failure).
 int makeLoopbackReceiver(int& outPort)
 {
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    int fd = testOpenSocket(AF_INET, SOCK_DGRAM);
     if (fd < 0)
     {
         return -1;
@@ -34,23 +30,20 @@ int makeLoopbackReceiver(int& outPort)
 
     if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0)
     {
-        close(fd);
+        testCloseSocket(fd);
         return -1;
     }
 
     socklen_t addrLen = sizeof(addr);
     if (getsockname(fd, (struct sockaddr*)&addr, &addrLen) < 0)
     {
-        close(fd);
+        testCloseSocket(fd);
         return -1;
     }
     outPort = ntohs(addr.sin_port);
 
     // Never block forever if a datagram is unexpectedly missing.
-    struct timeval timeout;
-    timeout.tv_sec = 2;
-    timeout.tv_usec = 0;
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    testSetRecvTimeout(fd, 2000);
 
     return fd;
 }
@@ -134,7 +127,7 @@ bool testReceiveRecordProducesValidJson()
             reporter.addReceiveRecord("N1DQ", "1600X", 14236000, -5);
             result &= receiveAndValidateRecord(fd, "N1DQ", "1600X", -5, 14236000ULL);
         }
-        close(fd);
+        testCloseSocket(fd);
     }
 
     std::cout << (result ? "PASS" : "FAIL") << "\n";
@@ -162,7 +155,7 @@ bool testNonRecordMethodsSendNothing()
             ssize_t len = recv(fd, buf, sizeof(buf), 0); // SO_RCVTIMEO bounds the wait
             result &= (len < 0) && (errno == EAGAIN || errno == EWOULDBLOCK);
         }
-        close(fd);
+        testCloseSocket(fd);
     }
 
     std::cout << (result ? "PASS" : "FAIL") << "\n";
@@ -185,7 +178,7 @@ bool testRecordFrequencyFollowsArgumentNotFreqChange()
             reporter.addReceiveRecord("K6AQ", "8PSK1250", 7074000, 12);
             result &= receiveAndValidateRecord(fd, "K6AQ", "8PSK1250", 12, 7074000ULL);
         }
-        close(fd);
+        testCloseSocket(fd);
     }
 
     std::cout << (result ? "PASS" : "FAIL") << "\n";

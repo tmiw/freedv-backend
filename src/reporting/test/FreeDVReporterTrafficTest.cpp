@@ -730,7 +730,9 @@ int main(int, char**)
     // The fake servers here write to clients that may already have hung up
     // (e.g. after rejecting a TLS certificate). Report that as a failed write
     // rather than letting SIGPIPE kill the test.
+#if !defined(_WIN32)
     signal(SIGPIPE, SIG_IGN);
+#endif // !defined(_WIN32)
 
     bool result = true;
 

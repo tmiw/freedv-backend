@@ -73,7 +73,11 @@ target_link_libraries(RadeStepResetTest PRIVATE rade opus samplerate)
 set(RADAE_PYTHON_EXECUTABLE "" CACHE STRING
     "Python3 interpreter (with numpy/torch) for MinimalTxRxThreadTest. Auto-detected if empty.")
 
-if(NOT RADAE_PYTHON_EXECUTABLE)
+if(CMAKE_CROSSCOMPILING)
+    # The test runs Python on the build host against the test's output, so it
+    # can only run where it's built.
+    set(RADAE_PYTHON_EXECUTABLE "")
+elseif(NOT RADAE_PYTHON_EXECUTABLE)
     # Try the system Python3 first
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_FOUND)
@@ -87,7 +91,7 @@ if(NOT RADAE_PYTHON_EXECUTABLE)
     endif()
 endif()
 
-if(NOT RADAE_PYTHON_EXECUTABLE)
+if(NOT RADAE_PYTHON_EXECUTABLE AND NOT CMAKE_CROSSCOMPILING)
     # Fall back to common virtual-environment locations
     foreach(_PY_CANDIDATE
         "$ENV{HOME}/radae/radae-venv/bin/python3"
