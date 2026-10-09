@@ -26,8 +26,7 @@
 
 using namespace std::chrono_literals;
 
-#if defined(ENABLE_TLS_SUPPORT)
-// Lets tests observe and manipulate the handler's TLS state (see
+// Lets tests observe and manipulate the handler's socket and TLS state (see
 // TcpConnectionHandler.h).
 class TcpConnectionHandlerTest
 {
@@ -38,6 +37,7 @@ public:
         return (int)conn.socket_.load(std::memory_order_relaxed);
     }
 
+#if defined(ENABLE_TLS_SUPPORT)
     // True if the client's last TLS operation is waiting to write.
     static bool sslWantsWrite(TcpConnectionHandler& conn)
     {
@@ -70,8 +70,8 @@ public:
         });
         return true;
     }
-};
 #endif // defined(ENABLE_TLS_SUPPORT)
+};
 
 namespace {
 
@@ -434,6 +434,16 @@ void resetConnection(int fd)
     testSetSockOpt(fd, SOL_SOCKET, SO_LINGER, &lingerOpt, sizeof(lingerOpt));
 }
 
+// Gives the client's send buffer and the server's receive buffer small fixed
+// sizes, so a large send to a server that isn't reading really stalls.
+// (Otherwise Windows buffers tens of MB on loopback.)
+void pinSmallBuffers(TestConnection& conn, LoopbackTcpServer& server)
+{
+    int size = 64 * 1024;
+    testSetSockOpt(TcpConnectionHandlerTest::clientSocket(conn), SOL_SOCKET, SO_SNDBUF, &size, sizeof(size));
+    testSetSockOpt(server.peerFd(), SOL_SOCKET, SO_RCVBUF, &size, sizeof(size));
+}
+
 bool testPlainSendToResetPeer()
 {
     std::cout << "Test 22 (plain send to a reset connection fails and disconnects): ";
@@ -445,6 +455,7 @@ bool testPlainSendToResetPeer()
     conn.connect("127.0.0.1", server.port(), false);
     result &= CHECK(server.accept(ACCEPT_TIMEOUT_MS));
     result &= CHECK(conn.waitForConnects(1));
+    pinSmallBuffers(conn, server);
 
     // The server resets the connection while the client is mid-way through
     // a send it can't finish (nobody reads): write() must fail, not hang,
@@ -935,6 +946,7 @@ bool testBlockedSendAbandonedOnDisconnect(TestCertificate& cert)
             plainConn.connect("127.0.0.1", plainServer.port(), false);
             result &= CHECK(plainServer.accept(ACCEPT_TIMEOUT_MS));
             result &= CHECK(plainConn.waitForConnects(1));
+            pinSmallBuffers(plainConn, plainServer);
         }
 
         const std::string big = makePattern(STALLED_SEND_BYTES);
