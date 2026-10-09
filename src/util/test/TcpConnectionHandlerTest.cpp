@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -435,13 +436,23 @@ void resetConnection(int fd)
 }
 
 // Starts a send that can't complete because the server isn't reading, and
-// returns its future. Sends `data` twice: Windows accepts any single send in
-// full while the data it has queued is under SO_SNDBUF, so there only the
-// second send stalls. (Elsewhere the first does, and the second waits.)
+// returns its future. How much the OS buffers on loopback varies a lot
+// (Windows took well over 128 MB), so keep sending `data` until a send is
+// still pending after 300 ms, up to about 1 GB in all. On Linux and macOS the
+// first send stalls.
 std::future<void> startStalledSend(TestConnection& conn, const std::string& data)
 {
-    conn.send(data.c_str(), data.size());
-    return conn.send(data.c_str(), data.size());
+    const size_t maxSends = std::max<size_t>(1, (1024u * 1024 * 1024) / data.size());
+    std::future<void> sendFuture;
+    for (size_t i = 0; i < maxSends; i++)
+    {
+        sendFuture = conn.send(data.c_str(), data.size());
+        if (sendFuture.wait_for(300ms) == std::future_status::timeout)
+        {
+            break;
+        }
+    }
+    return sendFuture;
 }
 
 bool testPlainSendToResetPeer()
