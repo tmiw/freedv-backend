@@ -266,12 +266,16 @@ void TcpConnectionHandler::connectImpl_()
         results[1] = heads[1];
     }
 
+    // Choose based on the results we've actually collected rather than the
+    // ipv*Complete_ flags: the resolver threads set those *after* publishing
+    // their result, so a result we've already collected can still have its
+    // flag reading false here.
     int whichIndex = 0;
-    if (ipv6Complete_.load(std::memory_order_relaxed) == true && results[0] != nullptr)
+    if (results[0] != nullptr)
     {
         log_info("starting with IPv6 connection");
     }
-    else if (ipv4Complete_.load(std::memory_order_relaxed) == true && results[1] != nullptr)
+    else if (results[1] != nullptr)
     {
         log_info("starting with IPv4 connection");
         whichIndex = 1;
@@ -286,6 +290,11 @@ void TcpConnectionHandler::connectImpl_()
     
     while (!cancelConnect_.load(std::memory_order_relaxed) && (results[0] || results[1]))
     {
+        // At least one list is non-empty; make sure we're on one of those.
+        if (results[whichIndex] == nullptr)
+        {
+            whichIndex = (whichIndex + 1) % 2;
+        }
         struct addrinfo* current = results[whichIndex];
         int ret = 0;
 #if defined(WIN32)
