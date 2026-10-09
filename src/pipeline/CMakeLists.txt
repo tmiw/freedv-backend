@@ -46,6 +46,7 @@ DefineUnitTest(EitherOrTest)
 DefineUnitTest(LevelAdjustTest)
 DefineUnitTest(ResampleTest)
 DefineUnitTest(TapTest)
+DefineUnitTest(PipelineResetTest)
 
 DefineUnitTest(ldpc_decode)
 DefineUnitTest(ldpc_encode)
