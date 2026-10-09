@@ -66,5 +66,6 @@ endmacro()
 DefineUnitTest(ThreadedTimerTest)
 DefineUnitTest(GenericFIFOTest)
 DefineUnitTest(UlogAsyncTest)
+DefineUnitTest(TcpConnectionHandlerTest)
 endif(BUILD_BACKEND_UNITTESTS)
 
