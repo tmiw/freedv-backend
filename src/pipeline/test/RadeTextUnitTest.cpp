@@ -36,8 +36,10 @@
 //==========================================================================
 
 #include "../rade_text.h"
+#include "../ldpc_encode.h"
 #include "../../util/logging/ulog.h"
 
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstdio>
@@ -676,6 +678,163 @@ static void test14_noise_sweep_diagnostic()
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Reference framer: builds the on-air symbols for an arbitrary 8-bit CRC and
+// eight 6-bit character codes, independently of rade_text, so tests can
+// send frames the encoder never would (a wrong CRC, undefined codes).
+// Format: [CRC (8 bits, LSB first) | 8 x 6-bit codes (LSB first)] ->
+// LDPC(112,56) -> interleave (b = 37 over 56 symbols) -> QPSK.
+// ---------------------------------------------------------------------------
+static unsigned char referenceCrc8(const unsigned char* codes, int count)
+{
+    unsigned char crc = 0;
+    for (int i = 0; i < count && codes[i] != 0; i++) {
+        crc ^= codes[i];
+        for (int bit = 0; bit < 8; bit++)
+            crc = (crc & 0x80) ? (unsigned char)((crc << 1) ^ 0x1D) : (unsigned char)(crc << 1);
+    }
+    return crc;
+}
+
+static void referenceFrame(unsigned char crc, const unsigned char codes[8], float* syms, int nfloats)
+{
+    std::array<uint8_t, 56> info{};
+    for (int i = 0; i < 8; i++)
+        info[i] = (crc >> i) & 1;
+    for (int i = 0; i < 48; i++)
+        info[8 + i] = (codes[i / 6] >> (i % 6)) & 1;
+    auto codeword = ldpc_encode(info);
+
+    char interleaved[PAYLOAD_FLOATS];
+    for (int i = 0; i < PAYLOAD_SYMBOLS; i++) {
+        int to = (37 * i) % PAYLOAD_SYMBOLS;
+        interleaved[2 * to] = codeword[2 * i];
+        interleaved[2 * to + 1] = codeword[2 * i + 1];
+    }
+
+    for (int i = 0; i < PAYLOAD_SYMBOLS; i++) {
+        int bits = (interleaved[2 * i] << 1) | interleaved[2 * i + 1];
+        static const float map[4][2] = {{1, 0}, {0, 1}, {0, -1}, {-1, 0}};
+        syms[2 * i] = map[bits][0];
+        syms[2 * i + 1] = map[bits][1];
+    }
+    // Known filler after the payload, as the transmitter sends.
+    for (int i = PAYLOAD_FLOATS; i < nfloats; i++)
+        syms[i] = i % 2 ? 0 : 1;
+}
+
+// 6-bit code for a callsign character (A-Z, 0-9 here).
+static unsigned char otaCode(char c)
+{
+    return (c >= '0' && c <= '9') ? (unsigned char)(c - '0' + 10) : (unsigned char)(c - 'A' + 20);
+}
+
+static RxState receiveFrame(const float* syms)
+{
+    float copy[TOTAL_FLOATS];
+    memcpy(copy, syms, sizeof(copy));
+    rade_text_t rx = rade_text_create();
+    RxState state;
+    rade_text_set_rx_callback(rx, onTextRx, &state);
+    rade_text_rx(rx, copy, TOTAL_SYMS);
+    rade_text_destroy(rx);
+    return state;
+}
+
+// ---------------------------------------------------------------------------
+// Test 15: the encoder's on-air format matches the reference framer, so
+//          changes that would break decoding by other FreeDV versions show up
+// ---------------------------------------------------------------------------
+static bool test15_on_air_format()
+{
+    printf("=== Test 15: on-air format matches the reference framer ===\n");
+
+    unsigned char codes[8] = {otaCode('K'), otaCode('6'), otaCode('A'), otaCode('Q')};
+    float expected[TOTAL_FLOATS];
+    referenceFrame(referenceCrc8(codes, 8), codes, expected, TOTAL_FLOATS);
+
+    rade_text_t tx = rade_text_create();
+    float syms[TOTAL_FLOATS];
+    memset(syms, 0, sizeof(syms));
+    rade_text_generate_tx_string(tx, "K6AQ", 4, syms, TOTAL_FLOATS);
+    rade_text_destroy(tx);
+
+    bool ok = memcmp(syms, expected, sizeof(syms)) == 0;
+    RxState state = receiveFrame(expected);
+    ok &= state.callCount == 1 && state.received == "K6AQ";
+
+    printf("On-air format: %s\n\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Test 16: a frame that decodes cleanly but whose CRC doesn't match its text
+//          (as when noise turns it into a different valid codeword) is
+//          dropped rather than shown as a callsign
+// ---------------------------------------------------------------------------
+static bool test16_valid_codeword_bad_crc_rejected()
+{
+    printf("=== Test 16: valid codeword with a wrong CRC is rejected ===\n");
+
+    unsigned char codes[8] = {otaCode('K'), otaCode('6'), otaCode('A'), otaCode('Q')};
+    unsigned char crc = referenceCrc8(codes, 8);
+    bool ok = true;
+    for (int bit = 0; bit < 8; bit++) {
+        float syms[TOTAL_FLOATS];
+        referenceFrame(crc ^ (1 << bit), codes, syms, TOTAL_FLOATS);
+        RxState state = receiveFrame(syms);
+        if (state.callCount != 0) {
+            printf("  FAIL: CRC bit %d flipped, got '%s'\n", bit, state.received.c_str());
+            ok = false;
+        }
+    }
+
+    printf("Wrong CRC rejected: %s\n\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Test 17: undefined 6-bit codes (47 = space, which the encoder never sends,
+//          and 48-63) in an otherwise valid frame are left out of the text
+// ---------------------------------------------------------------------------
+static bool test17_undefined_codes_dropped()
+{
+    printf("=== Test 17: undefined character codes are dropped on receive ===\n");
+
+    unsigned char codes[8] = {otaCode('K'), 47, otaCode('6'), 48, otaCode('A'), 63, otaCode('Q'), 0};
+    float syms[TOTAL_FLOATS];
+    referenceFrame(referenceCrc8(codes, 8), codes, syms, TOTAL_FLOATS);
+    RxState state = receiveFrame(syms);
+
+    bool ok = state.callCount == 1 && state.received == "K6AQ";
+    printf("Received '%s' (%d callbacks)\n", state.received.c_str(), state.callCount);
+    printf("Undefined codes dropped: %s\n\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Test 18: characters outside the 6-bit set are skipped when encoding, and
+//          the rest of the callsign still gets through
+// ---------------------------------------------------------------------------
+static bool test18_unencodable_characters_skipped()
+{
+    printf("=== Test 18: characters outside the character set are skipped ===\n");
+
+    // ' ', '!', '#', '_', '~' and '@' have no 6-bit code.
+    const char* input = "K6 !#_~@";
+    rade_text_t tx = rade_text_create();
+    float syms[TOTAL_FLOATS];
+    memset(syms, 0, sizeof(syms));
+    rade_text_generate_tx_string(tx, input, (int)strlen(input), syms, TOTAL_FLOATS);
+    rade_text_destroy(tx);
+    RxState state = receiveFrame(syms);
+
+    bool ok = state.callCount == 1 && state.received == "K6";
+    printf("Received '%s' (%d callbacks)\n", state.received.c_str(), state.callCount);
+    printf("Unencodable characters skipped: %s\n\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 int main()
 {
     bool success = true;
@@ -694,6 +853,10 @@ int main()
     success &= test12_sigma07_no_false_positive();
     success &= test13_high_noise_no_false_positive();
     test14_noise_sweep_diagnostic();   // informational, not in success
+    success &= test15_on_air_format();
+    success &= test16_valid_codeword_bad_crc_rejected();
+    success &= test17_undefined_codes_dropped();
+    success &= test18_unencodable_characters_skipped();
 
     printf("=== Overall: %s ===\n", success ? "PASS" : "FAIL");
     return success ? 0 : 1;
