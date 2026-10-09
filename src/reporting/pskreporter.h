@@ -37,6 +37,8 @@
 
 #include <vector>
 #include <mutex>
+#include <string>
+#include <thread>
 #include "IReporter.h"
 
 struct SenderRecord
@@ -78,6 +80,15 @@ private:
     std::string decodingSoftware_;
     std::vector<SenderRecord> recordList_;
     std::mutex recordListMutex_;
+
+    // Where reports are sent (the live server unless a test overrides it).
+    std::string serverHostname_;
+    std::string serverPort_;
+
+    // Background send started by send(); joined before starting another and
+    // on destruction so it never outlives this object.
+    std::thread sendThread_;
+    std::mutex sendThreadMutex_;
     
     int getRxDataSize_();    
     int getTxDataSize_();    
