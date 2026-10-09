@@ -404,6 +404,68 @@ bool testUnresolvableHost()
     return report(result);
 }
 
+// Closes the socket with an RST instead of a FIN, so the peer's next send
+// or read fails outright rather than being accepted into a buffer or
+// reported as an orderly EOF.
+void resetConnection(int fd)
+{
+    struct linger lingerOpt = {1, 0};
+    setsockopt(fd, SOL_SOCKET, SO_LINGER, &lingerOpt, sizeof(lingerOpt));
+}
+
+bool testPlainSendToResetPeer()
+{
+    std::cout << "Test 22 (plain send to a reset connection fails and disconnects): ";
+
+    LoopbackTcpServer server;
+    TestConnection conn;
+
+    bool result = CHECK(server.valid());
+    conn.connect("127.0.0.1", server.port(), false);
+    result &= CHECK(server.accept(ACCEPT_TIMEOUT_MS));
+    result &= CHECK(conn.waitForConnects(1));
+
+    // The server resets the connection while the client is mid-way through
+    // a send it can't finish (nobody reads): write() must fail, not hang,
+    // and the client must treat it as a disconnect.
+    const std::string big = makePattern(8 * 1024 * 1024);
+    auto sendFuture = conn.send(big.c_str(), big.size());
+    std::this_thread::sleep_for(300ms);
+    result &= CHECK(sendFuture.wait_for(0ms) == std::future_status::timeout);
+    resetConnection(server.peerFd());
+    server.closePeer();
+
+    result &= CHECK(sendFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
+    result &= CHECK(conn.waitForDisconnects(1));
+    result &= CHECK(conn.disconnectCount() == 1);
+
+    return report(result);
+}
+
+bool testPlainReadFromResetPeer()
+{
+    std::cout << "Test 23 (reset of an idle plain connection fails the read and disconnects): ";
+
+    LoopbackTcpServer server;
+    TestConnection conn;
+
+    bool result = CHECK(server.valid());
+    conn.connect("127.0.0.1", server.port(), false);
+    result &= CHECK(server.accept(ACCEPT_TIMEOUT_MS));
+    result &= CHECK(conn.waitForConnects(1));
+
+    // An RST rather than a FIN: read() fails (ECONNRESET) instead of
+    // returning 0, which takes the read-error path rather than EOF.
+    resetConnection(server.peerFd());
+    server.closePeer();
+
+    result &= CHECK(conn.waitForDisconnects(1));
+    result &= CHECK(conn.disconnectCount() == 1);
+    result &= CHECK(conn.received().empty());
+
+    return report(result);
+}
+
 #if defined(ENABLE_TLS_SUPPORT)
 
 // Self-signed certificate for "localhost", generated at runtime so the test
@@ -582,14 +644,6 @@ private:
     SSL_CTX* ctx_;
     SSL* ssl_;
 };
-
-// Closes the socket with an RST instead of a FIN, so the peer's next send
-// fails outright rather than being accepted into a buffer.
-void resetConnection(int fd)
-{
-    struct linger lingerOpt = {1, 0};
-    setsockopt(fd, SOL_SOCKET, SO_LINGER, &lingerOpt, sizeof(lingerOpt));
-}
 
 void setPeerRecvTimeout(int fd, int seconds)
 {
@@ -1045,6 +1099,50 @@ bool testTlsReadWantsWriteThenDisconnect(TestCertificate& cert)
     return report(result);
 }
 
+// TLS 1.2 renegotiation the server never completes: the client sends its
+// ClientHello and waits for the server's reply, so its next SSL_write() has
+// to wait to read (SSL_write() -> SSL_ERROR_WANT_READ). A disconnect must
+// abandon that send promptly.
+bool testTlsSendWaitingToReadAbandonedOnDisconnect(TestCertificate& cert)
+{
+    std::cout << "Test 24 (disconnect abandons a send waiting on a stalled renegotiation): ";
+
+    TlsFixture f(cert, true);
+    bool result = CHECK(f.ok);
+
+    if (!f.tls.startRenegotiationNonBlocking())
+    {
+        std::cout << "SKIP (TLS library won't renegotiate) ";
+        return report(result);
+    }
+    std::this_thread::sleep_for(300ms);
+    if (f.conn.disconnectCount() > 0)
+    {
+        std::cout << "SKIP (client refused to renegotiate) ";
+        return report(result);
+    }
+
+    const std::string msg = "stuck behind the handshake";
+    auto sendFuture = f.conn.send(msg.c_str(), msg.size());
+    std::this_thread::sleep_for(300ms);
+    result &= CHECK(sendFuture.wait_for(0ms) == std::future_status::timeout);
+
+    auto start = std::chrono::steady_clock::now();
+    auto disconnectFuture = f.conn.disconnect();
+    bool finished = sendFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready &&
+                    disconnectFuture.wait_for(EVENT_TIMEOUT) == std::future_status::ready;
+    result &= CHECK(finished);
+    result &= CHECK(std::chrono::steady_clock::now() - start < 3s);
+    if (!finished)
+    {
+        // The handler can't be destroyed while its send is stuck.
+        std::cout << "FAIL (send never abandoned)" << std::endl;
+        _exit(1);
+    }
+
+    return report(result);
+}
+
 #endif // defined(ENABLE_TLS_SUPPORT)
 
 } // namespace
@@ -1089,7 +1187,12 @@ int main(int, char**)
 #endif // defined(SSL_KEY_UPDATE_REQUESTED)
     result &= testTlsRenegotiationWhileSendBlocked(cert);
     result &= testTlsReadWantsWriteThenDisconnect(cert);
+    result &= testTlsSendWaitingToReadAbandonedOnDisconnect(cert);
 #endif // defined(ENABLE_TLS_SUPPORT)
+
+    // Numbered after the TLS tests, which were written first.
+    result &= testPlainSendToResetPeer();
+    result &= testPlainReadFromResetPeer();
 
     return result ? 0 : -1;
 }
