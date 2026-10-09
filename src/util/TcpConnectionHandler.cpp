@@ -907,7 +907,13 @@ void TcpConnectionHandler::receiveImpl_()
                         if (sslErr == SSL_ERROR_WANT_READ)
                         {
                             // This case can be handled by the top-level select()
-                            // loop. Not an error.
+                            // loop. Not an error. If we already read data on this
+                            // pass (e.g. it was an exact multiple of READ_SIZE_BYTES),
+                            // dispatch it now rather than waiting for more to arrive.
+                            if (numHaveRead > 0)
+                            {
+                                break;
+                            }
                             goto tryAgain;
                         }
                         else if (sslErr == SSL_ERROR_WANT_WRITE && socket_.load(std::memory_order_relaxed) != INVALID_SOCKET)
