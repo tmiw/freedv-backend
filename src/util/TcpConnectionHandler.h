@@ -65,6 +65,8 @@ protected:
     virtual void onReceive_(char* buf, int length) = 0;
     
 private:
+    friend class TcpConnectionHandlerTest; // grants unit tests access to TLS state
+
     std::thread receiveThread_;
     ThreadedTimer reconnectTimer_;
     // socket_ / ssl_ / sslCtx_ are accessed with relaxed ordering. They are only

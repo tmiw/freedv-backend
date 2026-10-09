@@ -26,6 +26,21 @@
 
 using namespace std::chrono_literals;
 
+#if defined(ENABLE_TLS_SUPPORT)
+// Lets tests observe the handler's TLS state (see TcpConnectionHandler.h).
+class TcpConnectionHandlerTest
+{
+public:
+    // True if the client's last TLS operation is waiting to write.
+    static bool sslWantsWrite(TcpConnectionHandler& conn)
+    {
+        std::unique_lock<std::mutex> lk(conn.sslMutex_);
+        SSL* ssl = conn.ssl_.load(std::memory_order_relaxed);
+        return ssl != nullptr && SSL_want_write(ssl);
+    }
+};
+#endif // defined(ENABLE_TLS_SUPPORT)
+
 namespace {
 
 // Evaluates a test condition, printing the failing expression and line so a
@@ -954,7 +969,20 @@ bool testTlsReadWantsWriteThenDisconnect(TestCertificate& cert)
         std::cout << "SKIP (TLS library won't renegotiate) ";
         return report(result);
     }
-    std::this_thread::sleep_for(500ms);
+
+    // Wait for the client's SSL_read() to get stuck wanting to write.
+    auto waitStart = std::chrono::steady_clock::now();
+    while (!TcpConnectionHandlerTest::sslWantsWrite(f.conn) && f.conn.disconnectCount() == 0 &&
+           std::chrono::steady_clock::now() - waitStart < EVENT_TIMEOUT)
+    {
+        std::this_thread::sleep_for(10ms);
+    }
+    if (f.conn.disconnectCount() > 0)
+    {
+        std::cout << "SKIP (client refused to renegotiate) ";
+        return report(result);
+    }
+    result &= CHECK(TcpConnectionHandlerTest::sslWantsWrite(f.conn));
 
     auto start = std::chrono::steady_clock::now();
     auto disconnectFuture = f.conn.disconnect();
