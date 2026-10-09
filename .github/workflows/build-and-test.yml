@@ -14,6 +14,14 @@ jobs:
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
         is-univ-build: [true, false]
         is-windows-build: [true, false]
+        use-static-libressl: [false]
+        include:
+        # freedv-gui's macOS release build uses a static LibreSSL rather than
+        # OpenSSL, so run the TLS code against it too.
+        - os: macos-15
+          is-univ-build: false
+          is-windows-build: false
+          use-static-libressl: true
         exclude:
         - os: ubuntu-24.04
           is-univ-build: true
@@ -61,7 +69,7 @@ jobs:
       run: |
         mkdir build
         cd build
-        cmake -DRADAE_PYTHON_EXECUTABLE=${{ github.workspace }}/rade-venv/bin/python3 -DBUILD_BACKEND_UNITTESTS=1 ..
+        cmake -DRADAE_PYTHON_EXECUTABLE=${{ github.workspace }}/rade-venv/bin/python3 -DBUILD_BACKEND_UNITTESTS=1 ${{ matrix.use-static-libressl && '-DUSE_STATIC_LIBRESSL=1' || '' }} ..
 
     - name: Configure build (macOS universal)
       if: ${{ matrix.is-univ-build == true }}
