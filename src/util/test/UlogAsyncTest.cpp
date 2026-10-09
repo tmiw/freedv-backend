@@ -11,6 +11,9 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdarg>
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <functional>
@@ -276,6 +279,176 @@ bool testMultiProducerInvariants()
     return result;
 }
 
+// Logs fmt both through ulog (deferred formatting on the consumer thread) and
+// through snprintf() directly, and records what snprintf() produced so the
+// test can check ulog rendered the same text. The <> markers keep one case
+// from matching inside another.
+#define LOG_LIKE_PRINTF(expected, fmt, ...)                         \
+    do                                                              \
+    {                                                               \
+        char e_[512];                                               \
+        std::snprintf(e_, sizeof e_, "<" fmt ">", __VA_ARGS__);     \
+        (expected).push_back(e_);                                   \
+        log_info("<" fmt ">", __VA_ARGS__);                         \
+    } while (0)
+
+bool testMatchesPrintf()
+{
+    std::cout << "Test 6 (every supported conversion renders like printf): ";
+
+    std::vector<std::string> expected;
+    std::string out = captureStderr([&]() {
+        std::thread rt([&]() {
+            LOG_LIKE_PRINTF(expected, "100%% of %d%%", 7);
+            LOG_LIKE_PRINTF(expected, "c=%c|%-3c|%3c", 'x', 'y', 'z');
+            LOG_LIKE_PRINTF(expected, "p=%p", reinterpret_cast<void*>(0x1234));
+            LOG_LIKE_PRINTF(expected, "hh=%hhd h=%hd hhu=%hhu hu=%hu", 300, 70000, 300, 70000);
+            LOG_LIKE_PRINTF(expected, "hhneg=%hhd hneg=%hd hhx=%hhx hx=%hx", -129, -32769, -1, -1);
+            LOG_LIKE_PRINTF(expected, "j=%jd z=%zd t=%td", static_cast<intmax_t>(-5),
+                            static_cast<std::ptrdiff_t>(-6), static_cast<std::ptrdiff_t>(-7));
+            LOG_LIKE_PRINTF(expected, "lu=%lu llu=%llu ju=%ju zu=%zu tx=%tx", 1UL, 2ULL,
+                            static_cast<uintmax_t>(3), static_cast<size_t>(4),
+                            static_cast<std::ptrdiff_t>(255));
+            LOG_LIKE_PRINTF(expected, "ld=%ld lld=%lld neg", -8L, -9LL);
+            LOG_LIKE_PRINTF(expected, "o=%o x=%x X=%X #x=%#x", 8u, 255u, 255u, 255u);
+            LOG_LIKE_PRINTF(expected, "flags=%+d|% d|%05d|%-5d|", 3, 3, 3, 3);
+            LOG_LIKE_PRINTF(expected, "e=%e g=%g a=%a 5.1f=%5.1f", 1.5, 0.0001, 1.0, 3.14159);
+            LOG_LIKE_PRINTF(expected, "Lf=%Lf", 2.5L);
+            LOG_LIKE_PRINTF(expected, "s=%.3s|%10s|%-10s|", "abcdef", "hi", "hi");
+        });
+        rt.join();
+        ulog_async_flush();
+    });
+
+    bool result = true;
+    for (auto const& e : expected)
+    {
+        if (!contains(out, e))
+        {
+            std::cout << "\n    missing: " << e;
+            result = false;
+        }
+    }
+    std::cout << (result ? "" : "\n    ") << (result ? "PASS" : "FAIL") << "\n";
+    if (!result) std::cout << "---\n" << out << "---\n";
+    return result;
+}
+
+bool testUnsupportedConversions()
+{
+    std::cout << "Test 7 (unsupported conversions render as <?> and flag truncation): ";
+
+    // None of these may reach a real printf: %n would write through the
+    // pointer, and %* / %.* / positional / wide conversions can't be
+    // reproduced from the captured arguments. Everything from the first
+    // unsupported conversion on renders as <?>.
+    int n = 0;
+    std::string out = captureStderr([&]() {
+        std::thread rt([&]() {
+            log_info("n: a=%d %n b=%d", 1, &n, 2);
+            log_info("star: %*d|%d", 5, 3, 4);
+            log_info("dotstar: %.*f", 2, 1.5);
+            log_info("positional: %1$d", 6);
+            log_info("wide: %ls %lc", L"w", static_cast<wint_t>(L'w'));
+            log_info("unknown: %y");
+            log_info("trailing %");
+            log_info("trailing lenmod %l");
+        });
+        rt.join();
+        ulog_async_flush();
+    });
+
+    bool result = contains(out, "n: a=1 <?> b=<?> [ulog_async: truncated]");
+    result &= (n == 0);
+    result &= contains(out, "star: <?>|<?> [ulog_async: truncated]");
+    result &= contains(out, "dotstar: <?> [ulog_async: truncated]");
+    result &= contains(out, "positional: <?> [ulog_async: truncated]");
+    result &= contains(out, "wide: <?> <?> [ulog_async: truncated]");
+    result &= contains(out, "unknown: <?> [ulog_async: truncated]");
+    result &= contains(out, "trailing <?> [ulog_async: truncated]");
+    result &= contains(out, "trailing lenmod <?> [ulog_async: truncated]");
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    if (!result) std::cout << "---\n" << out << "---\n";
+    return result;
+}
+
+bool testOverflow()
+{
+    std::cout << "Test 8 (argument, message and spec overflow are truncated safely): ";
+
+    // Three 160-byte strings need more argument space than a record has: the
+    // third is dropped and the record flagged, but the rest still renders.
+    static const std::string a(160, 'a'), b(160, 'b'), c(160, 'c');
+
+    // A message longer than the render buffer (512) is cut at 511 characters.
+    static const std::string longFmt = std::string(600, 'x') + "%d";
+
+    std::string out = captureStderr([&]() {
+        std::thread rt([&]() {
+            log_info("args: %s|%s|%s|end", a.c_str(), b.c_str(), c.c_str());
+            log_info(longFmt.c_str(), 1);
+            // Flags/width longer than ulog copies (24 chars): the value still
+            // comes out, just without the full width.
+            log_info("prefix: [%0000000000000000000000000007d]", 42);
+        });
+        rt.join();
+        ulog_async_flush();
+    });
+
+    bool result = contains(out, "args: " + a + "|" + b + "||end [ulog_async: truncated]");
+    result &= !contains(out, std::string(10, 'c'));
+    result &= contains(out, std::string(511, 'x'));
+    result &= !contains(out, std::string(512, 'x'));
+    result &= contains(out, "prefix: [") && contains(out, "42]");
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    if (!result) std::cout << "---\n" << out.substr(0, 2000) << "\n---\n";
+    return result;
+}
+
+void enqueueDirect(const char* fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    ulog_async_enqueue(LOG_INFO, __FILE__, __LINE__, fmt, ap);
+    va_end(ap);
+}
+
+bool testLifecycleEdges()
+{
+    std::cout << "Test 9 (start/stop/flush are idempotent; enqueue while stopped counts a drop): ";
+
+    bool result = true;
+    std::string out = captureStderr([&]() {
+        // Already running: a second start is a no-op and logging still works.
+        ulog_async_start();
+        log_info("after double start %d", 1);
+        ulog_async_flush();
+
+        ulog_async_stop();
+        ulog_async_stop(); // no-op
+        ulog_async_flush(); // no-op while stopped; must not hang
+
+        // Enqueueing directly while stopped can't be delivered: it's counted.
+        unsigned long before = ulog_async_dropped_count();
+        enqueueDirect("never delivered %d", 2);
+        result &= (ulog_async_dropped_count() == before + 1);
+
+        ulog_async_start();
+        log_info("after restart %d", 3);
+        ulog_async_flush();
+    });
+
+    result &= contains(out, "after double start 1");
+    result &= !contains(out, "never delivered");
+    result &= contains(out, "after restart 3");
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    if (!result) std::cout << "---\n" << out << "---\n";
+    return result;
+}
+
 } // namespace
 
 int main()
@@ -287,6 +460,10 @@ int main()
     result &= testNullAndLongString();
     result &= testSynchronousFallbackWhenStopped();
     result &= testMultiProducerInvariants();
+    result &= testMatchesPrintf();
+    result &= testUnsupportedConversions();
+    result &= testOverflow();
+    result &= testLifecycleEdges();
 
     return result ? 0 : -1;
 }

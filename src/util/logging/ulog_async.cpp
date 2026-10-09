@@ -239,6 +239,22 @@ struct Spec
     char    prefix[kSpecPrefixMax + 1]; // flags/width/precision, NUL-terminated
 };
 
+// For a spec we can't reproduce, finds the end of the whole conversion
+// (flags, width, precision, '*', '$', length modifier and the conversion
+// character), so none of it leaks into the output as literal text.
+std::size_t unsupportedSpecLen(const char* start, const char* p) FREEDV_NONBLOCKING
+{
+    while (*p != '\0' && std::strchr("0123456789.*$-+ #hljztL", *p) != nullptr)
+    {
+        ++p;
+    }
+    if (*p != '\0')
+    {
+        ++p; // conversion character
+    }
+    return static_cast<std::size_t>(p - start);
+}
+
 // p points at a '%'. Fills out; returns nothing (out.kind == AK_UNSUPPORTED on
 // anything we cannot safely reproduce later).
 void parseSpec(const char* p, Spec& out) FREEDV_NONBLOCKING
@@ -269,12 +285,19 @@ void parseSpec(const char* p, Spec& out) FREEDV_NONBLOCKING
     if (*p == '*')
     {
         out.kind = AK_UNSUPPORTED;
-        out.totalLen = static_cast<std::size_t>(p - start) + 1;
+        out.totalLen = unsupportedSpecLen(start, p);
         return;
     }
     while (*p >= '0' && *p <= '9')
     {
         ++p;
+    }
+    if (*p == '$')
+    {
+        // positional argument
+        out.kind = AK_UNSUPPORTED;
+        out.totalLen = unsupportedSpecLen(start, p);
+        return;
     }
 
     // precision
@@ -284,7 +307,7 @@ void parseSpec(const char* p, Spec& out) FREEDV_NONBLOCKING
         if (*p == '*')
         {
             out.kind = AK_UNSUPPORTED;
-            out.totalLen = static_cast<std::size_t>(p - start) + 1;
+            out.totalLen = unsupportedSpecLen(start, p);
             return;
         }
         while (*p >= '0' && *p <= '9')
@@ -432,6 +455,9 @@ void serializeArgs(const char* fmt, va_list ap, Record& rec) FREEDV_NONBLOCKING
                     case LM_j:  v = static_cast<long long>(va_arg(ap, intmax_t)); break;
                     case LM_z:  v = static_cast<long long>(va_arg(ap, std::size_t)); break;
                     case LM_t:  v = static_cast<long long>(va_arg(ap, std::ptrdiff_t)); break;
+                    // As printf does, narrow h/hh arguments (passed as int).
+                    case LM_hh: v = static_cast<signed char>(va_arg(ap, int)); break;
+                    case LM_h:  v = static_cast<short>(va_arg(ap, int)); break;
                     default:    v = static_cast<long long>(va_arg(ap, int)); break;
                 }
                 ok = w.put(&v, sizeof v);
@@ -447,6 +473,8 @@ void serializeArgs(const char* fmt, va_list ap, Record& rec) FREEDV_NONBLOCKING
                     case LM_j:  v = static_cast<unsigned long long>(va_arg(ap, uintmax_t)); break;
                     case LM_z:  v = static_cast<unsigned long long>(va_arg(ap, std::size_t)); break;
                     case LM_t:  v = static_cast<unsigned long long>(va_arg(ap, std::size_t)); break;
+                    case LM_hh: v = static_cast<unsigned char>(va_arg(ap, unsigned int)); break;
+                    case LM_h:  v = static_cast<unsigned short>(va_arg(ap, unsigned int)); break;
                     default:    v = static_cast<unsigned long long>(va_arg(ap, unsigned int)); break;
                 }
                 ok = w.put(&v, sizeof v);
