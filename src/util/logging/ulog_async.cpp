@@ -695,6 +695,13 @@ void renderMessage(const Record& rec, char* out, std::size_t cap)
                 break;
         }
 
+        if (argsExhausted)
+        {
+            // This argument didn't fit in the record: mark it like every
+            // conversion after it rather than leaving it out silently.
+            n = std::snprintf(out + used, remain, "%s", "<?>");
+        }
+
         if (n > 0 && used + n < cap)
         {
             used += n;

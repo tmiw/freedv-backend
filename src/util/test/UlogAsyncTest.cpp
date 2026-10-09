@@ -399,7 +399,7 @@ bool testOverflow()
         ulog_async_flush();
     });
 
-    bool result = contains(out, "args: " + a + "|" + b + "||end [ulog_async: truncated]");
+    bool result = contains(out, "args: " + a + "|" + b + "|<?>|end [ulog_async: truncated]");
     result &= !contains(out, std::string(10, 'c'));
     result &= contains(out, std::string(511, 'x'));
     result &= !contains(out, std::string(512, 'x'));
@@ -407,6 +407,84 @@ bool testOverflow()
 
     std::cout << (result ? "PASS" : "FAIL") << "\n";
     if (!result) std::cout << "---\n" << out.substr(0, 2000) << "\n---\n";
+    return result;
+}
+
+bool testRemainingConversions()
+{
+    std::cout << "Test 10 (%i, %F, %E, %G and %A render like printf): ";
+
+    std::vector<std::string> expected;
+    std::string out = captureStderr([&]() {
+        std::thread rt([&]() {
+            LOG_LIKE_PRINTF(expected, "i=%i|%+5i|%-4i|", -12, 7, 3);
+            LOG_LIKE_PRINTF(expected, "F=%F E=%E G=%G A=%A", 1.5, 12345.678, 0.00001234, 1.0);
+        });
+        rt.join();
+        ulog_async_flush();
+    });
+
+    bool result = true;
+    for (auto const& e : expected)
+    {
+        if (!contains(out, e))
+        {
+            std::cout << "\n    missing: " << e;
+            result = false;
+        }
+    }
+    std::cout << (result ? "" : "\n    ") << (result ? "PASS" : "FAIL") << "\n";
+    if (!result) std::cout << "---\n" << out << "---\n";
+    return result;
+}
+
+bool testArgumentSpaceRunsOut()
+{
+    std::cout << "Test 11 (an argument of any type that doesn't fit renders as <?>, as do the rest): ";
+
+    // Two 160-character strings (2 + 160 bytes each), seven 8-byte integers
+    // and one 4-byte char fill a record's 384 bytes of argument space
+    // exactly, so the next argument -- of each type in turn -- doesn't fit.
+    static const std::string a(160, 'a'), b(160, 'b');
+#define FILL_FMT "%s|%s|%lld|%lld|%lld|%lld|%lld|%lld|%lld|%c|"
+#define FILL_ARGS a.c_str(), b.c_str(), 1LL, 2LL, 3LL, 4LL, 5LL, 6LL, 7LL, 'z'
+    const std::string filled = a + "|" + b + "|1|2|3|4|5|6|7|z|";
+
+    // A message that doesn't fit the 512-byte render buffer is cut off in
+    // the middle of a conversion's output.
+    static const std::string longFmt = std::string(505, 'x') + "%lld";
+
+    std::string out = captureStderr([&]() {
+        std::thread rt([&]() {
+            log_info("s64: " FILL_FMT "%d|%d|end", FILL_ARGS, 8, 9);
+            log_info("u64: " FILL_FMT "%u|%d|end", FILL_ARGS, 8u, 9);
+            log_info("dbl: " FILL_FMT "%f|%d|end", FILL_ARGS, 8.0, 9);
+            log_info("chr: " FILL_FMT "%c|%d|end", FILL_ARGS, 'y', 9);
+            log_info("ptr: " FILL_FMT "%p|%d|end", FILL_ARGS, (void*)&a, 9);
+            log_info("str: " FILL_FMT "%s|%d|end", FILL_ARGS, "eight", 9);
+            log_info(longFmt.c_str(), 1234567890123LL);
+        });
+        rt.join();
+        ulog_async_flush();
+    });
+#undef FILL_FMT
+#undef FILL_ARGS
+
+    bool result = true;
+    for (const char* type : {"s64", "u64", "dbl", "chr", "ptr", "str"})
+    {
+        std::string line = std::string(type) + ": " + filled + "<?>|<?>|end [ulog_async: truncated]";
+        if (!contains(out, line))
+        {
+            std::cout << "\n    missing: " << type << ": ...|z|<?>|<?>|end [ulog_async: truncated]";
+            result = false;
+        }
+    }
+    result &= contains(out, std::string(505, 'x') + "123456");
+    result &= !contains(out, std::string(505, 'x') + "1234567");
+
+    std::cout << (result ? "" : "\n    ") << (result ? "PASS" : "FAIL") << "\n";
+    if (!result) std::cout << "---\n" << out.substr(0, 4000) << "\n---\n";
     return result;
 }
 
@@ -467,6 +545,8 @@ int main()
     result &= testUnsupportedConversions();
     result &= testOverflow();
     result &= testLifecycleEdges();
+    result &= testRemainingConversions();
+    result &= testArgumentSpaceRunsOut();
 
     return result ? 0 : -1;
 }
