@@ -32,6 +32,7 @@
 //
 //=========================================================================
 
+#include <algorithm>
 #include <cassert>
 #include <cstring>
 #include <cmath>
@@ -85,7 +86,9 @@ short* ToneInterfererStep::execute(short* inputSamples, int numInputSamples, int
     float w = 2.0 * M_PI * toneFrequency / sampleRate_;
     for(int i = 0; i < numInputSamples; i++) {
         float s = (float)toneAmplitude * cosf(phase);
-        outputSamples_.get()[i] += (int)s;
+        // Clip rather than let the short wrap around to the opposite sign.
+        int sum = outputSamples_.get()[i] + (int)s;
+        outputSamples_.get()[i] = (short)std::clamp(sum, -32768, 32767);
         phase += w;
     }
     phase -= 2.0 * M_PI * floor(phase / (2.0 * M_PI));
