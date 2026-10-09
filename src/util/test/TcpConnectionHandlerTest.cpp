@@ -434,14 +434,14 @@ void resetConnection(int fd)
     testSetSockOpt(fd, SOL_SOCKET, SO_LINGER, &lingerOpt, sizeof(lingerOpt));
 }
 
-// Gives the client's send buffer and the server's receive buffer small fixed
-// sizes, so a large send to a server that isn't reading really stalls.
-// (Otherwise Windows buffers tens of MB on loopback.)
-void pinSmallBuffers(TestConnection& conn, LoopbackTcpServer& server)
+// Starts a send that can't complete because the server isn't reading, and
+// returns its future. Sends `data` twice: Windows accepts any single send in
+// full while the data it has queued is under SO_SNDBUF, so there only the
+// second send stalls. (Elsewhere the first does, and the second waits.)
+std::future<void> startStalledSend(TestConnection& conn, const std::string& data)
 {
-    int size = 64 * 1024;
-    testSetSockOpt(TcpConnectionHandlerTest::clientSocket(conn), SOL_SOCKET, SO_SNDBUF, &size, sizeof(size));
-    testSetSockOpt(server.peerFd(), SOL_SOCKET, SO_RCVBUF, &size, sizeof(size));
+    conn.send(data.c_str(), data.size());
+    return conn.send(data.c_str(), data.size());
 }
 
 bool testPlainSendToResetPeer()
@@ -455,13 +455,12 @@ bool testPlainSendToResetPeer()
     conn.connect("127.0.0.1", server.port(), false);
     result &= CHECK(server.accept(ACCEPT_TIMEOUT_MS));
     result &= CHECK(conn.waitForConnects(1));
-    pinSmallBuffers(conn, server);
 
     // The server resets the connection while the client is mid-way through
     // a send it can't finish (nobody reads): write() must fail, not hang,
     // and the client must treat it as a disconnect.
     const std::string big = makePattern(STALLED_SEND_BYTES);
-    auto sendFuture = conn.send(big.c_str(), big.size());
+    auto sendFuture = startStalledSend(conn, big);
     std::this_thread::sleep_for(300ms);
     result &= CHECK(sendFuture.wait_for(0ms) == std::future_status::timeout);
     resetConnection(server.peerFd());
@@ -946,11 +945,10 @@ bool testBlockedSendAbandonedOnDisconnect(TestCertificate& cert)
             plainConn.connect("127.0.0.1", plainServer.port(), false);
             result &= CHECK(plainServer.accept(ACCEPT_TIMEOUT_MS));
             result &= CHECK(plainConn.waitForConnects(1));
-            pinSmallBuffers(plainConn, plainServer);
         }
 
         const std::string big = makePattern(STALLED_SEND_BYTES);
-        auto sendFuture = conn->send(big.c_str(), big.size());
+        auto sendFuture = startStalledSend(*conn, big);
         std::this_thread::sleep_for(300ms);
         result &= CHECK(sendFuture.wait_for(0ms) == std::future_status::timeout);
 
