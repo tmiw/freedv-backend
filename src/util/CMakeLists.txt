@@ -68,5 +68,7 @@ DefineUnitTest(GenericFIFOTest)
 DefineUnitTest(UlogAsyncTest)
 DefineUnitTest(TcpConnectionHandlerTest)
 DefineUnitTest(UdpHandlerTest)
+DefineUnitTest(AudioSpinMutexTest)
+DefineUnitTest(UlogConfigTest)
 endif(BUILD_BACKEND_UNITTESTS)
 

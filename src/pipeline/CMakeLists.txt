@@ -47,6 +47,9 @@ DefineUnitTest(LevelAdjustTest)
 DefineUnitTest(ResampleTest)
 DefineUnitTest(TapTest)
 DefineUnitTest(PipelineResetTest)
+DefineUnitTest(LinkStepTest)
+DefineUnitTest(MuteStepTest)
+DefineUnitTest(ToneInterfererTest)
 
 DefineUnitTest(ldpc_decode)
 DefineUnitTest(ldpc_encode)
@@ -55,6 +58,9 @@ DefineUnitTest(RadeTextTest)
 target_link_libraries(RadeTextTest PRIVATE rade opus samplerate)
 
 DefineUnitTest(RadeTextUnitTest)
+
+DefineUnitTest(RadeStepResetTest)
+target_link_libraries(RadeStepResetTest PRIVATE rade opus samplerate)
 #endif(LINUX)
 
 # ---------------------------------------------------------------------------
