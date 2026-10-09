@@ -255,14 +255,14 @@ void TcpConnectionHandler::connectImpl_()
             results[0] = heads[0];
         }
     }
-    if (ipv4Complete_.load(std::memory_order_relaxed) == false && ipv6Complete_.load(std::memory_order_relaxed) == true && results[0] == nullptr)
+    // Check whether the IPv4 result has been collected rather than whether it's
+    // complete: IPv4 DNS may finish after the check above, and testing
+    // ipv4Complete_ here would then skip collecting it and leave us with no
+    // addresses at all.
+    if (ipv4ResultFuture.valid() && ipv6Complete_.load(std::memory_order_relaxed) == true && results[0] == nullptr)
     {
         log_info("no valid IPv6 results, need to wait for IPv4 before continuing.");
-        while (ipv4Complete_.load(std::memory_order_relaxed) == false)
-        {
-            std::this_thread::sleep_for(1ms);
-        }
-        heads[1] = ipv4ResultFuture.get();
+        heads[1] = ipv4ResultFuture.get(); // blocks until IPv4 DNS completes
         results[1] = heads[1];
     }
 
