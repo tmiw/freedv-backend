@@ -1,8 +1,10 @@
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <vector>
 
 #include "../FreeDVReporter.h"
 
@@ -66,6 +68,15 @@ bool testValidForReportingGating()
     result &= (FreeDVReporterTest::mode(noCallsign) == "");
     result &= (FreeDVReporterTest::message(noCallsign) == "");
     result &= (FreeDVReporterTest::hidden(noCallsign) == false);
+
+    bool aboutToShowSelfCalled = false;
+    noCallsign.setAboutToShowSelfFn([&]() { aboutToShowSelfCalled = true; });
+    noCallsign.hideFromView();
+    result &= (FreeDVReporterTest::hidden(noCallsign) == false);
+    noCallsign.showOurselves();
+    result &= !aboutToShowSelfCalled;
+    noCallsign.requestQSY("sid", 7100000, "ignored");
+    noCallsign.addReceiveRecord("K6AQ", "1600X", 14236000, 5);
 
     std::cout << (result ? "PASS" : "FAIL") << "\n";
     return result;
@@ -409,6 +420,201 @@ bool testHideShowAnalogMode()
     return result;
 }
 
+// A server event, how to deliver it, and a payload the handler accepts.
+struct ServerEvent
+{
+    const char* name;
+    void (*fire)(FreeDVReporter&, yyjson_val*);
+    const char* validJson;
+    std::vector<std::string> optionalFields; // may be missing or of any type
+};
+
+const std::vector<ServerEvent>& serverEvents()
+{
+    static const std::vector<ServerEvent> events = {
+        {"new_connection", FreeDVReporterTest::fireNewConnection,
+         R"({"sid":"s","last_update":"u","callsign":"K6AQ","grid_square":"DM12kw",)"
+         R"("version":"1.4","rx_only":true,"connect_time":"t"})", {}},
+        {"remove_connection", FreeDVReporterTest::fireRemoveConnection,
+         R"({"sid":"s","last_update":"u","callsign":"K6AQ","grid_square":"DM12kw",)"
+         R"("version":"1.4","rx_only":false})", {}},
+        {"tx_report", FreeDVReporterTest::fireTxReport,
+         R"({"sid":"s","last_update":"u","callsign":"K6AQ","grid_square":"DM12kw",)"
+         R"("mode":"1600X","transmitting":true,"last_tx":"2026-10-08 12:00:00"})", {"last_tx"}},
+        {"rx_report", FreeDVReporterTest::fireRxReport,
+         R"({"sid":"s","last_update":"u","receiver_callsign":"K6AQ","receiver_grid_square":"DM12kw",)"
+         R"("callsign":"N1DQ","snr":5,"mode":"1600X"})", {}},
+        {"freq_change", FreeDVReporterTest::fireFreqChange,
+         R"({"sid":"s","last_update":"u","callsign":"K6AQ","grid_square":"DM12kw","freq":14236000})", {}},
+        {"message_update", FreeDVReporterTest::fireMessageUpdate,
+         R"({"sid":"s","last_update":"u","message":"CQ test"})", {}},
+        {"qsy_request", FreeDVReporterTest::fireQsyRequest,
+         R"({"callsign":"K6AQ","frequency":7100000,"message":"QSY please"})", {}},
+    };
+    return events;
+}
+
+// Registers a handler for every server event that counts its calls.
+void countAllEvents(FreeDVReporter& reporter, int& calls)
+{
+    reporter.setOnUserConnectFn([&](std::string, std::string, std::string, std::string, std::string, bool, std::string) { calls++; });
+    reporter.setOnUserDisconnectFn([&](std::string, std::string, std::string, std::string, std::string, bool, std::string) { calls++; });
+    reporter.setOnTransmitUpdateFn([&](std::string, std::string, std::string, std::string, std::string, bool, std::string) { calls++; });
+    reporter.setOnReceiveUpdateFn([&](std::string, std::string, std::string, std::string, std::string, float, std::string) { calls++; });
+    reporter.setOnFrequencyChangeFn([&](std::string, std::string, std::string, std::string, uint64_t) { calls++; });
+    reporter.setMessageUpdateFn([&](std::string, std::string, std::string) { calls++; });
+    reporter.setOnQSYRequestFn([&](std::string, uint64_t, std::string) { calls++; });
+}
+
+// Delivers the event's valid payload with one field removed (wrongValue
+// null) or replaced by wrongValue, and returns how many handlers ran.
+int fireWithFieldChanged(FreeDVReporter& reporter, int& calls, const ServerEvent& event,
+                         const char* field, const char* wrongValue)
+{
+    yyjson_doc* doc = yyjson_read(event.validJson, strlen(event.validJson), 0);
+    yyjson_mut_doc* mut = yyjson_doc_mut_copy(doc, nullptr);
+    yyjson_doc_free(doc);
+    yyjson_mut_val* root = yyjson_mut_doc_get_root(mut);
+    if (wrongValue == nullptr)
+    {
+        yyjson_mut_obj_remove_key(root, field);
+    }
+    else
+    {
+        yyjson_doc* valueDoc = yyjson_read(wrongValue, strlen(wrongValue), 0);
+        yyjson_mut_obj_replace(root, yyjson_mut_strcpy(mut, field),
+                               yyjson_val_mut_copy(mut, yyjson_doc_get_root(valueDoc)));
+        yyjson_doc_free(valueDoc);
+    }
+    char* json = yyjson_mut_write(mut, 0, nullptr);
+    yyjson_mut_doc_free(mut);
+
+    int before = calls;
+    withParsedJson(json, [&](yyjson_val* root) { event.fire(reporter, root); });
+    free(json);
+    return calls - before;
+}
+
+bool testEveryFieldValidated()
+{
+    std::cout << "Test 11 (every server event ignores a missing or wrongly typed field): ";
+
+    FreeDVReporter reporter("localhost", "N1DQ", "CN98", "FreeDV Test", false);
+    int calls = 0;
+    countAllEvents(reporter, calls);
+
+    bool result = true;
+    for (auto& event : serverEvents())
+    {
+        // The valid payload itself must get through.
+        int before = calls;
+        withParsedJson(event.validJson, [&](yyjson_val* root) { event.fire(reporter, root); });
+        if (calls != before + 1)
+        {
+            std::cout << "\n    " << event.name << ": valid payload not delivered\n    ";
+            result = false;
+        }
+
+        yyjson_doc* doc = yyjson_read(event.validJson, strlen(event.validJson), 0);
+        size_t idx, max;
+        yyjson_val *key, *value;
+        yyjson_obj_foreach(yyjson_doc_get_root(doc), idx, max, key, value)
+        {
+            std::string field = yyjson_get_str(key);
+            bool optional = std::find(event.optionalFields.begin(), event.optionalFields.end(), field) != event.optionalFields.end();
+            int expected = optional ? 1 : 0;
+
+            // A value of some other type: a number for a string field, a
+            // string for anything else.
+            const char* wrongValue = yyjson_is_str(value) ? "42" : "\"wrong\"";
+            const char* variants[] = {nullptr, wrongValue, "null"};
+            for (const char* variant : variants)
+            {
+                int got = fireWithFieldChanged(reporter, calls, event, field.c_str(), variant);
+                if (got != expected)
+                {
+                    std::cout << "\n    " << event.name << ": " << field << " "
+                              << (variant ? std::string("= ") + variant : std::string("missing"))
+                              << " -> " << got << " calls, expected " << expected << "\n    ";
+                    result = false;
+                }
+            }
+        }
+        yyjson_doc_free(doc);
+    }
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
+bool testNonObjectPayloadsIgnored()
+{
+    std::cout << "Test 12 (every server event ignores a payload that isn't an object): ";
+
+    FreeDVReporter reporter("localhost", "N1DQ", "CN98", "FreeDV Test", false);
+    int calls = 0;
+    countAllEvents(reporter, calls);
+
+    for (auto& event : serverEvents())
+    {
+        for (const char* json : {"null", "42", "\"text\"", "[1,2,3]", "{}"})
+        {
+            withParsedJson(json, [&](yyjson_val* root) { event.fire(reporter, root); });
+        }
+        event.fire(reporter, nullptr); // event sent without arguments
+    }
+    bool result = (calls == 0);
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
+bool testTxReportWithoutLastTx()
+{
+    std::cout << "Test 13 (tx_report with last_tx missing or not a string reports it as empty): ";
+
+    // Used to construct a std::string from a null pointer (a crash).
+    FreeDVReporter reporter("localhost", "N1DQ", "CN98", "FreeDV Test", false);
+    int calls = 0;
+    std::string lastTx = "unset";
+    reporter.setOnTransmitUpdateFn([&](std::string, std::string, std::string, std::string, std::string, bool, std::string tx) {
+        calls++;
+        lastTx = tx;
+    });
+
+    bool result = true;
+    for (const char* lastTxJson : {"", R"(,"last_tx":12345)", R"(,"last_tx":null)"})
+    {
+        std::string json = std::string(R"({"sid":"s","last_update":"u","callsign":"K6AQ","grid_square":"DM12kw",)"
+                                       R"("mode":"1600X","transmitting":true)") + lastTxJson + "}";
+        lastTx = "unset";
+        withParsedJson(json.c_str(), [&](yyjson_val* root) { FreeDVReporterTest::fireTxReport(reporter, root); });
+        result &= (lastTx == "");
+    }
+    result &= (calls == 3);
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
+bool testEventsWithoutHandlersIgnored()
+{
+    std::cout << "Test 14 (server events with no handler registered are ignored): ";
+
+    // freedv-gui registers only some handlers (e.g. none while the FreeDV
+    // Reporter window is closed); the rest must be skipped safely.
+    FreeDVReporter reporter("localhost", "N1DQ", "CN98", "FreeDV Test", false);
+    for (auto& event : serverEvents())
+    {
+        withParsedJson(event.validJson, [&](yyjson_val* root) { event.fire(reporter, root); });
+    }
+    FreeDVReporterTest::fireConnectionSuccessful(reporter);
+    bool result = FreeDVReporterTest::fullyConnected(reporter);
+
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -425,6 +631,10 @@ int main(int argc, char** argv)
     result &= testBulkUpdateToleratesMalformedEntries();
     result &= testStateSavedBeforeConnectionAndReplayedOnSuccess();
     result &= testHideShowAnalogMode();
+    result &= testEveryFieldValidated();
+    result &= testNonObjectPayloadsIgnored();
+    result &= testTxReportWithoutLastTx();
+    result &= testEventsWithoutHandlersIgnored();
 
     return result ? 0 : -1;
 }
