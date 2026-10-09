@@ -74,6 +74,11 @@ short* LinkStep::OutputStep::execute(short*, int numInputSamples, int* numOutput
 {
     auto& fifo = parent_->getFifo();
     *numOutputSamples = numInputSamples > 0 ? std::min(fifo.numUsed(), numInputSamples) : fifo.numUsed();
+
+    // outputSamples_ holds one second of audio, but the FIFO can hold more
+    // (48000 samples by default, whatever the rate), so never return more than
+    // that per call; anything left over is returned by later calls.
+    *numOutputSamples = std::min(*numOutputSamples, parent_->getSampleRate());
     
     if (*numOutputSamples > 0)
     {
