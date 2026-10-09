@@ -70,5 +70,6 @@ DefineUnitTest(TcpConnectionHandlerTest)
 DefineUnitTest(UdpHandlerTest)
 DefineUnitTest(AudioSpinMutexTest)
 DefineUnitTest(UlogConfigTest)
+DefineUnitTest(ThreadedObjectTest)
 endif(BUILD_BACKEND_UNITTESTS)
 
