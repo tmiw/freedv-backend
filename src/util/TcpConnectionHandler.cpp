@@ -1086,6 +1086,10 @@ void TcpConnectionHandler::receiveImpl_()
                 enqueue_([this]() {
                     disconnectImpl_();
                 });
+
+                // Nothing more to read. Stop here rather than spinning (and
+                // queueing more disconnects) until the disconnect runs.
+                break;
             }
             else if (numRead < 0 && socket_.load(std::memory_order_relaxed) != INVALID_SOCKET)
             {
@@ -1097,6 +1101,7 @@ void TcpConnectionHandler::receiveImpl_()
                 enqueue_([this]() {
                     disconnectImpl_();
                 });
+                break; // as above
             }
         }
         else if (rv < 0 && socket_.load(std::memory_order_relaxed) != INVALID_SOCKET)
@@ -1109,6 +1114,7 @@ void TcpConnectionHandler::receiveImpl_()
             enqueue_([this]() {
                 disconnectImpl_();
             });
+            break; // as above
         }
         continue;
 tryAgain:
