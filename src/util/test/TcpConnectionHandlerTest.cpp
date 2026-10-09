@@ -1,3 +1,4 @@
+#include <atomic>
 #include <chrono>
 #include <csignal>
 #include <condition_variable>
@@ -92,6 +93,10 @@ constexpr auto EVENT_TIMEOUT = 5s;
 class TestConnection : public TcpConnectionHandler
 {
 public:
+    // Makes the receive handler slow (1 ms per call), as if the application
+    // were busy, so incoming data backs up.
+    std::atomic<bool> slowReceive{false};
+
     virtual ~TestConnection()
     {
         // TcpConnectionHandler's destructor would call our onDisconnect_()
@@ -134,7 +139,7 @@ public:
 
     bool waitForConnects(int count, std::chrono::milliseconds timeout = EVENT_TIMEOUT) { return waitFor([&]() { return connectCount_ >= count; }, timeout); }
     bool waitForDisconnects(int count) { return waitFor([&]() { return disconnectCount_ >= count; }); }
-    bool waitForReceived(size_t length) { return waitFor([&]() { return received_.size() >= length; }); }
+    bool waitForReceived(size_t length, std::chrono::milliseconds timeout = EVENT_TIMEOUT) { return waitFor([&]() { return received_.size() >= length; }, timeout); }
     bool waitForRecvEnd() { return waitFor([&]() { return recvEndCount_ > 0; }); }
 
 protected:
@@ -154,6 +159,10 @@ protected:
 
     virtual void onReceive_(char* buf, int length) override
     {
+        if (slowReceive.load())
+        {
+            std::this_thread::sleep_for(1ms);
+        }
         std::unique_lock<std::mutex> lk(mutex_);
         received_.append(buf, length);
         cv_.notify_all();
@@ -462,6 +471,66 @@ bool testPlainReadFromResetPeer()
     result &= CHECK(conn.waitForDisconnects(1));
     result &= CHECK(conn.disconnectCount() == 1);
     result &= CHECK(conn.received().empty());
+
+    return report(result);
+}
+
+// Sends 1 MB, far more than the client's 128 KB receive buffer, to a client
+// whose receive handler is slow: every byte must still arrive, in order.
+bool checkBurstToSlowReceiver(TestConnection& conn, std::function<bool(const std::string&)> const& serverSend)
+{
+    conn.slowReceive = true;
+    const std::string big = makePattern(1024 * 1024);
+    bool result = CHECK(serverSend(big));
+    result &= CHECK(conn.waitForReceived(big.size(), 30s));
+    result &= CHECK(conn.received() == big);
+    result &= CHECK(conn.disconnectCount() == 0);
+    return result;
+}
+
+bool testPlainBurstToSlowReceiver()
+{
+    std::cout << "Test 25 (1 MB burst to a slow receiver arrives intact, plain TCP): ";
+
+    LoopbackTcpServer server;
+    TestConnection conn;
+
+    bool result = CHECK(server.valid());
+    conn.connect("127.0.0.1", server.port(), false);
+    result &= CHECK(server.accept(ACCEPT_TIMEOUT_MS));
+    result &= CHECK(conn.waitForConnects(1));
+    result &= checkBurstToSlowReceiver(conn, [&](const std::string& data) { return server.sendAll(data); });
+
+    return report(result);
+}
+
+bool testConnectWhileConnected()
+{
+    std::cout << "Test 26 (connect() while connected is ignored; the connection keeps working): ";
+
+    LoopbackTcpServer server;
+    LoopbackTcpServer otherServer;
+    TestConnection conn;
+
+    bool result = CHECK(server.valid() && otherServer.valid());
+    conn.connect("127.0.0.1", server.port(), false);
+    result &= CHECK(server.accept(ACCEPT_TIMEOUT_MS));
+    result &= CHECK(conn.waitForConnects(1));
+
+    // Used to replace the running receive thread (std::terminate()).
+    auto fut = conn.connect("127.0.0.1", otherServer.port(), false);
+    result &= CHECK(fut.wait_for(EVENT_TIMEOUT) == std::future_status::ready);
+    result &= CHECK(!otherServer.accept(500));
+    result &= CHECK(conn.connectCount() == 1);
+
+    const std::string msg = "still connected";
+    conn.send(msg.c_str(), msg.size());
+    std::string got(msg.size(), '\0');
+    result &= CHECK(server.recvExact(&got[0], msg.size(), IO_TIMEOUT_MS) && got == msg);
+    result &= CHECK(server.sendAll(msg));
+    result &= CHECK(conn.waitForReceived(msg.size()));
+    result &= CHECK(conn.received() == msg);
+    result &= CHECK(conn.disconnectCount() == 0);
 
     return report(result);
 }
@@ -1143,6 +1212,17 @@ bool testTlsSendWaitingToReadAbandonedOnDisconnect(TestCertificate& cert)
     return report(result);
 }
 
+bool testTlsBurstToSlowReceiver(TestCertificate& cert)
+{
+    std::cout << "Test 25b (1 MB burst to a slow receiver arrives intact, TLS): ";
+
+    TlsFixture f(cert);
+    bool result = CHECK(f.ok);
+    result &= checkBurstToSlowReceiver(f.conn, [&](const std::string& data) { return f.tls.write(data); });
+
+    return report(result);
+}
+
 #endif // defined(ENABLE_TLS_SUPPORT)
 
 } // namespace
@@ -1188,11 +1268,14 @@ int main(int, char**)
     result &= testTlsRenegotiationWhileSendBlocked(cert);
     result &= testTlsReadWantsWriteThenDisconnect(cert);
     result &= testTlsSendWaitingToReadAbandonedOnDisconnect(cert);
+    result &= testTlsBurstToSlowReceiver(cert);
 #endif // defined(ENABLE_TLS_SUPPORT)
 
     // Numbered after the TLS tests, which were written first.
     result &= testPlainSendToResetPeer();
     result &= testPlainReadFromResetPeer();
+    result &= testPlainBurstToSlowReceiver();
+    result &= testConnectWhileConnected();
 
     return result ? 0 : -1;
 }

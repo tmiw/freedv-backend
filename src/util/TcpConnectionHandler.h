@@ -45,6 +45,8 @@ public:
     TcpConnectionHandler();
     virtual ~TcpConnectionHandler();
     
+    // Ignored (with a warning) if already connected; disconnect() first to
+    // connect somewhere else.
     std::future<void> connect(const char* host, int port, bool enableReconnect, bool enableTLS = false);
     std::future<void> disconnect();
     
@@ -99,6 +101,7 @@ private:
 
     int sslWrite_(const char* buf, int length, int& sslErr);
     int sslRead_(char* buf, int length, int& sslErr);
+    int sslPending_(); // decrypted bytes SSL_read() can return without the socket
 #endif // defined(ENABLE_TLS_SUPPORT)
 
     void connectImpl_();

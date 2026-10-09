@@ -123,16 +123,26 @@ TcpConnectionHandler::~TcpConnectionHandler()
 std::future<void> TcpConnectionHandler::connect(const char* host, int port, bool enableReconnect, bool enableTLS)
 {
     cancelConnect_.store(false, std::memory_order_relaxed);
-    host_ = host;
-    port_ = port;
-    usingTLS_ = enableTLS;
-    enableReconnect_.store(enableReconnect, std::memory_order_relaxed);
     
     std::shared_ptr<std::promise<void>> prom = std::make_shared<std::promise<void> >();
     auto fut = prom->get_future();
     
-    enqueue_([&, prom]() {
-        connectImpl_();
+    // The connection parameters are only changed on the worker thread, and
+    // only while disconnected: the receive thread reads usingTLS_.
+    std::string hostStr(host);
+    enqueue_([&, prom, hostStr, port, enableReconnect, enableTLS]() {
+        if (socket_.load(std::memory_order_relaxed) != INVALID_SOCKET)
+        {
+            log_warn("connect() called while already connected to %s port %d; ignoring", host_.c_str(), port_);
+        }
+        else
+        {
+            host_ = hostStr;
+            port_ = port;
+            usingTLS_ = enableTLS;
+            enableReconnect_.store(enableReconnect, std::memory_order_relaxed);
+            connectImpl_();
+        }
         prom->set_value();
     });
     return fut;
@@ -180,6 +190,14 @@ void TcpConnectionHandler::setOnRecvEndFn(OnRecvEndFn fn)
 
 void TcpConnectionHandler::connectImpl_()
 {
+    // A connect() or reconnect attempt can be queued behind one that has
+    // already succeeded. Starting over on a live connection would leak its
+    // socket and TLS state and replace a running receive thread.
+    if (socket_.load(std::memory_order_relaxed) != INVALID_SOCKET)
+    {
+        return;
+    }
+
     // Convert port to string (needed by getaddrinfo() below).
     std::stringstream portStream;
     portStream << port_;
@@ -910,6 +928,13 @@ int TcpConnectionHandler::sslRead_(char* buf, int length, int& sslErr)
     sslErr = (rv <= 0) ? SSL_get_error(ssl, rv) : SSL_ERROR_NONE;
     return rv;
 }
+
+int TcpConnectionHandler::sslPending_()
+{
+    std::unique_lock<std::mutex> lk(sslMutex_);
+    SSL* ssl = ssl_.load(std::memory_order_relaxed);
+    return ssl != nullptr ? SSL_pending(ssl) : 0;
+}
 #endif // defined(ENABLE_TLS_SUPPORT)
 
 constexpr int READ_SIZE_BYTES = 1024;
@@ -922,22 +947,48 @@ void TcpConnectionHandler::receiveImpl_()
 
     while (socket_.load(std::memory_order_relaxed) != INVALID_SOCKET)
     {
-        struct timeval tv = {0, 250000}; // 250ms
-        fd_set readSet;
-        FD_ZERO(&readSet);
-        FD_SET(socket_.load(std::memory_order_relaxed), &readSet);
+        // If the receive buffer can't take another read, stop reading until
+        // the handler has caught up. The data waits in the socket and TCP
+        // flow control slows the sender down, rather than it being dropped.
+        // (Everything already in the buffer has a dispatch task queued.)
+        if (receiveBuffer_.numFree() < READ_SIZE_BYTES)
+        {
+            std::this_thread::sleep_for(1ms);
+            continue;
+        }
 
-        int rv = select(socket_.load(std::memory_order_relaxed) + 1, &readSet, nullptr, nullptr, &tv);
+        int rv = 1;
+#if defined(ENABLE_TLS_SUPPORT)
+        // Data TLS has already decrypted doesn't make the socket readable, so
+        // read it without waiting (left over when the buffer filled up).
+        if (!usingTLS_ || sslPending_() == 0)
+#endif // defined(ENABLE_TLS_SUPPORT)
+        {
+            struct timeval tv = {0, 250000}; // 250ms
+            fd_set readSet;
+            FD_ZERO(&readSet);
+            FD_SET(socket_.load(std::memory_order_relaxed), &readSet);
+
+            rv = select(socket_.load(std::memory_order_relaxed) + 1, &readSet, nullptr, nullptr, &tv);
+        }
         if (rv > 0 && socket_.load(std::memory_order_relaxed) != INVALID_SOCKET)
         {
             int numRead = 0;
             int numHaveRead = 0;
+            bool bufferFull = false;
 #if defined(ENABLE_TLS_SUPPORT)
             while(!usingTLS_ || ssl_.load(std::memory_order_relaxed) != nullptr)
 #else
             while(true)
 #endif // defined(ENABLE_TLS_SUPPORT)
             {
+                if (receiveBuffer_.numFree() < READ_SIZE_BYTES)
+                {
+                    // Dispatch what we have; the top of the loop waits for room.
+                    bufferFull = true;
+                    break;
+                }
+
 #if defined(ENABLE_TLS_SUPPORT)
                 if (usingTLS_ && ssl_.load(std::memory_order_relaxed) != nullptr)
                 {
@@ -995,9 +1046,13 @@ void TcpConnectionHandler::receiveImpl_()
                     break;
                 }
 
-                // Queue RX handler
+                // Queue RX handler. This thread is the buffer's only writer
+                // and we checked for room above, so this can't fail.
                 numHaveRead += numRead;
-                receiveBuffer_.write(buf, numRead);
+                if (receiveBuffer_.write(buf, numRead) != 0)
+                {
+                    log_error("receive buffer overflow; dropped %d bytes", numRead);
+                }
 
                 if (numRead < READ_SIZE_BYTES)
                 {
@@ -1021,6 +1076,10 @@ void TcpConnectionHandler::receiveImpl_()
                     }
                 });
             } 
+            else if (bufferFull)
+            {
+                // Nothing read this pass; wait for room at the top of the loop.
+            }
             else if (numRead == 0 && socket_.load(std::memory_order_relaxed) != INVALID_SOCKET)
             {
                 log_warn("EOF received");
