@@ -313,7 +313,10 @@ bool testMatchesPrintf()
             LOG_LIKE_PRINTF(expected, "o=%o x=%x X=%X #x=%#x", 8u, 255u, 255u, 255u);
             LOG_LIKE_PRINTF(expected, "flags=%+d|% d|%05d|%-5d|", 3, 3, 3, 3);
             LOG_LIKE_PRINTF(expected, "e=%e g=%g a=%a 5.1f=%5.1f", 1.5, 0.0001, 1.0, 3.14159);
-            LOG_LIKE_PRINTF(expected, "Lf=%Lf", 2.5L);
+            // Not compared with snprintf(): Windows' C library treats long
+            // double as double, but clang/mingw pass an 80-bit long double.
+            log_info("<Lf=%Lf>", 2.5L);
+            expected.push_back("<Lf=2.500000>");
             LOG_LIKE_PRINTF(expected, "s=%.3s|%10s|%-10s|", "abcdef", "hi", "hi");
         });
         rt.join();

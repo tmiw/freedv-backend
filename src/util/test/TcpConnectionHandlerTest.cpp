@@ -93,6 +93,14 @@ constexpr int ACCEPT_TIMEOUT_MS = 5000;
 constexpr int IO_TIMEOUT_MS = 5000;
 constexpr auto EVENT_TIMEOUT = 5s;
 
+// Enough data that a send to a peer that isn't reading can't complete,
+// whatever the OS buffers on loopback (Windows takes well over 8 MB).
+#if defined(_WIN32)
+constexpr size_t STALLED_SEND_BYTES = 64 * 1024 * 1024;
+#else
+constexpr size_t STALLED_SEND_BYTES = 8 * 1024 * 1024;
+#endif // defined(_WIN32)
+
 // Records the handler callbacks so tests can wait on them from the main thread.
 class TestConnection : public TcpConnectionHandler
 {
@@ -441,7 +449,7 @@ bool testPlainSendToResetPeer()
     // The server resets the connection while the client is mid-way through
     // a send it can't finish (nobody reads): write() must fail, not hang,
     // and the client must treat it as a disconnect.
-    const std::string big = makePattern(8 * 1024 * 1024);
+    const std::string big = makePattern(STALLED_SEND_BYTES);
     auto sendFuture = conn.send(big.c_str(), big.size());
     std::this_thread::sleep_for(300ms);
     result &= CHECK(sendFuture.wait_for(0ms) == std::future_status::timeout);
@@ -888,7 +896,7 @@ bool testTlsSendToSlowReader(TestCertificate& cert)
     TlsFixture f(cert);
     bool result = CHECK(f.ok);
 
-    const std::string big = makePattern(8 * 1024 * 1024);
+    const std::string big = makePattern(STALLED_SEND_BYTES);
     auto sendFuture = f.conn.send(big.c_str(), big.size());
     std::this_thread::sleep_for(500ms);
     result &= CHECK(sendFuture.wait_for(0ms) == std::future_status::timeout);
@@ -929,7 +937,7 @@ bool testBlockedSendAbandonedOnDisconnect(TestCertificate& cert)
             result &= CHECK(plainConn.waitForConnects(1));
         }
 
-        const std::string big = makePattern(8 * 1024 * 1024);
+        const std::string big = makePattern(STALLED_SEND_BYTES);
         auto sendFuture = conn->send(big.c_str(), big.size());
         std::this_thread::sleep_for(300ms);
         result &= CHECK(sendFuture.wait_for(0ms) == std::future_status::timeout);
@@ -954,7 +962,7 @@ bool testTlsSendToResetPeer(TestCertificate& cert)
     // The server resets the connection while the client is mid-way through a
     // large send: SSL_write() must fail (not hang) and the client must treat
     // it as a disconnect.
-    const std::string big = makePattern(8 * 1024 * 1024);
+    const std::string big = makePattern(STALLED_SEND_BYTES);
     auto sendFuture = f.conn.send(big.c_str(), big.size());
     std::this_thread::sleep_for(300ms);
     resetConnection(f.server.peerFd());
@@ -1000,7 +1008,7 @@ bool testTlsKeyUpdateWhileSendBlocked(TestCertificate& cert)
     // write rather than sending it from SSL_read().) Once the server drains
     // the connection, everything must complete with data intact and the
     // connection must keep working under the new keys.
-    const std::string big = makePattern(8 * 1024 * 1024);
+    const std::string big = makePattern(STALLED_SEND_BYTES);
     auto sendFuture = f.conn.send(big.c_str(), big.size());
     std::this_thread::sleep_for(300ms);
 
@@ -1037,7 +1045,7 @@ bool testTlsRenegotiationWhileSendBlocked(TestCertificate& cert)
     TlsFixture f(cert, true);
     bool result = CHECK(f.ok);
 
-    const std::string big = makePattern(8 * 1024 * 1024);
+    const std::string big = makePattern(STALLED_SEND_BYTES);
     auto sendFuture = f.conn.send(big.c_str(), big.size());
     std::this_thread::sleep_for(300ms);
 

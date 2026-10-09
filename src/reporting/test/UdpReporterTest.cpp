@@ -153,7 +153,7 @@ bool testNonRecordMethodsSendNothing()
 
             char buf[4096];
             ssize_t len = recv(fd, buf, sizeof(buf), 0); // SO_RCVTIMEO bounds the wait
-            result &= (len < 0) && (errno == EAGAIN || errno == EWOULDBLOCK);
+            result &= (len < 0) && testLastRecvTimedOut();
         }
         testCloseSocket(fd);
     }

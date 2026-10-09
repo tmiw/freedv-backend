@@ -24,6 +24,7 @@
 #ifndef TEST_SOCKET_COMPAT_H
 #define TEST_SOCKET_COMPAT_H
 
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -137,6 +138,16 @@ inline void testSetSendTimeout(int fd, int timeoutMs)
     timeout.tv_usec = (timeoutMs % 1000) * 1000;
 #endif // defined(_WIN32)
     testSetSockOpt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+}
+
+// True if the last recv() failed because its SO_RCVTIMEO timeout expired.
+inline bool testLastRecvTimedOut()
+{
+#if defined(_WIN32)
+    return WSAGetLastError() == WSAETIMEDOUT;
+#else
+    return errno == EAGAIN || errno == EWOULDBLOCK;
+#endif // defined(_WIN32)
 }
 
 inline void testSetNonBlocking(int fd)
