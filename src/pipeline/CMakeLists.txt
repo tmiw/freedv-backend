@@ -124,6 +124,10 @@ if(NOT RADAE_PYTHON_EXECUTABLE AND NOT CMAKE_CROSSCOMPILING)
     endforeach()
 endif()
 
+DefineUnitTest(MinimalTxRxThreadOversTest)
+target_link_libraries(MinimalTxRxThreadOversTest PRIVATE rade opus samplerate)
+target_compile_definitions(MinimalTxRxThreadOversTest PRIVATE SPEECH_WAV_PATH="${RADE_SPEECH_WAV}")
+
 # Runs with or without Python; with it, radae's loss.py also scores the
 # received speech.
 DefineUnitTest(MinimalTxRxThreadTest)
