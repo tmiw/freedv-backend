@@ -835,6 +835,40 @@ static bool test18_unencodable_characters_skipped()
     return ok;
 }
 
+// ---------------------------------------------------------------------------
+// Test 19: a callsign longer than 8 characters is cut to the first 8, and an
+//          empty one is sent and received as empty
+// ---------------------------------------------------------------------------
+static bool test19_long_and_empty_callsigns()
+{
+    printf("=== Test 19: over-long and empty callsigns ===\n");
+
+    struct Case { const char* sent; const char* expected; };
+    const Case cases[] = {
+        {"W4XYZ5678AB", "W4XYZ567"}, // 11 characters: only 8 fit in a frame
+        {"VK3TPM/P/MM", "VK3TPM/P"},
+        {"", ""},
+    };
+
+    bool ok = true;
+    for (const auto& c : cases) {
+        rade_text_t tx = rade_text_create();
+        float syms[TOTAL_FLOATS];
+        memset(syms, 0, sizeof(syms));
+        rade_text_generate_tx_string(tx, c.sent, (int)strlen(c.sent), syms, TOTAL_FLOATS);
+        rade_text_destroy(tx);
+
+        RxState state = receiveFrame(syms);
+        bool passed = state.callCount == 1 && state.received == c.expected;
+        printf("  '%s' -> '%s' (%d callbacks): %s\n", c.sent, state.received.c_str(), state.callCount,
+               passed ? "PASS" : "FAIL");
+        ok &= passed;
+    }
+
+    printf("Over-long and empty callsigns: %s\n\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 int main()
 {
     bool success = true;
@@ -857,6 +891,7 @@ int main()
     success &= test16_valid_codeword_bad_crc_rejected();
     success &= test17_undefined_codes_dropped();
     success &= test18_unencodable_characters_skipped();
+    success &= test19_long_and_empty_callsigns();
 
     printf("=== Overall: %s ===\n", success ? "PASS" : "FAIL");
     return success ? 0 : 1;
