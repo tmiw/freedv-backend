@@ -777,6 +777,24 @@ bool testUnansweredAddressDoesNotBlockNext()
     return report(result);
 }
 
+bool testLateIpv6AfterIpv4Fails()
+{
+    std::cout << "Test 36 (every IPv4 address fails, IPv6 DNS answers later: IPv6 is used): ";
+
+    // The handler runs out of addresses while the IPv6 lookup is still
+    // pending, so it must wait for that lookup and then try what it returns.
+    LoopbackTcpServer server6(AF_INET6);
+    if (skipWithoutIpv6(server6)) return true;
+    int closedPort = LoopbackTcpServer::GetClosedPort();
+    ScriptedDnsConnection conn({1000ms, {{"::1", server6.port()}}}, {0ms, {{"127.0.0.1", closedPort}}});
+
+    conn.connect(SCRIPTED_HOST, 0, false);
+    bool result = CHECK(server6.accept(ACCEPT_TIMEOUT_MS));
+    result &= CHECK(conn.waitForConnects(1));
+
+    return report(result);
+}
+
 bool testDisconnectDuringDnsCancelsConnect()
 {
     std::cout << "Test 35 (disconnect() during DNS lookups cancels the connection attempt): ";
@@ -1442,6 +1460,7 @@ int main(int, char**)
     result &= testNoAddressesFailsCleanly();
     result &= testUnansweredAddressDoesNotBlockNext();
     result &= testDisconnectDuringDnsCancelsConnect();
+    result &= testLateIpv6AfterIpv4Fails();
 
     return result ? 0 : -1;
 }
