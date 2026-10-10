@@ -28,6 +28,11 @@ target_include_directories(fdv_audio_pipeline PRIVATE ${CODEC2_INCLUDE_DIRS} ${C
 target_include_directories(fdv_audio_pipeline PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 if(BUILD_BACKEND_UNITTESTS)
+# Real speech from the RADE sources, for tests that need it (see
+# test/SpeechSample.h).
+ExternalProject_Get_Property(build_rade SOURCE_DIR)
+set(RADE_SPEECH_WAV "${SOURCE_DIR}/wav/all.wav")
+
 macro(DefineUnitTest utName)
     add_executable(${utName} test/${utName}.cpp)
     target_link_libraries(${utName} PRIVATE fdv_audio_pipeline fdv_util samplerate)
@@ -48,6 +53,9 @@ DefineUnitTest(EitherOrTest)
 DefineUnitTest(LevelAdjustTest)
 DefineUnitTest(ResampleTest)
 DefineUnitTest(TapTest)
+DefineUnitTest(BandwidthExpandStepTest)
+DefineUnitTest(RNNoiseStepTest)
+target_compile_definitions(RNNoiseStepTest PRIVATE SPEECH_WAV_PATH="${RADE_SPEECH_WAV}")
 DefineUnitTest(PipelineResetTest)
 DefineUnitTest(LinkStepTest)
 DefineUnitTest(MuteStepTest)
@@ -63,6 +71,9 @@ DefineUnitTest(RadeTextUnitTest)
 
 DefineUnitTest(RadeStepResetTest)
 target_link_libraries(RadeStepResetTest PRIVATE rade opus samplerate)
+DefineUnitTest(RadeLoopbackTest)
+target_link_libraries(RadeLoopbackTest PRIVATE rade opus samplerate)
+target_compile_definitions(RadeLoopbackTest PRIVATE SPEECH_WAV_PATH="${RADE_SPEECH_WAV}")
 #endif(LINUX)
 
 # ---------------------------------------------------------------------------

@@ -79,9 +79,66 @@ bool falseStep()
     return eitherOrCommon(false);
 }
 
+// Counts the samples it's given and passes them through.
+class CountingStep : public IPipelineStep
+{
+public:
+    explicit CountingStep(int& samplesSeen) : samplesSeen_(samplesSeen) {}
+
+    virtual int getInputSampleRate() const FREEDV_NONBLOCKING { return 8000; }
+    virtual int getOutputSampleRate() const FREEDV_NONBLOCKING { return 8000; }
+    virtual short* execute(short* inputSamples, int numInputSamples, int* numOutputSamples) FREEDV_NONBLOCKING
+    {
+        samplesSeen_ += numInputSamples;
+        *numOutputSamples = numInputSamples;
+        return inputSamples;
+    }
+
+private:
+    int& samplesSeen_;
+};
+
+static bool SwitchingCondition_;
+
+bool switchesBetweenCalls()
+{
+    // The condition is checked on every call (freedv-gui flips it from the
+    // GUI while audio runs), and only the selected step sees that block.
+    int trueSamples = 0;
+    int falseSamples = 0;
+    SwitchingCondition_ = true;
+    EitherOrStep step(+[]() FREEDV_NONBLOCKING { return SwitchingCondition_; },
+                      new CountingStep(trueSamples), new CountingStep(falseSamples));
+
+    short block[160] = {0};
+    int numOut = 0;
+    const bool sequence[] = {true, true, false, true, false, false, false, true};
+    int expectedTrue = 0, expectedFalse = 0;
+    for (bool condition : sequence)
+    {
+        SwitchingCondition_ = condition;
+        short* result = step.execute(block, 160, &numOut);
+        (condition ? expectedTrue : expectedFalse) += 160;
+        if (result != block || numOut != 160)
+        {
+            std::cerr << "[block not passed through the selected step]...";
+            return false;
+        }
+    }
+
+    if (trueSamples != expectedTrue || falseSamples != expectedFalse)
+    {
+        std::cerr << "[true step saw " << trueSamples << " (expected " << expectedTrue << "), false step "
+                  << falseSamples << " (expected " << expectedFalse << ")]...";
+        return false;
+    }
+    return true;
+}
+
 int main()
 {
     TEST_CASE(trueStep);
     TEST_CASE(falseStep);
+    TEST_CASE(switchesBetweenCalls);
     return 0;
 }

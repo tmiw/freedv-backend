@@ -157,6 +157,8 @@ jobs:
         for dll in libc++.dll libunwind.dll libwinpthread-1.dll; do
           cp ${LLVM_MINGW}/x86_64-w64-mingw32/bin/$dll windows-tests/
         done
+        # Real speech for RNNoiseStepTest (see src/pipeline/test/SpeechSample.h).
+        cp build/rade_src/wav/all.wav windows-tests/
         ls -l windows-tests
 
     - uses: actions/upload-artifact@v4
