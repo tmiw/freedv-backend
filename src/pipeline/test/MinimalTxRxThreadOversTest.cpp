@@ -86,17 +86,20 @@ std::vector<short> transmit(paCallBackData& cbData, const std::vector<short>& sp
 
     // Starting TX makes the thread empty its input FIFO the next time it
     // runs, which wipes anything written before then. Queue a short marker
-    // and wait for the FIFO to drain (wiped, or sent if the wipe is broken)
-    // before writing the speech, so none of it is caught by the wipe.
+    // and wait for the FIFO to drain before writing the speech, so none of
+    // it is caught by the wipe. The output FIFO isn't drained meanwhile:
+    // with nothing to send, the thread transmits silence, and the small
+    // output FIFO (see below) stops it after one block. If the wipe is
+    // broken, the marker and stale audio are sent instead, a block at a
+    // time, and the wait times out.
     std::vector<short> marker(SPEECH_CHUNK, 0);
     cbData.infifo1->write(marker.data(), (int)marker.size());
     endingTx.store(false, std::memory_order_release);
     g_tx.store(true, std::memory_order_release);
-    auto deadline = std::chrono::steady_clock::now() + 10s;
+    auto deadline = std::chrono::steady_clock::now() + 5s;
     while (cbData.infifo1->numUsed() > 0 && std::chrono::steady_clock::now() < deadline)
     {
         std::this_thread::sleep_for(1ms);
-        drainInto(cbData.outfifo1, modem);
     }
     feed(cbData.infifo1, speech.data(), speech.size(), SPEECH_CHUNK, cbData.outfifo1, modem);
 
@@ -150,7 +153,7 @@ bool secondTransmissionStartsClean()
     // thread can never run dry mid-transmission (it would send silence,
     // making the transmission longer, on a slow or busy machine).
     cbData.infifo1 = new GenericFIFO<short>(8 * SPEECH_RATE);
-    cbData.outfifo1 = new GenericFIFO<short>(MODEM_RATE);
+    cbData.outfifo1 = nullptr; // sized once the TX thread knows its frame size
     cbData.infifo2 = new GenericFIFO<short>(MODEM_RATE);
     cbData.outfifo2 = new GenericFIFO<short>(SPEECH_RATE);
 
@@ -160,6 +163,12 @@ bool secondTransmissionStartsClean()
     auto rxThread = std::make_unique<MinimalTxRxThread>(false, MODEM_RATE, SPEECH_RATE, rxHelper, rade, encState, &fargan, radeText, &cbData);
     txThread->start(); rxThread->start();
     txThread->waitForReady(); rxThread->waitForReady();
+
+    // Room for exactly one modem frame (the thread only runs when a whole
+    // frame fits): it can't get more than a block ahead of what the test
+    // drains, so how long the test takes to start feeding speech can't
+    // change how much silence gets sent.
+    cbData.outfifo1 = new GenericFIFO<short>(txThread->getTxNNomModemSamples() + 1);
     txThread->signalToStart(); rxThread->signalToStart();
     std::this_thread::sleep_for(100ms);
 
