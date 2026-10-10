@@ -38,12 +38,13 @@ using namespace std::chrono_literals;
 #include "MinimalTxRxThread.h"
 #include "../pipeline/paCallbackData.h"
 
-#include "../../pipeline/AgcStep.h"
+#include "../../pipeline/LevelerLimiterStep.h"
 #include "../../pipeline/RNNoiseStep.h"
 #include "../../pipeline/ResampleStep.h"
 #include "../../pipeline/LevelAdjustStep.h"
 #include "../../pipeline/RADEReceiveStep.h"
 #include "../../pipeline/BandwidthExpandStep.h"
+#include "../../util/DiagnosticCsvLogger.h"
 
 #include "../../util/logging/ulog.h"
 #include "../../os/os_interface.h"
@@ -83,10 +84,10 @@ void MinimalTxRxThread::initializePipeline_()
     if (m_tx)
     {
         txStep_ = new RADETransmitStep(rade_, encState_);
-        auto agcStep = new AgcStep(txStep_->getInputSampleRate());
+        auto levelerLimiterStep = new LevelerLimiterStep(txStep_->getInputSampleRate(), std::make_shared<DiagnosticCsvLogger>());
         auto rnnoiseStep = new RNNoiseStep();
         pipeline_->appendPipelineStep(rnnoiseStep);
-        pipeline_->appendPipelineStep(agcStep);
+        pipeline_->appendPipelineStep(levelerLimiterStep);
         pipeline_->appendPipelineStep(txStep_);
         
         auto levelAdjustStep = new LevelAdjustStep(outputSampleRate_, +[]() FREEDV_NONBLOCKING { return TxScaleFactor_; });

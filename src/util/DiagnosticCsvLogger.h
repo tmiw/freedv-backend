@@ -1,8 +1,9 @@
 //=========================================================================
-// Name:            AgcStep.h
-// Purpose:         Describes an AGC step in the audio pipeline.
+// Name:            DiagnosticCsvLogger.h
+// Purpose:         Diagnostic-only CSV logger for the leveler/limiter
+//                  pipeline step.
 //
-// Authors:         Mooneer Salem
+// Authors:         Claude Code (for Barry Jackson, G4MKT)
 // License:
 //
 // All rights reserved.
@@ -32,42 +33,34 @@
 //
 //=========================================================================
 
-#ifndef AUDIO_PIPELINE__AGC_STEP_H
-#define AUDIO_PIPELINE__AGC_STEP_H
+#ifndef UTIL__DIAGNOSTIC_CSV_LOGGER_H
+#define UTIL__DIAGNOSTIC_CSV_LOGGER_H
 
-#include "IPipelineStep.h"
-#include "../util/GenericFIFO.h"
-#include "../3rdparty/WebRTC_AGC/agc.h"
+#include <cstdio>
+#include <chrono>
 
-#include <memory>
+#include "freedv_sanitizers.h"
 
-class AgcStep : public IPipelineStep
+// Diagnostic only, not for production use. Opens and writes ~/agc_diag.csv
+// only when built with -DENABLE_AUDIO_DIAG_LOGGING=ON (see the top-level
+// CMakeLists.txt); otherwise every call is a cheap no-op, so
+// LevelerLimiterStep can always be given an instance.
+//
+// Writes one row per ~10ms processing chunk.
+class DiagnosticCsvLogger
 {
 public:
-    AgcStep(int sampleRate);
-    virtual ~AgcStep();
-    
-    virtual int getInputSampleRate() const FREEDV_NONBLOCKING override;
-    virtual int getOutputSampleRate() const FREEDV_NONBLOCKING override;
-    virtual short* execute(short* inputSamples, int numInputSamples, int* numOutputSamples) FREEDV_NONBLOCKING override;
-    virtual void reset() FREEDV_NONBLOCKING override;
-    
+    DiagnosticCsvLogger();
+    ~DiagnosticCsvLogger();
+
+    // appliedGainDb differs from currentGainDb only during the leveler's
+    // startup ramp-in (see STARTUP_RAMP_SEC in LevelerLimiterStep.cpp).
+    void logChunk(double inputDbfs, double feedbackLufs, double targetGainDb, double currentGainDb, double appliedGainDb,
+                  double gainReductionDb, double outputDbfs) FREEDV_NONBLOCKING;
+
 private:
-    int sampleRate_;
-    float targetGainDb_;
-    float currentGainDb_;
-    WebRtcAgcConfig agcConfig_;
-    void* agcState_;
-
-    void* ebur128State_;
-
-    int numSamplesPerRun_;
-    int blocksSinceLoudnessUpdate_;
-    bool lastMeasurementValid_;
-    GenericFIFO<short> inputSampleFifo_;
-    std::unique_ptr<short[]> outputSamples_;
-    std::unique_ptr<short[]> tmpInput_;
+    FILE* file_;
+    std::chrono::steady_clock::time_point startTime_;
 };
 
-
-#endif // AUDIO_PIPELINE__AGC_STEP_H
+#endif // UTIL__DIAGNOSTIC_CSV_LOGGER_H
