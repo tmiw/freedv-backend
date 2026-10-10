@@ -21,6 +21,11 @@
 #include "../FreeDVReporter.h"
 #include "../../util/test/LoopbackTcpServer.h"
 
+#if defined(ENABLE_TLS_SUPPORT)
+#include <openssl/ssl.h>
+#include "../../util/test/TestCertificate.h"
+#endif // defined(ENABLE_TLS_SUPPORT)
+
 using namespace std::chrono_literals;
 
 namespace {
@@ -71,19 +76,59 @@ std::string getStr(yyjson_val* obj, const char* key)
 }
 
 // Fake FreeDV Reporter server: WebSocket server role on top of
-// LoopbackTcpServer, plus socket.io helpers.
+// LoopbackTcpServer (optionally over TLS), plus socket.io helpers.
 class FakeReporterServer
 {
 public:
+    FakeReporterServer() = default;
+
+#if defined(ENABLE_TLS_SUPPORT)
+    // Serves over TLS with this certificate (for "localhost"), as the real
+    // server does when freedv-gui uses a secure connection (its default).
+    explicit FakeReporterServer(TestCertificate& cert)
+        : sslCtx_(SSL_CTX_new(TLS_server_method()))
+    {
+        SSL_CTX_use_certificate(sslCtx_, cert.cert);
+        SSL_CTX_use_PrivateKey(sslCtx_, cert.key);
+    }
+#endif // defined(ENABLE_TLS_SUPPORT)
+
+    ~FakeReporterServer()
+    {
+        endTls_();
+#if defined(ENABLE_TLS_SUPPORT)
+        if (sslCtx_ != nullptr)
+        {
+            SSL_CTX_free(sslCtx_);
+        }
+#endif // defined(ENABLE_TLS_SUPPORT)
+    }
+
+    FakeReporterServer(const FakeReporterServer&) = delete;
+    FakeReporterServer& operator=(const FakeReporterServer&) = delete;
+
     bool valid() const { return tcp_.valid(); }
     int port() const { return tcp_.port(); }
-    std::string hostname() const { return "127.0.0.1:" + std::to_string(port()); }
+
+    // The TLS certificate is for "localhost" (which also tries ::1 first;
+    // the server only listens on 127.0.0.1).
+    std::string hostname() const
+    {
+#if defined(ENABLE_TLS_SUPPORT)
+        if (sslCtx_ != nullptr)
+        {
+            return "localhost:" + std::to_string(port());
+        }
+#endif // defined(ENABLE_TLS_SUPPORT)
+        return "127.0.0.1:" + std::to_string(port());
+    }
 
     // Accepts the client and completes the WebSocket upgrade. Records the
     // request target so tests can check the engine.io query string.
     bool acceptWebSocket(int timeoutMs = ACCEPT_TIMEOUT_MS)
     {
-        if (!tcp_.accept(timeoutMs))
+        endTls_();
+        if (!tcp_.accept(timeoutMs) || !startTls_())
         {
             return false;
         }
@@ -92,7 +137,7 @@ public:
         while (request.find("\r\n\r\n") == std::string::npos)
         {
             char c;
-            if (!tcp_.recvExact(&c, 1, IO_TIMEOUT_MS) || request.size() > 8192)
+            if (!recvExact_(&c, 1, IO_TIMEOUT_MS) || request.size() > 8192)
             {
                 return false;
             }
@@ -132,7 +177,7 @@ public:
             "Upgrade: websocket\r\n"
             "Connection: Upgrade\r\n"
             "Sec-WebSocket-Accept: " + websocketpp::base64_encode(hash, sizeof(hash)) + "\r\n\r\n";
-        return tcp_.sendAll(response);
+        return sendAll_(response);
     }
 
     const std::string& requestTarget() const { return requestTarget_; }
@@ -161,7 +206,7 @@ public:
             }
         }
         frame += payload;
-        return tcp_.sendAll(frame);
+        return sendAll_(frame);
     }
 
     bool sendEvent(const std::string& name, const std::string& argsJson)
@@ -176,7 +221,7 @@ public:
         while (true)
         {
             unsigned char header[2];
-            if (!tcp_.recvExact(header, 2, timeoutMs))
+            if (!recvExact_(header, 2, timeoutMs))
             {
                 return false;
             }
@@ -187,7 +232,7 @@ public:
             {
                 unsigned char ext[8];
                 int extLen = (length == 126) ? 2 : 8;
-                if (!tcp_.recvExact(ext, extLen, timeoutMs))
+                if (!recvExact_(ext, extLen, timeoutMs))
                 {
                     return false;
                 }
@@ -198,12 +243,12 @@ public:
                 }
             }
             unsigned char mask[4] = {0, 0, 0, 0};
-            if (masked && !tcp_.recvExact(mask, 4, timeoutMs))
+            if (masked && !recvExact_(mask, 4, timeoutMs))
             {
                 return false;
             }
             std::string data(length, '\0');
-            if (length > 0 && !tcp_.recvExact(&data[0], length, timeoutMs))
+            if (length > 0 && !recvExact_(&data[0], length, timeoutMs))
             {
                 return false;
             }
@@ -278,14 +323,100 @@ public:
                sendText(R"(40{"sid":"sio-test"})");
     }
 
-    bool waitForClientClose(int timeoutMs = IO_TIMEOUT_MS) { return tcp_.waitForPeerClose(timeoutMs); }
-    void dropConnection() { tcp_.closePeer(); }
+    bool waitForClientClose(int timeoutMs = IO_TIMEOUT_MS)
+    {
+#if defined(ENABLE_TLS_SUPPORT)
+        if (ssl_ != nullptr)
+        {
+            // Discard data until close_notify or EOF.
+            testSetRecvTimeout(tcp_.peerFd(), timeoutMs);
+            char buf[1024];
+            int numRead;
+            while ((numRead = SSL_read(ssl_, buf, sizeof(buf))) > 0)
+            {
+            }
+            return SSL_get_error(ssl_, numRead) == SSL_ERROR_ZERO_RETURN || !testLastRecvTimedOut();
+        }
+#endif // defined(ENABLE_TLS_SUPPORT)
+        return tcp_.waitForPeerClose(timeoutMs);
+    }
+
+    void dropConnection()
+    {
+        endTls_();
+        tcp_.closePeer();
+    }
 
     std::vector<std::string> skipped;
 
 private:
     LoopbackTcpServer tcp_;
     std::string requestTarget_;
+#if defined(ENABLE_TLS_SUPPORT)
+    SSL_CTX* sslCtx_ = nullptr;
+    SSL* ssl_ = nullptr;
+#endif // defined(ENABLE_TLS_SUPPORT)
+
+    // TLS handshake on a newly accepted client (no-op without TLS).
+    bool startTls_()
+    {
+#if defined(ENABLE_TLS_SUPPORT)
+        if (sslCtx_ != nullptr)
+        {
+            testSetRecvTimeout(tcp_.peerFd(), IO_TIMEOUT_MS);
+            testSetSendTimeout(tcp_.peerFd(), IO_TIMEOUT_MS);
+            ssl_ = SSL_new(sslCtx_);
+            SSL_set_fd(ssl_, tcp_.peerFd());
+            return SSL_accept(ssl_) == 1;
+        }
+#endif // defined(ENABLE_TLS_SUPPORT)
+        return true;
+    }
+
+    void endTls_()
+    {
+#if defined(ENABLE_TLS_SUPPORT)
+        if (ssl_ != nullptr)
+        {
+            SSL_free(ssl_);
+            ssl_ = nullptr;
+        }
+#endif // defined(ENABLE_TLS_SUPPORT)
+    }
+
+    bool recvExact_(void* data, size_t length, int timeoutMs)
+    {
+#if defined(ENABLE_TLS_SUPPORT)
+        if (ssl_ != nullptr)
+        {
+            testSetRecvTimeout(tcp_.peerFd(), timeoutMs);
+            char* ptr = static_cast<char*>(data);
+            while (length > 0)
+            {
+                int numRead = SSL_read(ssl_, ptr, (int)length);
+                if (numRead <= 0)
+                {
+                    return false;
+                }
+                ptr += numRead;
+                length -= numRead;
+            }
+            return true;
+        }
+#endif // defined(ENABLE_TLS_SUPPORT)
+        return tcp_.recvExact(data, length, timeoutMs);
+    }
+
+    bool sendAll_(const std::string& data)
+    {
+#if defined(ENABLE_TLS_SUPPORT)
+        if (ssl_ != nullptr)
+        {
+            return SSL_write(ssl_, data.data(), (int)data.size()) == (int)data.size();
+        }
+#endif // defined(ENABLE_TLS_SUPPORT)
+        return tcp_.sendAll(data);
+    }
 
     static std::string writeJson_(yyjson_val* val)
     {
@@ -723,6 +854,67 @@ bool testAlternateRoles()
     return report(result);
 }
 
+#if defined(ENABLE_TLS_SUPPORT)
+bool testSecureConnection(TestCertificate& cert)
+{
+    std::cout << "Test 9 (secure connection: handshake and events over TLS): ";
+
+    // freedv-gui connects securely by default.
+    testSetEnv("SSL_CERT_FILE", cert.path.c_str());
+    FakeReporterServer server(cert);
+    CallbackLog log;
+    FreeDVReporter reporter(server.hostname(), "N1DQ", "CN98", "FreeDV Test", false, false, true);
+    registerCallbacks(reporter, log);
+    reporter.freqChange(14236000);
+
+    bool result = CHECK(server.valid());
+    reporter.connect();
+    JsonDoc auth;
+    result &= CHECK(server.completeHandshake(auth));
+    result &= CHECK((getStr(auth.root(), "callsign") == "N1DQ"));
+
+    result &= CHECK(server.sendEvent("connection_successful", "{}"));
+    result &= CHECK(log.waitFor("connection_successful"));
+    JsonDoc args;
+    result &= CHECK(server.expectEvent("freq_change", args));
+    result &= CHECK((yyjson_get_uint(yyjson_obj_get(args.root(), "freq")) == 14236000ULL));
+
+    result &= CHECK(server.sendEvent("message_update", R"({"sid":"s1","last_update":"u","message":"over TLS"})"));
+    result &= CHECK(log.waitFor("message_update s1 over TLS"));
+
+    // A large event (several TLS records) arrives intact.
+    std::string longMessage(20000, 'm');
+    result &= CHECK(server.sendEvent("message_update", R"({"sid":"s2","last_update":"u","message":")" + longMessage + R"("})"));
+    result &= CHECK(log.waitFor("message_update s2 " + longMessage));
+
+    return report(result);
+}
+
+bool testSecureConnectionRejectsUntrustedServer(TestCertificate& cert)
+{
+    std::cout << "Test 10 (secure connection refuses a server it doesn't trust): ";
+
+    // Trust nothing: the server's certificate can't be verified, so the
+    // reporter must not get as far as sending its WebSocket request.
+    std::string emptyTrustFile = testMakeTempFile("fdvnone");
+    testSetEnv("SSL_CERT_FILE", emptyTrustFile.c_str());
+    FakeReporterServer server(cert);
+    CallbackLog log;
+    {
+        FreeDVReporter reporter(server.hostname(), "N1DQ", "CN98", "FreeDV Test", false, false, true);
+        registerCallbacks(reporter, log);
+
+        bool result = CHECK(server.valid());
+        reporter.connect();
+        result &= CHECK(!server.acceptWebSocket());
+        result &= CHECK(log.count("connection_successful") == 0);
+        std::remove(emptyTrustFile.c_str());
+        testSetEnv("SSL_CERT_FILE", cert.path.c_str());
+        return report(result);
+    }
+}
+#endif // defined(ENABLE_TLS_SUPPORT)
+
 } // namespace
 
 int main(int, char**)
@@ -744,6 +936,17 @@ int main(int, char**)
     result &= testServerInitiatedDisconnects();
     result &= testPingTimeout();
     result &= testAlternateRoles();
+
+#if defined(ENABLE_TLS_SUPPORT)
+    TestCertificate cert;
+    if (!cert.generate())
+    {
+        std::cout << "Could not generate test certificate\n";
+        return -1;
+    }
+    result &= testSecureConnection(cert);
+    result &= testSecureConnectionRejectsUntrustedServer(cert);
+#endif // defined(ENABLE_TLS_SUPPORT)
 
     return result ? 0 : -1;
 }
