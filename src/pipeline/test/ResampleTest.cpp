@@ -1,6 +1,12 @@
 #include "ResampleStep.h"
 #include "PipelineTestCommon.h"
 
+#include <vector>
+
+#ifndef M_PI // not defined by every C library (e.g. on Windows)
+#define M_PI 3.14159265358979323846
+#endif
+
 bool resampleTestCaseCommon(int inputSampleRate, int outputSampleRate)
 {
     ResampleStep resampleStep(inputSampleRate, outputSampleRate);
@@ -37,10 +43,77 @@ bool resampleToLower()
     return resampleTestCaseCommon(48000, 8000);
 }
 
+// Streams two seconds of a 400 Hz tone through the resampler in 10 ms blocks
+// (441 samples at 44.1 kHz) and checks what comes out: the right number of
+// samples (no drift), still a 400 Hz tone, at the same level.
+bool resampleToneCommon(int inputSampleRate, int outputSampleRate)
+{
+    ResampleStep resampleStep(inputSampleRate, outputSampleRate);
+
+    const int seconds = 2;
+    const double amplitude = 8000;
+    std::vector<short> input(seconds * inputSampleRate);
+    for (size_t n = 0; n < input.size(); n++)
+    {
+        input[n] = (short)(amplitude * std::sin(2 * M_PI * 400.0 * n / inputSampleRate));
+    }
+
+    std::vector<short> output;
+    const int block = inputSampleRate / 100;
+    for (size_t pos = 0; pos < input.size(); pos += block)
+    {
+        int numOutputSamples = 0;
+        short* result = resampleStep.execute(&input[pos], block, &numOutputSamples);
+        output.insert(output.end(), result, result + numOutputSamples);
+    }
+
+    // Allow for the filter delay, but not for drift.
+    int expected = seconds * outputSampleRate;
+    if (std::abs((int)output.size() - expected) > outputSampleRate / 50)
+    {
+        std::cerr << "[" << output.size() << " samples out, expected " << expected << "]...";
+        return false;
+    }
+
+    // Measure from 100 ms in (past the filter's start-up).
+    size_t start = outputSampleRate / 10;
+    int crossings = 0;
+    double sumSquares = 0;
+    for (size_t i = start + 1; i < output.size(); i++)
+    {
+        if ((output[i - 1] < 0) != (output[i] < 0))
+        {
+            crossings++;
+        }
+        sumSquares += (double)output[i] * output[i];
+    }
+    double measured = (double)(output.size() - start - 1);
+    double freq = crossings / (2 * measured / outputSampleRate);
+    double levelDb = 20 * std::log10(std::sqrt(sumSquares / measured) / (amplitude / std::sqrt(2.0)));
+    if (std::abs(freq - 400) > 4 || std::abs(levelDb) > 0.5)
+    {
+        std::cerr << "[output is " << freq << " Hz at " << levelDb << " dB, expected 400 Hz at 0 dB]...";
+        return false;
+    }
+
+    return true;
+}
+
+bool resample44100To48000() { return resampleToneCommon(44100, 48000); }
+bool resample48000To44100() { return resampleToneCommon(48000, 44100); }
+bool resample44100To8000() { return resampleToneCommon(44100, 8000); }
+bool resample8000To44100() { return resampleToneCommon(8000, 44100); }
+bool resample48000To8000Tone() { return resampleToneCommon(48000, 8000); }
+
 int main()
 {
     TEST_CASE(resampleEqual);
     TEST_CASE(resampleToHigher);
     TEST_CASE(resampleToLower);
+    TEST_CASE(resample44100To48000);
+    TEST_CASE(resample48000To44100);
+    TEST_CASE(resample44100To8000);
+    TEST_CASE(resample8000To44100);
+    TEST_CASE(resample48000To8000Tone);
     return 0;
 }
