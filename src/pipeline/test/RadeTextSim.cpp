@@ -83,6 +83,10 @@
 #include <type_traits>
 #include <vector>
 
+#ifndef M_PI // not defined by every C library (e.g. on Windows)
+#define M_PI 3.14159265358979323846
+#endif
+
 static constexpr float SYMBOL_RATE = 25.0f;
 static constexpr int CODEWORD_SYMS = 112; // LDPC(112,56)
 

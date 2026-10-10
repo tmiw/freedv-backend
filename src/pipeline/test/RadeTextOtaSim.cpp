@@ -76,6 +76,10 @@
 #include <string>
 #include <vector>
 
+#ifndef M_PI // not defined by every C library (e.g. on Windows)
+#define M_PI 3.14159265358979323846
+#endif
+
 static constexpr float FS = RADE_MODEM_SAMPLE_RATE;
 static constexpr int NB_FEATURES = 36; // NB_TOTAL_FEATURES
 static constexpr int CODEWORD_SYMS = 112; // LDPC(112,56)
