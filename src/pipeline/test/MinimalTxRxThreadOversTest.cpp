@@ -146,7 +146,10 @@ bool secondTransmissionStartsClean()
     }, nullptr);
 
     paCallBackData cbData;
-    cbData.infifo1 = new GenericFIFO<short>(SPEECH_RATE);
+    // Room for a whole transmission, so its speech is queued at once and the
+    // thread can never run dry mid-transmission (it would send silence,
+    // making the transmission longer, on a slow or busy machine).
+    cbData.infifo1 = new GenericFIFO<short>(8 * SPEECH_RATE);
     cbData.outfifo1 = new GenericFIFO<short>(MODEM_RATE);
     cbData.infifo2 = new GenericFIFO<short>(MODEM_RATE);
     cbData.outfifo2 = new GenericFIFO<short>(SPEECH_RATE);
