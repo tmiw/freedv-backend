@@ -85,6 +85,8 @@ macro(DefineUnitTest utName)
     target_link_libraries(${utName} PRIVATE fdv_util)
 
     add_test(NAME util_${utName} COMMAND ${CMAKE_CURRENT_BINARY_DIR}/${utName})
+    # Fail a hung test instead of letting it run until CI gives up.
+    set_tests_properties(util_${utName} PROPERTIES TIMEOUT 600)
 endmacro()
 
 DefineUnitTest(ThreadedTimerTest)

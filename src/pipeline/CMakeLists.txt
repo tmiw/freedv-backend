@@ -34,6 +34,8 @@ macro(DefineUnitTest utName)
     target_include_directories(${utName} PRIVATE ${CODEC2_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_BINARY_DIR}/..)
 
     add_test(NAME pipeline_${utName} COMMAND ${CMAKE_CURRENT_BINARY_DIR}/${utName})
+    # Fail a hung test instead of letting it run until CI gives up.
+    set_tests_properties(pipeline_${utName} PROPERTIES TIMEOUT 600)
 
     set_target_properties(
         ${utName}
@@ -114,17 +116,20 @@ endif()
 if(RADAE_PYTHON_EXECUTABLE)
     message(STATUS "MinimalTxRxThreadTest: using Python at ${RADAE_PYTHON_EXECUTABLE}")
 
-    # Populate Python RADE scripts
+    # Populate Python RADE scripts. Only loss.py (which compares two feature
+    # files) is used, so pin a known-good commit rather than tracking main,
+    # where an unrelated change could break the test.
     include(ExternalProject)
     ExternalProject_Add(
         rade_python
-	URL https://github.com/drowe67/radae/archive/refs/heads/main.zip
+	URL https://github.com/drowe67/radae/archive/89220e28fcc25138c0e038849e653dba30ec2dd6.zip
 	CONFIGURE_COMMAND ""
 	BUILD_COMMAND ""
 	INSTALL_COMMAND "")
     ExternalProject_Get_Property(rade_python SOURCE_DIR)
 
     DefineUnitTest(MinimalTxRxThreadTest)
+    add_dependencies(MinimalTxRxThreadTest rade_python) # the test runs loss.py from it
     target_link_libraries(MinimalTxRxThreadTest PRIVATE rade opus samplerate)
     target_compile_definitions(MinimalTxRxThreadTest PRIVATE
 	    RADE_SRC_DIR="${SOURCE_DIR}"

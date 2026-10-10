@@ -24,6 +24,8 @@ macro(DefineUnitTest utName)
     target_include_directories(${utName} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
     add_test(NAME reporting_${utName} COMMAND ${CMAKE_CURRENT_BINARY_DIR}/${utName})
+    # Fail a hung test instead of letting it run until CI gives up.
+    set_tests_properties(reporting_${utName} PROPERTIES TIMEOUT 600)
 endmacro()
 
 DefineUnitTest(CsvReporterTest)
