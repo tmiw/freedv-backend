@@ -114,6 +114,10 @@ void ResetMainWindowColorSpace()
 
 void StartLowLatencyActivity()
 {
+    // Starting again without a stop would otherwise leak the first activity,
+    // and with it the "no idle sleep" assertion, until FreeDV exits.
+    StopLowLatencyActivity();
+
     NSActivityOptions options = NSActivityUserInitiated | NSActivityIdleSystemSleepDisabled | NSActivityLatencyCritical;
 
     Activity = [[NSProcessInfo processInfo] beginActivityWithOptions: options reason:@"FreeDV provides low latency audio processing and should not be inturrupted by system throttling."];
