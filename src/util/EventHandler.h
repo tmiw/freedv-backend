@@ -48,9 +48,12 @@ private:
 template<typename... FnArgs>
 void EventHandler<FnArgs...>::operator() (FnArgs... args)
 {
+    // Pass the arguments as lvalues: forwarding them would let the first
+    // handler move from a by-value argument (e.g. a std::string) and leave
+    // the handlers after it with an empty one.
     for (auto& fn : fnList_)
     {
-        fn(std::forward<FnArgs>(args)...);
+        fn(args...);
     }
 }
 

@@ -11,10 +11,13 @@
 //                       (speech rate in → modem rate out).
 //                    3. The modem-rate output is piped through an RX instance
 //                       (modem rate in → speech rate out).
-//                  Feature files are captured via utTxFeatureFile /
-//                  utRxFeatureFile and evaluated by rade_src/loss.py with
-//                  --loss_test 0.15.  The overall test passes only when every
-//                  configured combination passes.
+//                  Every combination must deliver the EOO callsign and
+//                  bring back speech of about the right length and level.
+//                  Where Python is configured, feature files captured via
+//                  utTxFeatureFile / utRxFeatureFile are also scored by
+//                  radae's loss.py with --loss_test 0.15; without it (e.g.
+//                  on Windows) only the first 10 s of speech is used, to
+//                  keep the run short.
 //
 //                  Valid speech rates  (TX input / RX output): 16000, 22050,
 //                    24000, 32000, 44100, 48000 Hz.
@@ -62,7 +65,7 @@
 #include <thread>
 #include <memory>
 
-#include <unistd.h>
+#include <cmath>
 
 extern "C"
 {
@@ -80,6 +83,8 @@ extern "C"
 #include "ResampleStep.h"
 #include "../util/GenericFIFO.h"
 #include "../util/logging/ulog.h"
+#include "../../util/test/TestSocketCompat.h" // testMakeTempFile()
+#include "SpeechSample.h"
 
 // ---------------------------------------------------------------------------
 // Globals required by MinimalTxRxThread
@@ -95,57 +100,10 @@ std::string utTxFeatureFile;
 std::string utRxFeatureFile;
 
 // ---------------------------------------------------------------------------
-// Minimal WAV header parser.  Advances *f* past all RIFF chunks until the
-// "data" chunk is found.  Returns true and leaves the file positioned at the
-// first audio sample on success.
-// ---------------------------------------------------------------------------
-static bool skipWavHeader(FILE* f)
-{
-    auto read32 = [&](uint32_t& v) -> bool {
-        return fread(&v, 4, 1, f) == 1;
-    };
-
-    char id[4];
-    uint32_t size = 0;
-
-    if (fread(id, 4, 1, f) != 1 || memcmp(id, "RIFF", 4) != 0) return false;
-    if (!read32(size)) return false;
-    if (fread(id, 4, 1, f) != 1 || memcmp(id, "WAVE", 4) != 0) return false;
-
-    while (true)
-    {
-        if (fread(id, 4, 1, f) != 1) return false;
-        if (!read32(size))           return false;
-        if (memcmp(id, "data", 4) == 0)
-            return true;
-        if (fseek(f, (long)size, SEEK_CUR) != 0)
-            return false;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Load all PCM samples from a 16-bit mono WAV file into a vector.
-// ---------------------------------------------------------------------------
-static std::vector<short> loadWav(const char* path)
-{
-    FILE* f = fopen(path, "rb");
-    assert(f != nullptr && "Could not open WAV file");
-    assert(skipWavHeader(f) && "Failed to parse WAV header");
-
-    std::vector<short> samples;
-    short buf[4096];
-    size_t n;
-    while ((n = fread(buf, sizeof(short), 4096, f)) > 0)
-        samples.insert(samples.end(), buf, buf + n);
-
-    fclose(f);
-    return samples;
-}
-
-// ---------------------------------------------------------------------------
 // Run loss.py on the two feature files.
 // Returns true if loss.py outputs "PASS" (and not "FAIL").
 // ---------------------------------------------------------------------------
+#if defined(PYTHON_EXECUTABLE)
 static bool runLossCheck(const char* txFeat, const char* rxFeat)
 {
     std::string cmd =
@@ -178,6 +136,15 @@ static bool runLossCheck(const char* txFeat, const char* rxFeat)
     return output.find("PASS") != std::string::npos &&
            output.find("FAIL") == std::string::npos;
 }
+#endif // defined(PYTHON_EXECUTABLE)
+
+static double rmsOf(const std::vector<short>& samples, size_t start)
+{
+    double sum = 0;
+    for (size_t i = start; i < samples.size(); i++)
+        sum += (double)samples[i] * samples[i];
+    return samples.size() > start ? std::sqrt(sum / (samples.size() - start)) : 0;
+}
 
 // ---------------------------------------------------------------------------
 // Run one TX → RX pipeline test for a given (speechRate, modemRate) pair.
@@ -200,7 +167,8 @@ static bool runPipeline(
     struct rade*      rade,
     LPCNetEncState*   encState,
     FARGANState*      fargan,
-    rade_text_t       radeText)
+    rade_text_t       radeText,
+    std::vector<short>& rxSpeech)
 {
     // Reset per-run global state
     g_tx.store(true, std::memory_order_release);
@@ -350,8 +318,9 @@ static bool runPipeline(
         int avail = cbData.outfifo2->numUsed();
         if (avail > 0)
         {
-            std::vector<short> discard(static_cast<size_t>(avail));
-            cbData.outfifo2->read(discard.data(), avail);
+            size_t prev = rxSpeech.size();
+            rxSpeech.resize(prev + static_cast<size_t>(avail));
+            cbData.outfifo2->read(rxSpeech.data() + prev, avail);
             return true;
         }
         return false;
@@ -419,8 +388,20 @@ static bool runPipeline(
 int main()
 {
     // Load the source WAV once; all pipeline runs reuse this buffer
-    const std::vector<short> wavAudio16k = loadWav(RADE_SRC_DIR "/wav/all.wav");
+#if defined(PYTHON_EXECUTABLE)
+    const double speechSeconds = 3600; // the whole file, for loss.py
+#else
+    const double speechSeconds = 10;
+#endif // defined(PYTHON_EXECUTABLE)
+    const std::vector<short> wavAudio16k = loadSpeech16k(speechSeconds);
+    if (wavAudio16k.empty())
+    {
+        printf("Could not load the speech sample (rade_src/wav/all.wav)\n");
+        return 1;
+    }
     log_info("Loaded WAV: %zu samples at 16000 Hz", wavAudio16k.size());
+    const double inputSeconds = (double)wavAudio16k.size() / RADE_SPEECH_SAMPLE_RATE;
+    const double inputRms = rmsOf(wavAudio16k, 0);
 
     // Global RADE init / finalise (called only once for the process)
     rade_initialize();
@@ -454,12 +435,11 @@ int main()
         fflush(stdout);
 
         // Temporary feature files for this configuration
-        char txFeatPath[] = "/tmp/MinimalTxRxTest_tx_XXXXXX";
-        char rxFeatPath[] = "/tmp/MinimalTxRxTest_rx_XXXXXX";
-        int txFd = mkstemp(txFeatPath);
-        int rxFd = mkstemp(rxFeatPath);
-        assert(txFd >= 0 && rxFd >= 0);
-        close(txFd); close(rxFd);
+        std::string txFeatFile = testMakeTempFile("mtxtx");
+        std::string rxFeatFile = testMakeTempFile("mtxrx");
+        assert(!txFeatFile.empty() && !rxFeatFile.empty());
+        const char* txFeatPath = txFeatFile.c_str();
+        const char* rxFeatPath = rxFeatFile.c_str();
 
         // Point the RADETransmitStep / RADEReceiveStep hooks at the new files.
         // Must be set before MinimalTxRxThread objects (and thus their internal
@@ -492,15 +472,18 @@ int main()
 
         rade_text_generate_tx_string(radeText, "K6AQ", 4);
 
+        // Must start false: it used to start true, so the check passed even
+        // if the callsign never arrived.
         bool radeTextReceived = false;
         rade_text_set_rx_callback(radeText, [](rade_text_t, const char *txt_ptr, int length, void *state) {
             bool* pass = (bool*)state;
-            *pass = (strncmp(txt_ptr, "K6AQ", length) == 0);
+            *pass = (length == 4 && strncmp(txt_ptr, "K6AQ", length) == 0);
         }, &radeTextReceived);
 
         // Run the full TX → RX pipeline
+        std::vector<short> rxSpeech;
         bool pipelineOk = runPipeline(wavAudio16k, speechRate, modemRate,
-                                      rade, encState, &fargan, radeText);
+                                      rade, encState, &fargan, radeText, rxSpeech);
 
         // Tear down per-iteration RADE state now that threads are stopped
         // (feature files are fully written at this point)
@@ -508,12 +491,26 @@ int main()
         rade_close(rade);
         lpcnet_encoder_destroy(encState);
 
+        // The received speech must be about as long as what was sent, and
+        // (past the first second, while RX acquires) at about its level.
+        double rxSeconds = (double)rxSpeech.size() / speechRate;
+        double levelDb = 20 * std::log10(rmsOf(rxSpeech, speechRate) / inputRms);
+        bool speechOk = rxSeconds > 0.8 * inputSeconds && rxSeconds < 1.2 * inputSeconds + 1 &&
+                        std::fabs(levelDb) < 6;
+        printf("rx speech: %.1f s (sent %.1f s), level %+.1f dB\n", rxSeconds, inputSeconds, levelDb);
+
+#if defined(PYTHON_EXECUTABLE)
         // Evaluate quality with loss.py
-        bool passed = pipelineOk && runLossCheck(txFeatPath, rxFeatPath) && radeTextReceived;
+        bool lossOk = runLossCheck(txFeatPath, rxFeatPath);
+#else
+        bool lossOk = true;
+        printf("loss.py: skipped (no Python configured)\n");
+#endif // defined(PYTHON_EXECUTABLE)
+        bool passed = pipelineOk && radeTextReceived && speechOk && lossOk;
 
         // Remove temp feature files
-        unlink(txFeatPath);
-        unlink(rxFeatPath);
+        std::remove(txFeatPath);
+        std::remove(rxFeatPath);
 
         printf("callsign rx=%d\n", radeTextReceived);
         printf("speechRate=%-5d  modemRate=%-5d : %s\n\n",

@@ -41,6 +41,8 @@
 #include "ebur128.h" // from libebur128
 
 #include <assert.h>
+#include <algorithm>
+#include <cstring>
 
 // AGC settings
 constexpr float AGC_LOUDNESS_TARGET_LUFS = -23.0;
@@ -105,7 +107,9 @@ AgcStep::AgcStep(int sampleRate)
     assert(ebur128State_ != nullptr);
 
     // Pre-allocate buffers so we don't have to do so during real-time operation.
-    outputSamples_ = std::make_unique<short[]>(sampleRate);
+    // Sized for the rate we actually run at: an unsupported sampleRate falls
+    // back to 48 kHz, and callers then send audio at that rate.
+    outputSamples_ = std::make_unique<short[]>(sampleRate_);
     assert(outputSamples_ != nullptr);
 
     tmpInput_ = std::make_unique<short[]>(numSamplesPerRun_);
@@ -247,4 +251,31 @@ void AgcStep::reset() FREEDV_NONBLOCKING
     targetGainDb_ = 0;
     blocksSinceLoudnessUpdate_ = 0;
     lastMeasurementValid_ = false;
+
+    // Audio after a reset (e.g. the start of a new transmission) must not be
+    // shaped by audio from before it, so clear the history kept by both
+    // libraries. reset() runs on the real-time audio thread, so neither step
+    // may allocate.
+
+    // The WebRTC limiter keeps its own gain/envelope state. Re-initializing it
+    // doesn't allocate.
+    if (agcState_ != nullptr)
+    {
+        WebRtcAgc_Init(agcState_, 0, 255, kAgcModeUnchanged, sampleRate_);
+        WebRtcAgc_set_config(agcState_, agcConfig_);
+    }
+
+    // libebur128 has no reset, and recreating the state allocates. Its
+    // momentary loudness only looks at the last 400 ms, so feeding it 400 ms
+    // of silence leaves it equivalent to a freshly created state (the
+    // K-weighting filter history decays to zero as well).
+    ebur128_state* state = static_cast<ebur128_state*>(ebur128State_);
+    short* silence = tmpInput_.get();
+    memset(silence, 0, sizeof(short) * numSamplesPerRun_);
+    for (int remaining = sampleRate_ * 4 / 10; remaining > 0; remaining -= numSamplesPerRun_)
+    {
+        FREEDV_BEGIN_VERIFIED_SAFE
+        ebur128_add_frames_short(state, silence, std::min(remaining, numSamplesPerRun_));
+        FREEDV_END_VERIFIED_SAFE
+    }
 }

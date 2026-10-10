@@ -36,6 +36,11 @@
 
 #include "os_interface.h"
 
+#include <algorithm>
+#ifdef __linux__
+#include <pthread.h>
+#endif // __linux__
+
 void VerifyMicrophonePermissions(std::promise<bool>& micPromise)
 {
     micPromise.set_value(true);
@@ -70,6 +75,11 @@ void SetThreadName(std::string const& name)
     std::string fullName = "FDV ";
     fullName += name;
 #ifdef __linux__
+    // Linux thread names are at most 15 characters, and longer ones are
+    // rejected outright (ERANGE) rather than shortened, leaving the thread
+    // unnamed. Keep the first 15.
+    constexpr size_t MAX_THREAD_NAME_LENGTH = 15;
+    fullName.resize(std::min(fullName.size(), MAX_THREAD_NAME_LENGTH));
     pthread_setname_np(pthread_self(), fullName.c_str());
 #endif // __linux__
 }

@@ -22,6 +22,7 @@
 
 #include <chrono>
 #include "../os/os_interface.h"
+#include "logging/ulog.h"
 #include "ThreadedObject.h"
 
 using namespace std::chrono_literals;
@@ -145,12 +146,21 @@ void ThreadedObject::eventLoop_()
                 
                 fn = eventQueue_[0];
                 eventQueue_.pop_front();
+
+                // Mark the task as running in the same critical section that
+                // dequeues it. Otherwise waitForAllTasksComplete_() can see an
+                // empty queue *and* nothing running in between, return, and
+                // let the object be destroyed under the task.
+                taskCurrentlyExecuting_.store(true, std::memory_order_relaxed);
             }
         
             if (!isDestroying_.load(std::memory_order_relaxed) && fn)
             {
-                taskCurrentlyExecuting_.store(true, std::memory_order_relaxed);
                 fn();
+            }
+
+            {
+                std::unique_lock<std::recursive_mutex> lk(eventQueueMutex_);
                 taskCurrentlyExecuting_.store(false, std::memory_order_relaxed);
             }
 
@@ -161,21 +171,32 @@ void ThreadedObject::eventLoop_()
 
 void ThreadedObject::waitForAllTasksComplete_()
 {
+    // A task waiting for its own object's queue would wait on itself forever;
+    // nothing else can run on this thread until it returns anyway.
+    if (std::this_thread::get_id() == objectThread_.get_id())
+    {
+        return;
+    }
+
     std::unique_lock<std::recursive_mutex> lk(eventQueueMutex_);
     suppressEnqueue_.store(true, std::memory_order_relaxed);
-    auto count = eventQueue_.size();
-    lk.unlock();
 
-    constexpr int MAX_TIMEOUT_COUNT = 250; // should be ~250ms
-    int timeoutCount = 0;
-    while ((count > 0 || taskCurrentlyExecuting_.load(std::memory_order_relaxed)) && timeoutCount < MAX_TIMEOUT_COUNT)
+    // Wait until nothing is queued or running. Both are read under
+    // eventQueueMutex_, which eventLoop_() holds whenever it changes either.
+    // Like the macOS implementation, there's no timeout: returning while a
+    // task is still running lets the caller destroy the object under it.
+    auto start = std::chrono::steady_clock::now();
+    bool warned = false;
+    while (eventQueue_.size() > 0 || taskCurrentlyExecuting_.load(std::memory_order_relaxed))
     {
-        std::this_thread::sleep_for(1ms);
-        lk.lock();
-        count = eventQueue_.size();
         lk.unlock();
-
-        timeoutCount++;
+        std::this_thread::sleep_for(1ms);
+        if (!warned && std::chrono::steady_clock::now() - start > 2s)
+        {
+            log_warn("%s: still waiting for queued tasks to finish", name_.c_str());
+            warned = true;
+        }
+        lk.lock();
     }
 
     suppressEnqueue_.store(false, std::memory_order_relaxed);

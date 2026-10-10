@@ -37,8 +37,10 @@
 //==========================================================================
 
 #include "../rade_text.h"
+#include "../ldpc_encode.h"
 #include "../../util/logging/ulog.h"
 
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstdio>
@@ -1023,6 +1025,163 @@ static bool test19_rx_reset()
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Reference encoder: builds one block's on-air BPSK symbols independently
+// of rade_text, from the documented layout, so tests can pin the format and
+// send blocks the encoder never would (e.g. a wrong CRC).
+// Payload (56 bits, LSB first per field): [CRC-8 | last_block | block_index
+// (2) | 8 characters packed base 38 (42) | reserved (3)] -> LDPC(112,56) ->
+// bit interleave (b = 37 over 112 bits) -> BPSK (0 -> +1, 1 -> -1).
+// The CRC (poly 0x1D) covers the framing byte (block_index | last_block<<2)
+// followed by the 8 character codes.
+// ---------------------------------------------------------------------------
+static uint8_t referenceBlockCrc(const uint8_t chars[8], int blockIndex, bool lastBlock)
+{
+    uint8_t buf[9];
+    buf[0] = (uint8_t)(blockIndex | (lastBlock ? 0x4 : 0));
+    memcpy(&buf[1], chars, 8);
+    uint8_t crc = 0;
+    for (uint8_t byte : buf) {
+        crc ^= byte;
+        for (int bit = 0; bit < 8; bit++)
+            crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x1D) : (uint8_t)(crc << 1);
+    }
+    return crc;
+}
+
+static std::vector<float> referenceBlock(const uint8_t chars[8], int blockIndex, bool lastBlock, uint8_t crc)
+{
+    uint64_t packed = 0;
+    for (int i = 0; i < 8; i++)
+        packed = packed * 38 + chars[i];
+
+    std::array<uint8_t, 56> info{};
+    for (int i = 0; i < 8; i++) info[i] = (crc >> i) & 1;
+    info[8] = lastBlock ? 1 : 0;
+    for (int i = 0; i < 2; i++) info[9 + i] = (blockIndex >> i) & 1;
+    for (int i = 0; i < 42; i++) info[11 + i] = (packed >> i) & 1;
+    auto codeword = ldpc_encode(info);
+
+    std::vector<float> syms(CODEWORD_SYMS);
+    for (int i = 0; i < CODEWORD_SYMS; i++)
+        syms[(37 * i) % CODEWORD_SYMS] = codeword[i] ? -1.0f : 1.0f;
+    return syms;
+}
+
+// Character code in the 38-symbol alphabet ('0'-'9' -> 1-10, 'A'-'Z' -> 11-36, '/' -> 37).
+static uint8_t otaCode(char c)
+{
+    if (c >= '0' && c <= '9') return (uint8_t)(c - '0' + 1);
+    if (c == '/') return 37;
+    return (uint8_t)(c - 'A' + 11);
+}
+
+// Streams `syms` repeatedly (as the transmitter does) into a fresh receiver.
+static RxState receiveRepeated(const std::vector<float>& syms, int totalSyms)
+{
+    rade_text_t rx = rade_text_create();
+    rade_text_enable_stats_output(rx, 0);
+    RxState state;
+    rade_text_set_rx_callback(rx, onTextRx, &state);
+    for (int i = 0; i < totalSyms; i++)
+        rade_text_rx_symbol(rx, syms[i % syms.size()]);
+    rade_text_destroy(rx);
+    return state;
+}
+
+// ---------------------------------------------------------------------------
+// Test 20: the encoder's on-air format matches the reference encoder, so
+//          changes that would break decoding by other FreeDV versions show up
+// ---------------------------------------------------------------------------
+static bool test20_on_air_format()
+{
+    printf("=== Test 20: on-air format matches the reference encoder ===\n");
+
+    const uint8_t chars[8] = {otaCode('K'), otaCode('6'), otaCode('A'), otaCode('Q')};
+    auto expected = referenceBlock(chars, 0, true, referenceBlockCrc(chars, 0, true));
+
+    rade_text_t tx = rade_text_create();
+    rade_text_enable_stats_output(tx, 0);
+    rade_text_generate_tx_string(tx, "K6AQ", 4);
+    auto got = pullSymbols(tx, CODEWORD_SYMS);
+    rade_text_destroy(tx);
+
+    bool ok = got == expected;
+    RxState state = receiveRepeated(expected, SWEEP_COMPLETE_SYMS);
+    ok &= state.callCount >= 1 && state.received == "K6AQ";
+
+    printf("On-air format: %s\n\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Test 21: a block that decodes cleanly but whose CRC doesn't match its
+//          contents (as when noise turns it into a different valid
+//          codeword) is dropped rather than shown as a callsign
+// ---------------------------------------------------------------------------
+static bool test21_valid_codeword_bad_crc_rejected()
+{
+    printf("=== Test 21: valid codeword with a wrong CRC is rejected ===\n");
+
+    const uint8_t chars[8] = {otaCode('K'), otaCode('6'), otaCode('A'), otaCode('Q')};
+    uint8_t crc = referenceBlockCrc(chars, 0, true);
+    bool ok = true;
+    for (int bit = 0; bit < 8; bit++) {
+        auto syms = referenceBlock(chars, 0, true, crc ^ (1 << bit));
+        RxState state = receiveRepeated(syms, 4 * CODEWORD_SYMS);
+        if (state.callCount != 0) {
+            printf("  FAIL: CRC bit %d flipped, got '%s'\n", bit, state.received.c_str());
+            ok = false;
+        }
+    }
+
+    printf("Wrong CRC rejected: %s\n\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Test 22: characters outside the alphabet are skipped when encoding, and
+//          the rest of the callsign still gets through
+// ---------------------------------------------------------------------------
+static bool test22_unencodable_characters_skipped()
+{
+    printf("=== Test 22: characters outside the alphabet are skipped ===\n");
+
+    // ' ', '!', '#', '_', '~', '@' and '-' aren't in the 38-symbol alphabet.
+    const char* input = "K6 !#_~@-AQ";
+    rade_text_t tx = rade_text_create();
+    rade_text_enable_stats_output(tx, 0);
+    rade_text_generate_tx_string(tx, input, (int)strlen(input));
+    auto syms = pullSymbols(tx, SWEEP_COMPLETE_SYMS);
+    rade_text_destroy(tx);
+    RxState state = receiveRepeated(syms, SWEEP_COMPLETE_SYMS);
+
+    bool ok = state.callCount >= 1 && state.received == "K6AQ";
+    printf("Received '%s' (%d callbacks)\n", state.received.c_str(), state.callCount);
+    printf("Unencodable characters skipped: %s\n\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Test 23: an empty callsign is sent as one block and received as empty
+// ---------------------------------------------------------------------------
+static bool test23_empty_callsign()
+{
+    printf("=== Test 23: empty callsign ===\n");
+
+    rade_text_t tx = rade_text_create();
+    rade_text_enable_stats_output(tx, 0);
+    rade_text_generate_tx_string(tx, "", 0);
+    auto syms = pullSymbols(tx, SWEEP_COMPLETE_SYMS);
+    rade_text_destroy(tx);
+    RxState state = receiveRepeated(syms, SWEEP_COMPLETE_SYMS);
+
+    bool ok = state.callCount >= 1 && state.received.empty();
+    printf("Received '%s' (%d callbacks)\n", state.received.c_str(), state.callCount);
+    printf("Empty callsign: %s\n\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 int main()
 {
     bool success = true;
@@ -1046,6 +1205,10 @@ int main()
     success &= test17_multi_block_mid_cycle_join();
     success &= test18_rx_combining_low_snr();
     success &= test19_rx_reset();
+    success &= test20_on_air_format();
+    success &= test21_valid_codeword_bad_crc_rejected();
+    success &= test22_unencodable_characters_skipped();
+    success &= test23_empty_callsign();
 
     printf("=== Overall: %s ===\n", success ? "PASS" : "FAIL");
     return success ? 0 : 1;
