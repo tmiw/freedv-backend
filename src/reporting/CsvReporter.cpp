@@ -41,6 +41,33 @@
 #include "CsvReporter.h"
 #include "../util/logging/ulog.h"
 
+namespace
+{
+
+// Quotes a field (RFC 4180) if it contains a comma, quote or line break.
+// Callsigns come from over-the-air text, whose character set includes ','.
+std::string csvField(std::string const& value)
+{
+    if (value.find_first_of(",\"\r\n") == std::string::npos)
+    {
+        return value;
+    }
+
+    std::string quoted = "\"";
+    for (char c : value)
+    {
+        if (c == '"')
+        {
+            quoted += '"';
+        }
+        quoted += c;
+    }
+    quoted += '"';
+    return quoted;
+}
+
+} // namespace
+
 CsvReporter::CsvReporter(std::string const& filename)
     : file_(filename, std::ios::app)
 {
@@ -97,8 +124,8 @@ void CsvReporter::addReceiveRecord(std::string callsign, std::string mode, uint6
 
     file_ << dateBuf << ","
           << timeBuf << ","
-          << callsign << ","
-          << mode << ","
+          << csvField(callsign) << ","
+          << csvField(mode) << ","
           << frequency << ","
           << snrInt << "\n";
     file_.flush();

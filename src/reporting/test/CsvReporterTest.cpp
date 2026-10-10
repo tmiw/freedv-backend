@@ -7,11 +7,18 @@
 #include <vector>
 
 #include "../CsvReporter.h"
+#include "../../util/test/TestSocketCompat.h"
 
 namespace {
 
-const char* TEST_FILE_NEW = "csv_reporter_test_new.csv";
-const char* TEST_FILE_APPEND = "csv_reporter_test_append.csv";
+// In the temporary directory, so parallel or interrupted runs don't collide
+// in (or litter) the working directory.
+const std::string TEST_FILE_NEW_PATH = testMakeTempFile("csvnew");
+const std::string TEST_FILE_APPEND_PATH = testMakeTempFile("csvapp");
+const std::string TEST_FILE_QUOTED_PATH = testMakeTempFile("csvquo");
+const char* TEST_FILE_NEW = TEST_FILE_NEW_PATH.c_str();
+const char* TEST_FILE_APPEND = TEST_FILE_APPEND_PATH.c_str();
+const char* TEST_FILE_QUOTED = TEST_FILE_QUOTED_PATH.c_str();
 const char* TEST_FILE_BAD = "/definitely/not/a/valid/dir/csv_reporter_test_bad.csv";
 
 const char* CSV_HEADER = "date,time,callsign,mode,frequency_hz,snr_db";
@@ -28,13 +35,36 @@ std::vector<std::string> readFileLines(const char* path)
     return lines;
 }
 
+// Splits one CSV record (RFC 4180: fields may be quoted, "" is a quote).
 std::vector<std::string> splitCsv(const std::string& line)
 {
     std::vector<std::string> fields;
     std::string current;
-    for (char c : line)
+    bool quoted = false;
+    for (size_t i = 0; i < line.size(); i++)
     {
-        if (c == ',')
+        char c = line[i];
+        if (quoted)
+        {
+            if (c == '"' && i + 1 < line.size() && line[i + 1] == '"')
+            {
+                current += '"';
+                i++;
+            }
+            else if (c == '"')
+            {
+                quoted = false;
+            }
+            else
+            {
+                current += c;
+            }
+        }
+        else if (c == '"')
+        {
+            quoted = true;
+        }
+        else if (c == ',')
         {
             fields.push_back(current);
             current.clear();
@@ -193,6 +223,34 @@ bool testUnopenableFileIsNoOp()
     return result;
 }
 
+bool testFieldsWithSpecialCharactersAreQuoted()
+{
+    std::cout << "Test 4 (a callsign with a comma or quote can't break the columns): ";
+
+    // RADE text's character set includes ',', so a callsign received over
+    // the air can contain one. It used to be written as-is, adding a column.
+    std::remove(TEST_FILE_QUOTED);
+    {
+        CsvReporter reporter(TEST_FILE_QUOTED);
+        reporter.addReceiveRecord("K6,AQ", "1600X", 14236000, 3);
+        reporter.addReceiveRecord("N1\"DQ", "RADE,V1", 7100000, -2);
+    }
+
+    auto lines = readFileLines(TEST_FILE_QUOTED);
+    bool result = (lines.size() == 3);
+    if (lines.size() == 3)
+    {
+        auto first = splitCsv(lines[1]);
+        result &= (first.size() == 6) && first[2] == "K6,AQ" && first[3] == "1600X" && first[4] == "14236000";
+        auto second = splitCsv(lines[2]);
+        result &= (second.size() == 6) && second[2] == "N1\"DQ" && second[3] == "RADE,V1" && second[5] == "-2";
+    }
+
+    std::remove(TEST_FILE_QUOTED);
+    std::cout << (result ? "PASS" : "FAIL") << "\n";
+    return result;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -202,6 +260,7 @@ int main(int argc, char** argv)
     result &= testNewFileWritesHeaderOnce();
     result &= testAppendToExistingFileNoDuplicateHeader();
     result &= testUnopenableFileIsNoOp();
+    result &= testFieldsWithSpecialCharactersAreQuoted();
 
     return result ? 0 : -1;
 }
