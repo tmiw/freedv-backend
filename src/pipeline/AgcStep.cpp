@@ -263,34 +263,21 @@ short* AgcStep::execute(short* inputSamples, int numInputSamples, int* numOutput
 
 void AgcStep::reset() FREEDV_NONBLOCKING
 {
+    // The gain and the loudness history behind it deliberately survive a
+    // reset: the next transmission is most likely the same operator at the
+    // same microphone, so it should start at the level the last one settled
+    // on rather than ramping from unity again (at 1 dB/s). Only what belongs
+    // to the interrupted audio is dropped: buffered input, the position in
+    // the loudness update cycle, and the limiter's envelope.
     inputSampleFifo_.reset();
     blocksSinceLoudnessUpdate_ = 0;
     lastMeasurementValid_ = false;
 
-    // Audio after a reset (e.g. the start of a new transmission) must not be
-    // shaped by audio from before it, so clear the history kept by both
-    // libraries. reset() runs on the real-time audio thread, so neither step
-    // may allocate.
-
-    // The WebRTC limiter keeps its own gain/envelope state. Re-initializing it
-    // doesn't allocate.
+    // Re-initializing the WebRTC limiter doesn't allocate (reset() runs on
+    // the real-time audio thread).
     if (agcState_ != nullptr)
     {
         WebRtcAgc_Init(agcState_, 0, 255, kAgcModeUnchanged, sampleRate_);
         WebRtcAgc_set_config(agcState_, agcConfig_);
-    }
-
-    // libebur128 has no reset, and recreating the state allocates. Its
-    // momentary loudness only looks at the last 400 ms, so feeding it 400 ms
-    // of silence leaves it equivalent to a freshly created state (the
-    // K-weighting filter history decays to zero as well).
-    ebur128_state* state = static_cast<ebur128_state*>(ebur128State_);
-    short* silence = tmpInput_.get();
-    memset(silence, 0, sizeof(short) * numSamplesPerRun_);
-    for (int remaining = sampleRate_ * 4 / 10; remaining > 0; remaining -= numSamplesPerRun_)
-    {
-        FREEDV_BEGIN_VERIFIED_SAFE
-        ebur128_add_frames_short(state, silence, std::min(remaining, numSamplesPerRun_));
-        FREEDV_END_VERIFIED_SAFE
     }
 }
