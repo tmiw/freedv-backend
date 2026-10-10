@@ -6,6 +6,10 @@
 #include "PipelineTestCommon.h"
 #include "ebur128.h" // from libebur128
 
+#ifndef M_PI // not defined by every C library (e.g. on Windows)
+#define M_PI 3.14159265358979323846
+#endif
+
 namespace {
 
 // The AGC is documented to converge toward -23 LUFS; verified independently
@@ -211,11 +215,78 @@ bool agcResetDoesNotReturnGainToUnity()
     return true;
 }
 
+bool agcLimitsCutToTwentyDb()
+{
+    // A full-scale 3 kHz square wave measures well above 0 LUFS (K-weighting
+    // boosts that range), so reaching -23 LUFS would take more than the
+    // AGC's maximum 20 dB of cut. It must stop at 20 dB.
+    constexpr int sampleRate = 48000;
+    constexpr double MAX_CUT_DB = 20.0;
+    constexpr double TOLERANCE_DB = 1.5;
+
+    AgcStep step(sampleRate);
+
+    std::vector<short> loudSignal(6 * sampleRate);
+    for (size_t n = 0; n < loudSignal.size(); n++)
+    {
+        loudSignal[n] = (n / 8) % 2 ? 32767 : -32767; // 3 kHz
+    }
+    double inputLufs = measureLoudnessLufs(loudSignal.data(), sampleRate, sampleRate);
+    if (inputLufs - MAX_CUT_DB < AGC_TARGET_LUFS + 3.0)
+    {
+        std::cerr << "[test signal too quiet to need more than 20 dB of cut: " << inputLufs << " LUFS]...";
+        return false;
+    }
+
+    auto output = runThroughAgc(step, loudSignal, sampleRate / 50);
+    double outputLufs = measureLoudnessLufs(&output[output.size() - sampleRate], sampleRate, sampleRate);
+    if (std::abs(outputLufs - (inputLufs - MAX_CUT_DB)) > TOLERANCE_DB)
+    {
+        std::cerr << "[input " << inputLufs << " LUFS settled at " << outputLufs << " LUFS, expected "
+                  << (inputLufs - MAX_CUT_DB) << " (20 dB of cut)]...";
+        return false;
+    }
+
+    return true;
+}
+
+bool agcUnsupportedRateRunsAt48k()
+{
+    // 44.1 kHz isn't supported, so the AGC runs at 48 kHz instead. The
+    // pipeline then sends it 48 kHz audio, up to a second at a time.
+    AgcStep step(44100);
+    if (step.getInputSampleRate() != 48000 || step.getOutputSampleRate() != 48000)
+    {
+        std::cerr << "[runs at " << step.getInputSampleRate() << " Hz, expected 48000]...";
+        return false;
+    }
+
+    double amplitude = findAmplitudeForLoudness(AGC_TARGET_LUFS, TEST_TONE_FREQ_HZ, 48000);
+    auto input = generateSineWave(amplitude, TEST_TONE_FREQ_HZ, 1.0, 48000);
+    auto output = runThroughAgc(step, input, input.size());
+    if (output.size() != input.size())
+    {
+        std::cerr << "[got " << output.size() << " samples back from " << input.size() << "]...";
+        return false;
+    }
+
+    double outputLufs = measureLoudnessLufs(&output[output.size() - 24000], 24000, 48000);
+    if (std::abs(outputLufs - AGC_TARGET_LUFS) > 2.0)
+    {
+        std::cerr << "[output at " << outputLufs << " LUFS, expected about " << AGC_TARGET_LUFS << "]...";
+        return false;
+    }
+
+    return true;
+}
+
 int main()
 {
     TEST_CASE(agcConvergesLoudSignalToTargetLoudness);
     TEST_CASE(agcConvergesQuietSignalToTargetLoudness);
     TEST_CASE(agcDoesNotBoostNearSilentSignal);
     TEST_CASE(agcResetDoesNotReturnGainToUnity);
+    TEST_CASE(agcLimitsCutToTwentyDb);
+    TEST_CASE(agcUnsupportedRateRunsAt48k);
     return 0;
 }

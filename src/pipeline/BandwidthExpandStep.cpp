@@ -33,6 +33,8 @@
 //
 //=========================================================================
 
+#include <algorithm>
+
 #include "BandwidthExpandStep.h"
 
 #define INPUT_SAMPLE_RATE 16000
@@ -85,31 +87,30 @@ short* BandwidthExpandStep::execute(short* inputSamples, int numInputSamples, in
 {
     *numOutputSamples = 0;
     short* outputSamples = outputSamples_.get();
+    short* tmpOutput = outputSamples;
+    short* tmpInput = tmpInput_.get();
 
-    int numRuns = (inputSampleFifo_.numUsed() + numInputSamples) / BWE_FRAME_SIZE;
-    if (numRuns > 0)
+    // Feed the input FIFO in pieces that fit: it holds half a second, and a
+    // larger block written in one go would be rejected outright.
+    while (numInputSamples > 0 && inputSamples != nullptr)
     {
-        *numOutputSamples = numRuns * BWE_FRAME_SIZE * (OUTPUT_SAMPLE_RATE / INPUT_SAMPLE_RATE);
-        
-        short* tmpOutput = outputSamples;
-        short* tmpInput = tmpInput_.get();
+        int samplesToWrite = std::min(inputSampleFifo_.numFree(), numInputSamples);
+        inputSampleFifo_.write(inputSamples, samplesToWrite);
+        inputSamples += samplesToWrite;
+        numInputSamples -= samplesToWrite;
 
-        inputSampleFifo_.write(inputSamples, numInputSamples);
         while (inputSampleFifo_.numUsed() >= BWE_FRAME_SIZE)
         {
             inputSampleFifo_.read(tmpInput, BWE_FRAME_SIZE);
 
             // Run BBWENet. Expects BWE_FRAME_SIZE * 3 buffer for output.
             osce_bwe(osce_, osceBWE_, tmpOutput, tmpInput, BWE_FRAME_SIZE, arch_);
-            
+
             tmpOutput += BWE_FRAME_SIZE * (OUTPUT_SAMPLE_RATE / INPUT_SAMPLE_RATE);
+            *numOutputSamples += BWE_FRAME_SIZE * (OUTPUT_SAMPLE_RATE / INPUT_SAMPLE_RATE);
         }
     }
-    else if (numInputSamples > 0 && inputSamples != nullptr)
-    {
-        inputSampleFifo_.write(inputSamples, numInputSamples);
-    }
-    
+
     return outputSamples;
 }
 

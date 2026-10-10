@@ -123,16 +123,26 @@ TcpConnectionHandler::~TcpConnectionHandler()
 std::future<void> TcpConnectionHandler::connect(const char* host, int port, bool enableReconnect, bool enableTLS)
 {
     cancelConnect_.store(false, std::memory_order_relaxed);
-    host_ = host;
-    port_ = port;
-    usingTLS_ = enableTLS;
-    enableReconnect_.store(enableReconnect, std::memory_order_relaxed);
     
     std::shared_ptr<std::promise<void>> prom = std::make_shared<std::promise<void> >();
     auto fut = prom->get_future();
     
-    enqueue_([&, prom]() {
-        connectImpl_();
+    // The connection parameters are only changed on the worker thread, and
+    // only while disconnected: the receive thread reads usingTLS_.
+    std::string hostStr(host);
+    enqueue_([&, prom, hostStr, port, enableReconnect, enableTLS]() {
+        if (socket_.load(std::memory_order_relaxed) != INVALID_SOCKET)
+        {
+            log_warn("connect() called while already connected to %s port %d; ignoring", host_.c_str(), port_);
+        }
+        else
+        {
+            host_ = hostStr;
+            port_ = port;
+            usingTLS_ = enableTLS;
+            enableReconnect_.store(enableReconnect, std::memory_order_relaxed);
+            connectImpl_();
+        }
         prom->set_value();
     });
     return fut;
@@ -180,6 +190,14 @@ void TcpConnectionHandler::setOnRecvEndFn(OnRecvEndFn fn)
 
 void TcpConnectionHandler::connectImpl_()
 {
+    // A connect() or reconnect attempt can be queued behind one that has
+    // already succeeded. Starting over on a live connection would leak its
+    // socket and TLS state and replace a running receive thread.
+    if (socket_.load(std::memory_order_relaxed) != INVALID_SOCKET)
+    {
+        return;
+    }
+
     // Convert port to string (needed by getaddrinfo() below).
     std::stringstream portStream;
     portStream << port_;
@@ -255,23 +273,27 @@ void TcpConnectionHandler::connectImpl_()
             results[0] = heads[0];
         }
     }
-    if (ipv4Complete_.load(std::memory_order_relaxed) == false && ipv6Complete_.load(std::memory_order_relaxed) == true && results[0] == nullptr)
+    // Check whether the IPv4 result has been collected rather than whether it's
+    // complete: IPv4 DNS may finish after the check above, and testing
+    // ipv4Complete_ here would then skip collecting it and leave us with no
+    // addresses at all.
+    if (ipv4ResultFuture.valid() && ipv6Complete_.load(std::memory_order_relaxed) == true && results[0] == nullptr)
     {
         log_info("no valid IPv6 results, need to wait for IPv4 before continuing.");
-        while (ipv4Complete_.load(std::memory_order_relaxed) == false)
-        {
-            std::this_thread::sleep_for(1ms);
-        }
-        heads[1] = ipv4ResultFuture.get();
+        heads[1] = ipv4ResultFuture.get(); // blocks until IPv4 DNS completes
         results[1] = heads[1];
     }
 
+    // Choose based on the results we've actually collected rather than the
+    // ipv*Complete_ flags: the resolver threads set those *after* publishing
+    // their result, so a result we've already collected can still have its
+    // flag reading false here.
     int whichIndex = 0;
-    if (ipv6Complete_.load(std::memory_order_relaxed) == true && results[0] != nullptr)
+    if (results[0] != nullptr)
     {
         log_info("starting with IPv6 connection");
     }
-    else if (ipv4Complete_.load(std::memory_order_relaxed) == true && results[1] != nullptr)
+    else if (results[1] != nullptr)
     {
         log_info("starting with IPv4 connection");
         whichIndex = 1;
@@ -286,6 +308,11 @@ void TcpConnectionHandler::connectImpl_()
     
     while (!cancelConnect_.load(std::memory_order_relaxed) && (results[0] || results[1]))
     {
+        // At least one list is non-empty; make sure we're on one of those.
+        if (results[whichIndex] == nullptr)
+        {
+            whichIndex = (whichIndex + 1) % 2;
+        }
         struct addrinfo* current = results[whichIndex];
         int ret = 0;
 #if defined(WIN32)
@@ -404,13 +431,18 @@ next_fd:
         results[whichIndex] = results[whichIndex]->ai_next;
         whichIndex = (whichIndex + 1) % 2;
 
-        // See if we got any new DNS results.
-        if (whichIndex == 0 && ipv6ResultFuture.valid())
+        // See if we got any new DNS results. Only take results that are
+        // already in: blocking on a slow lookup here would hold up trying
+        // the other family's remaining addresses (and noticing that an
+        // attempt already in flight has connected) until it finished.
+        if (whichIndex == 0 && ipv6ResultFuture.valid() &&
+            ipv6ResultFuture.wait_for(0s) == std::future_status::ready)
         {
             heads[0] = ipv6ResultFuture.get();
             results[0] = heads[0];
         }
-        if (whichIndex == 1 && ipv4ResultFuture.valid())
+        if (whichIndex == 1 && ipv4ResultFuture.valid() &&
+            ipv4ResultFuture.wait_for(0s) == std::future_status::ready)
         {
             heads[1] = ipv4ResultFuture.get();
             results[1] = heads[1];
@@ -423,11 +455,27 @@ next_fd:
             if (results[whichIndex] == nullptr && (ipv4Complete_.load(std::memory_order_relaxed) == false || ipv6Complete_.load(std::memory_order_relaxed) == false))
             {
                 // No more addresses to go through, so we *really* need to make sure
-                // we're done with DNS before exiting the loop.
+                // we're done with DNS before exiting the loop. Keep watching the
+                // attempts already in flight meanwhile: one of them may connect
+                // long before a slow lookup finishes.
                 log_info("ran out of addresses to check but DNS requests are still pending");
-                while (ipv4Complete_.load(std::memory_order_relaxed) == false || ipv6Complete_.load(std::memory_order_relaxed) == false)
+                while ((ipv4Complete_.load(std::memory_order_relaxed) == false || ipv6Complete_.load(std::memory_order_relaxed) == false) &&
+                       !cancelConnect_.load(std::memory_order_relaxed) &&
+                       socket_.load(std::memory_order_relaxed) == INVALID_SOCKET)
                 {
-                    std::this_thread::sleep_for(1ms);
+                    if (pendingSockets.empty())
+                    {
+                        std::this_thread::sleep_for(1ms);
+                    }
+                    else
+                    {
+                        checkConnections_(pendingSockets); // waits up to 250ms
+                    }
+                }
+                if (socket_.load(std::memory_order_relaxed) != INVALID_SOCKET ||
+                    cancelConnect_.load(std::memory_order_relaxed))
+                {
+                    break;
                 }
                 
                 if (ipv4ResultFuture.valid())
@@ -498,8 +546,9 @@ next_fd:
                 // Set up root certificate locations. Note that on Windows,
                 // we use the Windows certificate store, so we need to manually
                 // import those root certificates. For non-Windows platforms, we
-                // query SSL_CERT_DIR/SSL_CERT_FILE from the environment and override
-                // the default paths as needed. (OpenSSL does this for us, but LibreSSL does not,
+                // use the default paths. On all platforms, we then also query
+                // SSL_CERT_DIR/SSL_CERT_FILE from the environment and add those
+                // locations as needed. (OpenSSL does this for us, but LibreSSL does not,
                 // hence the need to manually query the environment here.)
 #if defined(WIN32)
                 {
@@ -548,6 +597,7 @@ next_fd:
                     log_warn("Unable to set TLS certificate validation paths: %s", errStr.c_str());
 #endif // defined(__APPLE__) && defined(ENABLE_TLS_SUPPORT_WITH_OPENSSL)
                 }
+#endif // defined(WIN32)
 
                 auto sslCertDirEnv = getenv("SSL_CERT_DIR"); // NOLINT
                 auto sslCertFileEnv = getenv("SSL_CERT_FILE"); // NOLINT
@@ -556,8 +606,6 @@ next_fd:
                     auto errStr = GetSSLError_();
                     log_warn("Unable to set TLS certificate locations: %s", errStr.c_str());
                 }
-
-#endif // defined(WIN32)
 
                 // Force >= TLS 1.2
                 if (!SSL_CTX_set_min_proto_version(sslCtx_.load(std::memory_order_relaxed), TLS1_2_VERSION)) 
@@ -781,13 +829,13 @@ void TcpConnectionHandler::sendImpl_(const char* buf, int length)
 #if defined(ENABLE_TLS_SUPPORT)
                 if (usingTLS_ && ssl_.load(std::memory_order_relaxed) != nullptr)
                 {
+                    int sslErr = SSL_ERROR_NONE;
                     while (
                         (ssl_.load(std::memory_order_relaxed) != nullptr) &&
-                        (numWritten = SSL_write(ssl_.load(std::memory_order_relaxed), buf, length)) < 0)
+                        (numWritten = sslWrite_(buf, length, sslErr)) < 0)
                     {
                         fd_set readSet;
                         FD_ZERO(&readSet);
-                        auto sslErr = SSL_get_error(ssl_.load(std::memory_order_relaxed), numWritten);
                         if (sslErr == SSL_ERROR_WANT_WRITE)
                         {
                             // Can be handled by the top level loop. Not an error.
@@ -811,7 +859,7 @@ void TcpConnectionHandler::sendImpl_(const char* buf, int length)
                         else
                         {
                             auto errStr = GetSSLError_();
-                            log_error("Unable to read from TLS connection: %s", errStr.c_str());
+                            log_error("Unable to write to TLS connection: %s", errStr.c_str());
                             break;
                         }
                     }
@@ -869,6 +917,47 @@ tryAgain:
     }
 }
 
+#if defined(ENABLE_TLS_SUPPORT)
+// SSL_write()/SSL_read() run on different threads (the ThreadedObject worker and
+// receiveThread_), and an SSL object must not be used by two threads at once.
+// Hold sslMutex_ only around the non-blocking calls themselves, never across
+// select(), so neither side can stall the other.
+int TcpConnectionHandler::sslWrite_(const char* buf, int length, int& sslErr)
+{
+    std::unique_lock<std::mutex> lk(sslMutex_);
+    SSL* ssl = ssl_.load(std::memory_order_relaxed);
+    if (ssl == nullptr)
+    {
+        sslErr = SSL_ERROR_SSL;
+        return -1;
+    }
+    int rv = SSL_write(ssl, buf, length);
+    sslErr = (rv <= 0) ? SSL_get_error(ssl, rv) : SSL_ERROR_NONE;
+    return rv;
+}
+
+int TcpConnectionHandler::sslRead_(char* buf, int length, int& sslErr)
+{
+    std::unique_lock<std::mutex> lk(sslMutex_);
+    SSL* ssl = ssl_.load(std::memory_order_relaxed);
+    if (ssl == nullptr)
+    {
+        sslErr = SSL_ERROR_SSL;
+        return -1;
+    }
+    int rv = SSL_read(ssl, buf, length);
+    sslErr = (rv <= 0) ? SSL_get_error(ssl, rv) : SSL_ERROR_NONE;
+    return rv;
+}
+
+int TcpConnectionHandler::sslPending_()
+{
+    std::unique_lock<std::mutex> lk(sslMutex_);
+    SSL* ssl = ssl_.load(std::memory_order_relaxed);
+    return ssl != nullptr ? SSL_pending(ssl) : 0;
+}
+#endif // defined(ENABLE_TLS_SUPPORT)
+
 constexpr int READ_SIZE_BYTES = 1024;
 
 void TcpConnectionHandler::receiveImpl_()
@@ -879,44 +968,80 @@ void TcpConnectionHandler::receiveImpl_()
 
     while (socket_.load(std::memory_order_relaxed) != INVALID_SOCKET)
     {
-        struct timeval tv = {0, 250000}; // 250ms
-        fd_set readSet;
-        FD_ZERO(&readSet);
-        FD_SET(socket_.load(std::memory_order_relaxed), &readSet);
+        // If the receive buffer can't take another read, stop reading until
+        // the handler has caught up. The data waits in the socket and TCP
+        // flow control slows the sender down, rather than it being dropped.
+        // (Everything already in the buffer has a dispatch task queued.)
+        if (receiveBuffer_.numFree() < READ_SIZE_BYTES)
+        {
+            std::this_thread::sleep_for(1ms);
+            continue;
+        }
 
-        int rv = select(socket_.load(std::memory_order_relaxed) + 1, &readSet, nullptr, nullptr, &tv);
+        int rv = 1;
+#if defined(ENABLE_TLS_SUPPORT)
+        // Data TLS has already decrypted doesn't make the socket readable, so
+        // read it without waiting (left over when the buffer filled up).
+        if (!usingTLS_ || sslPending_() == 0)
+#endif // defined(ENABLE_TLS_SUPPORT)
+        {
+            struct timeval tv = {0, 250000}; // 250ms
+            fd_set readSet;
+            FD_ZERO(&readSet);
+            FD_SET(socket_.load(std::memory_order_relaxed), &readSet);
+
+            rv = select(socket_.load(std::memory_order_relaxed) + 1, &readSet, nullptr, nullptr, &tv);
+        }
         if (rv > 0 && socket_.load(std::memory_order_relaxed) != INVALID_SOCKET)
         {
             int numRead = 0;
             int numHaveRead = 0;
+            bool bufferFull = false;
 #if defined(ENABLE_TLS_SUPPORT)
             while(!usingTLS_ || ssl_.load(std::memory_order_relaxed) != nullptr)
 #else
             while(true)
 #endif // defined(ENABLE_TLS_SUPPORT)
             {
+                if (receiveBuffer_.numFree() < READ_SIZE_BYTES)
+                {
+                    // Dispatch what we have; the top of the loop waits for room.
+                    bufferFull = true;
+                    break;
+                }
+
 #if defined(ENABLE_TLS_SUPPORT)
                 if (usingTLS_ && ssl_.load(std::memory_order_relaxed) != nullptr)
                 {
-                    numRead = SSL_read(ssl_.load(std::memory_order_relaxed), buf, READ_SIZE_BYTES);
+                    int sslErr = SSL_ERROR_NONE;
+                    numRead = sslRead_(buf, READ_SIZE_BYTES, sslErr);
                     if (numRead < 0 && ssl_.load(std::memory_order_relaxed))
                     {
                         fd_set writeSet;
                         FD_ZERO(&writeSet);
-                        auto sslErr = SSL_get_error(ssl_.load(std::memory_order_relaxed), numRead);
                         if (sslErr == SSL_ERROR_WANT_READ)
                         {
                             // This case can be handled by the top-level select()
-                            // loop. Not an error.
+                            // loop. Not an error. If we already read data on this
+                            // pass (e.g. it was an exact multiple of READ_SIZE_BYTES),
+                            // dispatch it now rather than waiting for more to arrive.
+                            if (numHaveRead > 0)
+                            {
+                                break;
+                            }
                             goto tryAgain;
                         }
                         else if (sslErr == SSL_ERROR_WANT_WRITE && socket_.load(std::memory_order_relaxed) != INVALID_SOCKET)
                         {
-                            // Block until we're able to continue writing.
+                            // Wait until we're able to continue writing. Wait in
+                            // slices so that a disconnect (which clears ssl_ and
+                            // then joins this thread) isn't stuck behind a peer
+                            // that has stopped reading.
                             auto rawSock = socket_.load(std::memory_order_relaxed);
                             FD_SET(rawSock, &writeSet);
 
-                            select(socket_.load(std::memory_order_relaxed) + 1, nullptr, &writeSet, nullptr, nullptr);
+                            struct timeval tv = {0, SELECT_SLICE_US};
+                            select(rawSock + 1, nullptr, &writeSet, nullptr, &tv);
                             continue;
                         }
                         else
@@ -942,9 +1067,13 @@ void TcpConnectionHandler::receiveImpl_()
                     break;
                 }
 
-                // Queue RX handler
+                // Queue RX handler. This thread is the buffer's only writer
+                // and we checked for room above, so this can't fail.
                 numHaveRead += numRead;
-                receiveBuffer_.write(buf, numRead);
+                if (receiveBuffer_.write(buf, numRead) != 0)
+                {
+                    log_error("receive buffer overflow; dropped %d bytes", numRead);
+                }
 
                 if (numRead < READ_SIZE_BYTES)
                 {
@@ -968,12 +1097,20 @@ void TcpConnectionHandler::receiveImpl_()
                     }
                 });
             } 
+            else if (bufferFull)
+            {
+                // Nothing read this pass; wait for room at the top of the loop.
+            }
             else if (numRead == 0 && socket_.load(std::memory_order_relaxed) != INVALID_SOCKET)
             {
                 log_warn("EOF received");
                 enqueue_([this]() {
                     disconnectImpl_();
                 });
+
+                // Nothing more to read. Stop here rather than spinning (and
+                // queueing more disconnects) until the disconnect runs.
+                break;
             }
             else if (numRead < 0 && socket_.load(std::memory_order_relaxed) != INVALID_SOCKET)
             {
@@ -985,6 +1122,7 @@ void TcpConnectionHandler::receiveImpl_()
                 enqueue_([this]() {
                     disconnectImpl_();
                 });
+                break; // as above
             }
         }
         else if (rv < 0 && socket_.load(std::memory_order_relaxed) != INVALID_SOCKET)
@@ -997,6 +1135,7 @@ void TcpConnectionHandler::receiveImpl_()
             enqueue_([this]() {
                 disconnectImpl_();
             });
+            break; // as above
         }
         continue;
 tryAgain:
@@ -1011,10 +1150,14 @@ void TcpConnectionHandler::checkConnections_(std::vector<int>& sockets)
 #endif // defined(WIN32)
 {
     fd_set writeSet;
+    // Windows reports a failed connect (e.g. refused) in the exception set
+    // rather than the write set; elsewhere the socket becomes writable.
+    fd_set exceptSet;
     struct timeval tv = {0, 250000}; // 250ms
     int err = 0;
 
     FD_ZERO(&writeSet);
+    FD_ZERO(&exceptSet);
 #if defined(WIN32)
     SOCKET maxSocket = INVALID_SOCKET;
 #else
@@ -1023,10 +1166,13 @@ void TcpConnectionHandler::checkConnections_(std::vector<int>& sockets)
     for (auto& sock : sockets)
     {
         FD_SET(sock, &writeSet);
+#if defined(WIN32)
+        FD_SET(sock, &exceptSet);
+#endif // defined(WIN32)
         if (sock > maxSocket) maxSocket = sock;
     }
     
-    if (select(maxSocket + 1, nullptr, &writeSet, nullptr, &tv) > 0)
+    if (select(maxSocket + 1, nullptr, &writeSet, &exceptSet, &tv) > 0)
     {
         int sockErrCode = 0;
         socklen_t resultLength = sizeof(sockErrCode);
@@ -1034,13 +1180,18 @@ void TcpConnectionHandler::checkConnections_(std::vector<int>& sockets)
         std::vector<int> socketsToDelete;
         for (auto& sock : sockets)
         {
-            if (FD_ISSET(sock, &writeSet))
+            if (FD_ISSET(sock, &writeSet) || FD_ISSET(sock, &exceptSet))
             {
 #if defined(WIN32)
                 auto sockOptError = getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&sockErrCode, &resultLength);
-                if (sockOptError != 0 && WSAGetLastError() != WSAEINPROGRESS)
+                if (sockOptError != 0)
                 {
                     err = WSAGetLastError();
+                    goto socket_error;
+                }
+                else if (sockErrCode != 0)
+                {
+                    err = sockErrCode;
                     goto socket_error;
                 }
 #else

@@ -30,6 +30,7 @@
 #include <vector>
 #include <future>
 #include <atomic>
+#include <mutex>
 
 #if defined(ENABLE_TLS_SUPPORT)
 #include <openssl/ssl.h>
@@ -44,6 +45,8 @@ public:
     TcpConnectionHandler();
     virtual ~TcpConnectionHandler();
     
+    // Ignored (with a warning) if already connected; disconnect() first to
+    // connect somewhere else.
     std::future<void> connect(const char* host, int port, bool enableReconnect, bool enableTLS = false);
     std::future<void> disconnect();
     
@@ -64,6 +67,8 @@ protected:
     virtual void onReceive_(char* buf, int length) = 0;
     
 private:
+    friend class TcpConnectionHandlerTest; // grants unit tests access to TLS state
+
     std::thread receiveThread_;
     ThreadedTimer reconnectTimer_;
     // socket_ / ssl_ / sslCtx_ are accessed with relaxed ordering. They are only
@@ -91,6 +96,12 @@ private:
 #if defined(ENABLE_TLS_SUPPORT)
     std::atomic<SSL_CTX*> sslCtx_;
     std::atomic<SSL*> ssl_;
+    // Serializes SSL_read()/SSL_write() between receiveThread_ and the worker.
+    std::mutex sslMutex_;
+
+    int sslWrite_(const char* buf, int length, int& sslErr);
+    int sslRead_(char* buf, int length, int& sslErr);
+    int sslPending_(); // decrypted bytes SSL_read() can return without the socket
 #endif // defined(ENABLE_TLS_SUPPORT)
 
     void connectImpl_();
@@ -98,7 +109,9 @@ private:
     void sendImpl_(const char* buf, int length);
     void receiveImpl_();
     
-    void resolveAddresses_(int addressFamily, const char* host, const char* port, struct addrinfo** result);
+    // Virtual so unit tests can script DNS answers and timing. The result
+    // is released with freeaddrinfo().
+    virtual void resolveAddresses_(int addressFamily, const char* host, const char* port, struct addrinfo** result);
 #if defined(WIN32)
     void checkConnections_(std::vector<SOCKET>& sockets);
 #else

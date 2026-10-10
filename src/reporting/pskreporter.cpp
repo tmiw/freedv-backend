@@ -150,6 +150,8 @@ PskReporter::PskReporter(std::string callsign, std::string gridSquare, std::stri
     , receiverCallsign_(std::move(callsign))
     , receiverGridSquare_(std::move(gridSquare))
     , decodingSoftware_(std::move(software))
+    , serverHostname_(PSK_REPORTER_HOSTNAME)
+    , serverPort_(PSK_REPORTER_PORT)
 {
     std::random_device randomDevice;
     std::uniform_int_distribution<int> idDistribution(0, RAND_MAX);
@@ -170,6 +172,15 @@ PskReporter::PskReporter(std::string callsign, std::string gridSquare, std::stri
 
 PskReporter::~PskReporter()
 {
+    // Wait for any background send so it can't run against a destroyed object.
+    {
+        std::unique_lock<std::mutex> lock(sendThreadMutex_);
+        if (sendThread_.joinable())
+        {
+            sendThread_.join();
+        }
+    }
+
     if (recordList_.size() > 0)
     {
         reportCommon_();
@@ -182,12 +193,19 @@ PskReporter::~PskReporter()
 
 void PskReporter::addReceiveRecord(std::string callsign, std::string, uint64_t frequency, signed char snr)
 {
-    std::unique_lock<std::mutex> lock(recordListMutex_);
-    recordList_.push_back(SenderRecord(callsign, frequency, snr));
-    
-    // This is unlikely to be hit but in case we come close to filling up an entire
-    // UDP datagram, we should go ahead and send whatever reports we have early.
-    if (recordList_.size() >= 50)
+    bool sendNow = false;
+    {
+        std::unique_lock<std::mutex> lock(recordListMutex_);
+        recordList_.push_back(SenderRecord(callsign, frequency, snr));
+
+        // This is unlikely to be hit but in case we come close to filling up an entire
+        // UDP datagram, we should go ahead and send whatever reports we have early.
+        sendNow = recordList_.size() >= 50;
+    }
+
+    // Outside recordListMutex_: send() may wait for a previous send, which
+    // needs that lock to finish.
+    if (sendNow)
     {
         send();
     }
@@ -195,10 +213,16 @@ void PskReporter::addReceiveRecord(std::string callsign, std::string, uint64_t f
 
 void PskReporter::send()
 {
-    auto task = std::thread(std::bind(&PskReporter::reportCommon_, this));
-    
-    // Allow the reporting to run without needing to wait for it.
-    task.detach();
+    // Run the report in the background so the caller doesn't wait on DNS or the
+    // network. Keep the thread joinable (rather than detaching it) so the
+    // destructor can wait for it; reports are infrequent, so the previous one
+    // has normally finished long before the next.
+    std::unique_lock<std::mutex> lock(sendThreadMutex_);
+    if (sendThread_.joinable())
+    {
+        sendThread_.join();
+    }
+    sendThread_ = std::thread(std::bind(&PskReporter::reportCommon_, this));
 }
 
 int PskReporter::getRxDataSize_()
@@ -343,9 +367,9 @@ bool PskReporter::reportCommon_()
     hints.ai_flags = AI_ADDRCONFIG | AI_V4MAPPED | AI_NUMERICSERV;
 #endif // WIN32
     struct addrinfo* res = NULL;
-    int err = getaddrinfo(PSK_REPORTER_HOSTNAME, PSK_REPORTER_PORT, &hints, &res);
+    int err = getaddrinfo(serverHostname_.c_str(), serverPort_.c_str(), &hints, &res);
     if (err != 0) {
-        log_debug("cannot resolve %s (err=%d)", PSK_REPORTER_HOSTNAME, err);
+        log_debug("cannot resolve %s (err=%d)", serverHostname_.c_str(), err);
         delete[] packet;
         return false;
     }
@@ -354,6 +378,7 @@ bool PskReporter::reportCommon_()
     if(fd < 0){
         log_debug("cannot open PSK Reporter socket (err=%d)", errno);
         delete[] packet;
+        freeaddrinfo(res);
         return false;
     }
 
@@ -361,6 +386,7 @@ bool PskReporter::reportCommon_()
         delete[] packet;
         log_debug("cannot send message to PSK Reporter (err=%d)", errno);
         close(fd);
+        freeaddrinfo(res);
         return false;
     }
     delete[] packet;

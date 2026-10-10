@@ -555,12 +555,33 @@ static void callback_stdout(ulog_Event *ev, void *arg) {
 
 
 int ulog_event_to_cstr(ulog_Event *ev, char *out, size_t out_size) {
+    if (out_size == 0) {
+        return -1;
+    }
     FILE *mem = fmemopen(out, out_size, "w");
     if (!mem) {
         return -1;
     }
     write_formatted_message(ev, mem, ULOG_TIME_SHORT, ULOG_COLOR_OFF, ULOG_NEW_LINE_OFF);
+#if defined(_WIN32)
+    {
+        // The Windows fmemopen() replacement (libfmemopen.c) is backed by a
+        // temporary file and never writes back into the buffer, so copy the
+        // result out before closing it (truncated, like fmemopen() would).
+        long written = ftell(mem);
+        size_t toCopy = written > 0 ? (size_t)written : 0;
+        if (toCopy > out_size - 1) {
+            toCopy = out_size - 1;
+        }
+        rewind(mem);
+        toCopy = fread(out, 1, toCopy, mem);
+        out[toCopy] = '\0';
+    }
+#endif // defined(_WIN32)
     fclose(mem);
+    // fmemopen() doesn't guarantee a terminator when the output fills the
+    // buffer (macOS leaves none), so make sure callers always get a C string.
+    out[out_size - 1] = '\0';
     return 0;
 }
 

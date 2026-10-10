@@ -23,10 +23,6 @@
 #ifndef THREADED_TIMER_H
 #define THREADED_TIMER_H
 
-#if defined(__APPLE__)
-#include <dispatch/dispatch.h>
-#endif // defined(__APPLE__)
-
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -56,20 +52,27 @@ public:
     bool isRunning();
 
 private:
-#if !defined(__APPLE__)
+    // A single thread that fires every ThreadedTimer. All scheduling state
+    // (the queue and each timer's nextFireTime_/scheduledIntervalMs_/
+    // scheduledRepeat_) is only touched under mutex_, so the server never
+    // dereferences a timer that's been unregistered.
     class TimerServer
     {
     public:
         TimerServer();
         virtual ~TimerServer();
 
-        void registerTimer(ThreadedTimer* timer);
+        void registerTimer(ThreadedTimer* timer, int intervalMs, bool repeat);
+
+        // Removes the timer and, unless called from the timer thread (i.e.
+        // from a timer callback), waits for any callback of it that's
+        // currently running, so the timer can be destroyed safely afterwards.
         void unregisterTimer(ThreadedTimer* timer);
 
     private:
         struct FireTimeComparator
         {
-            inline bool operator()(const ThreadedTimer* lhs, const ThreadedTimer* rhs)
+            inline bool operator()(const ThreadedTimer* lhs, const ThreadedTimer* rhs) const
             {
                 return lhs->nextFireTime_ > rhs->nextFireTime_;
             }
@@ -81,26 +84,29 @@ private:
         std::atomic<bool> isDestroying_;
         std::thread objectThread_;
         std::condition_variable timerCV_;
-        std::priority_queue<ThreadedTimer*, std::vector<ThreadedTimer*>, FireTimeComparator> timerQueue_;
+        std::condition_variable firingDoneCV_;
+        ThreadedTimer* firingTimer_; // timer whose callback is running, guarded by mutex_
+        std::vector<ThreadedTimer*> timerQueue_; // min-heap on nextFireTime_, guarded by mutex_
+
+        void removeLocked_(ThreadedTimer* timer);
         void eventLoop_();
     };
 
-    // "Is this timer currently scheduled" state. The timer config (fn_, repeat_,
-    // timeoutMilliseconds_, nextFireTime_) is guarded by timerMutex_, not by this
-    // flag, so relaxed ordering is enough.
+    // "Is this timer currently scheduled" state, for isRunning(). Relaxed
+    // ordering is enough; scheduling itself is guarded by the server's mutex_.
     std::atomic<bool> isRunning_;
+
+    // Guarded by TheTimerServer_.mutex_.
     std::chrono::time_point<std::chrono::steady_clock> nextFireTime_;
+    int scheduledIntervalMs_ = 0;
+    bool scheduledRepeat_ = false;
+
+    void fire_();
 
     static TimerServer TheTimerServer_;
-#endif // !defined(__APPLE__)
 
+    // Guards the timer's configuration (fn_, repeat_, timeoutMilliseconds_).
     std::mutex timerMutex_;
-    
-#if defined(__APPLE__)
-    dispatch_source_t internalTimer_;
-    
-    static void OnHandleTimer_(void* context);
-#endif // defined(__APPLE__)
     
     TimerCallbackFn fn_;
     bool repeat_;

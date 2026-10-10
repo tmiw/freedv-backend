@@ -505,7 +505,9 @@ void FreeDVReporter::onFreeDVReporterTransmitReport_(yyjson_val* msgParams)
                 yyjson_get_str(gridSquareJson),
                 yyjson_get_str(modeJson),
                 yyjson_get_bool(transmittingJson),
-                yyjson_is_null(lastTxJson) ? "" : yyjson_get_str(lastTxJson)
+                // last_tx is null if they've never transmitted; treat a
+                // missing or non-string value the same way.
+                yyjson_is_str(lastTxJson) ? yyjson_get_str(lastTxJson) : ""
             );
         }
     }

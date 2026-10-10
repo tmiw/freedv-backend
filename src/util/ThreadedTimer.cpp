@@ -23,151 +23,154 @@
 #include "ThreadedTimer.h"
 #include "../os/os_interface.h"
 
+#include <algorithm>
 #include <cinttypes>
 
 #if defined(__APPLE__)
 #include <pthread.h>
 #endif // defined(__APPLE__)
 
-#define PERCENT_TOLERANCE 0.05
-
-#if !defined(__APPLE__)
 ThreadedTimer::TimerServer ThreadedTimer::TheTimerServer_;
 
 ThreadedTimer::TimerServer::TimerServer()
     : isDestroying_(false)
+    , firingTimer_(nullptr)
 {
     objectThread_ = std::thread(std::bind(&ThreadedTimer::TimerServer::eventLoop_, this));
 }
 
 ThreadedTimer::TimerServer::~TimerServer()
 {
-    isDestroying_.store(true, std::memory_order_relaxed);
+    {
+        std::unique_lock<std::mutex> lk(mutex_);
+        isDestroying_.store(true, std::memory_order_relaxed);
+    }
     timerCV_.notify_one();
     objectThread_.join();
 }
 
-void ThreadedTimer::TimerServer::registerTimer(ThreadedTimer* timer)
+void ThreadedTimer::TimerServer::removeLocked_(ThreadedTimer* timer)
 {
-    std::unique_lock<std::mutex> lk(mutex_);
-    timerQueue_.push(timer);
+    auto it = std::find(timerQueue_.begin(), timerQueue_.end(), timer);
+    if (it != timerQueue_.end())
+    {
+        timerQueue_.erase(it);
+        std::make_heap(timerQueue_.begin(), timerQueue_.end(), FireTimeComparator());
+    }
+}
+
+void ThreadedTimer::TimerServer::registerTimer(ThreadedTimer* timer, int intervalMs, bool repeat)
+{
+    {
+        std::unique_lock<std::mutex> lk(mutex_);
+        removeLocked_(timer);
+        timer->scheduledIntervalMs_ = intervalMs;
+        timer->scheduledRepeat_ = repeat;
+        timer->nextFireTime_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(intervalMs);
+        timer->isRunning_.store(true, std::memory_order_relaxed);
+        timerQueue_.push_back(timer);
+        std::push_heap(timerQueue_.begin(), timerQueue_.end(), FireTimeComparator());
+    }
     timerCV_.notify_one(); // update wait time
 }
 
 void ThreadedTimer::TimerServer::unregisterTimer(ThreadedTimer* timer)
 {
-    std::unique_lock<std::mutex> lk(mutex_);
-
-    // XXX - need to find a more optimal way of doing this
-    std::vector<ThreadedTimer*> tmpTimerList;
-    while (!timerQueue_.empty())
     {
-        auto tmp = timerQueue_.top();
-        timerQueue_.pop();
+        std::unique_lock<std::mutex> lk(mutex_);
+        removeLocked_(timer);
+        timer->isRunning_.store(false, std::memory_order_relaxed);
 
-        if (tmp != timer)
+        // Wait out a callback that's already running so the caller can destroy
+        // the timer (and whatever the callback uses) afterwards. A callback
+        // stopping its own timer runs on this server's thread and must not
+        // wait for itself.
+        if (std::this_thread::get_id() != objectThread_.get_id())
         {
-            tmpTimerList.push_back(tmp);
+            firingDoneCV_.wait(lk, [&]() { return firingTimer_ != timer; });
         }
-        else
-        {
-            // We found the timer we're trying to unregister,
-            // no need to remove any others.
-            break;
-        }
-    }
-
-    for (auto& tmp : tmpTimerList)
-    {
-        timerQueue_.push(tmp);
     }
     timerCV_.notify_one(); // update wait time
 }
 
 void ThreadedTimer::TimerServer::eventLoop_()
 {
+#if defined(__APPLE__)
+    // Timer callbacks previously ran on GCD's utility-QoS queue; keep that.
+    pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+#endif // defined(__APPLE__)
+
     SetThreadName("Timer");
 
     std::unique_lock<std::mutex> lk(mutex_);
-    std::chrono::time_point<std::chrono::steady_clock> nextFireTime;
     while (!isDestroying_.load(std::memory_order_relaxed))
     {
         if (timerQueue_.empty())
         {
             timerCV_.wait(lk);
+            continue;
+        }
+
+        auto nextFireTime = timerQueue_.front()->nextFireTime_;
+        if (std::chrono::steady_clock::now() < nextFireTime)
+        {
+            timerCV_.wait_until(lk, nextFireTime);
+            continue;
+        }
+
+        // Earliest timer is due. Reschedule (or retire) it before running its
+        // callback, while still holding mutex_, so a concurrent stop() always
+        // finds it in the queue and a stopped timer can never be re-added.
+        std::pop_heap(timerQueue_.begin(), timerQueue_.end(), FireTimeComparator());
+        ThreadedTimer* timer = timerQueue_.back();
+        timerQueue_.pop_back();
+        if (timer->scheduledRepeat_)
+        {
+            timer->nextFireTime_ += std::chrono::milliseconds(timer->scheduledIntervalMs_);
+            timerQueue_.push_back(timer);
+            std::push_heap(timerQueue_.begin(), timerQueue_.end(), FireTimeComparator());
         }
         else
         {
-            ThreadedTimer* tmpTimer = timerQueue_.top();
-            lk.unlock();
-            {
-                std::unique_lock<std::mutex> lk2(tmpTimer->timerMutex_);
-                nextFireTime = tmpTimer->nextFireTime_;
-            }
-            lk.lock();
-            timerCV_.wait_until(lk, nextFireTime);
+            timer->isRunning_.store(false, std::memory_order_relaxed);
         }
 
-        // Execute timers that have fired.
-        auto currentTime = std::chrono::steady_clock::now();
-        while (
-            !isDestroying_.load(std::memory_order_relaxed) && 
-            !timerQueue_.empty() && timerQueue_.top()->nextFireTime_ <= currentTime)
-        {
-            ThreadedTimer* tmpTimer = timerQueue_.top();
-            timerQueue_.pop();
-
-            // Set next fire time if repeating, otherwise deregister
-            if (tmpTimer->repeat_)
-            {
-                lk.unlock();
-                {
-                    std::unique_lock<std::mutex> lk2(tmpTimer->timerMutex_);
-                    tmpTimer->nextFireTime_ += std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::milliseconds(tmpTimer->timeoutMilliseconds_));
-                }
-                lk.lock();
-                timerQueue_.push(tmpTimer);
-            }
-            else
-            {
-                tmpTimer->isRunning_.store(false, std::memory_order_relaxed); 
-            }
-
-            // NOTE: we have to drop the lock here to avoid deadlocks in case the fn wants to mess with
-            // the timer object.
-            lk.unlock();
-            tmpTimer->fn_(*tmpTimer);
-            lk.lock();
-            currentTime = std::chrono::steady_clock::now();
-        }
+        // Run the callback without holding mutex_ (it may start/stop timers);
+        // unregisterTimer() waits on firingTimer_ instead.
+        firingTimer_ = timer;
+        lk.unlock();
+        timer->fire_();
+        lk.lock();
+        firingTimer_ = nullptr;
+        firingDoneCV_.notify_all();
     }
 }
-#endif // !defined(__APPLE__)
 
+void ThreadedTimer::fire_()
+{
+    TimerCallbackFn fn;
+    {
+        std::unique_lock<std::mutex> lk(timerMutex_);
+        fn = fn_;
+    }
+    if (fn)
+    {
+        fn(*this);
+    }
+}
 ThreadedTimer::ThreadedTimer()
-    : 
-#if defined(__APPLE__)
-      internalTimer_(nullptr),
-#endif // defined(__APPLE__)
-      repeat_(false)
+    : repeat_(false)
     , timeoutMilliseconds_(0)
 {
-#if !defined(__APPLE__)
     isRunning_.store(false, std::memory_order_relaxed);
-#endif // !defined(__APPLE__)
 }
 
 ThreadedTimer::ThreadedTimer(int milliseconds, TimerCallbackFn fn, bool repeat)
-#if defined(__APPLE__)
-    : internalTimer_(nullptr)
-#endif // defined(__APPLE__)
 {
+    isRunning_.store(false, std::memory_order_relaxed);
     setTimeout(milliseconds);
     setCallback(std::move(fn));
     setRepeat(repeat);
-#if !defined(__APPLE__)
-    isRunning_.store(false, std::memory_order_relaxed);
-#endif // !defined(__APPLE__)
 }
 
 ThreadedTimer::~ThreadedTimer()
@@ -195,81 +198,30 @@ void ThreadedTimer::setRepeat(bool repeat)
 
 bool ThreadedTimer::isRunning()
 {
-#if defined(__APPLE__)
-    return internalTimer_ != nullptr;
-#else
     return isRunning_.load(std::memory_order_relaxed);
-#endif // defined(__APPLE__)
 }
     
 void ThreadedTimer::start()
 {
-    stop();
-
-#if defined(__APPLE__)
+    int intervalMs = 0;
+    bool repeat = false;
     {
         std::unique_lock<std::mutex> lk(timerMutex_);
-        internalTimer_ =
-            dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
-        if (internalTimer_ != nullptr)
-        {
-            auto timeoutNanoseconds = timeoutMilliseconds_ * NSEC_PER_MSEC;
-            auto leeway = timeoutNanoseconds * PERCENT_TOLERANCE;
-            dispatch_set_context(internalTimer_, this);
-            dispatch_source_set_timer(internalTimer_, dispatch_time(DISPATCH_TIME_NOW, timeoutNanoseconds), timeoutNanoseconds, leeway);
-            dispatch_source_set_event_handler_f(internalTimer_, &ThreadedTimer::OnHandleTimer_);
-            dispatch_resume(internalTimer_);
-        }
+        intervalMs = timeoutMilliseconds_;
+        repeat = repeat_;
     }
-#else
-    {
-        std::unique_lock<std::mutex> lk(timerMutex_);
-        nextFireTime_ = std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::milliseconds(timeoutMilliseconds_));
-        isRunning_.store(true, std::memory_order_relaxed);
-    }
-    TheTimerServer_.registerTimer(this);
-#endif // defined(__APPLE__)
+    TheTimerServer_.registerTimer(this, intervalMs, repeat);
 }
 
 void ThreadedTimer::stop()
 {
-    std::unique_lock<std::mutex> lk(timerMutex_);
-#if defined(__APPLE__)
-    if (internalTimer_ != nullptr)
-    {
-        dispatch_source_cancel(internalTimer_);
-        dispatch_release(internalTimer_);
-        internalTimer_ = nullptr;
-    }
-#else
-    if (isRunning_.load(std::memory_order_relaxed))
-    {
-        // Temporarily unlock here to avoid deadlocks.
-        lk.unlock();
-        TheTimerServer_.unregisterTimer(this);
-        lk.lock();
-        isRunning_.store(false, std::memory_order_relaxed);
-    }
-#endif // defined(__APPLE__)
+    // Always unregister, even if not scheduled: a one-shot timer's callback
+    // may be running right now, and unregisterTimer() waits for it.
+    TheTimerServer_.unregisterTimer(this);
 }
 
 void ThreadedTimer::restart()
 {
-    stop();
+    // registerTimer() replaces any existing schedule.
     start();
 }
-
-#if defined(__APPLE__)
-void ThreadedTimer::OnHandleTimer_(void* context)
-{
-    ThreadedTimer* thisObj = (ThreadedTimer*)context;
-    if (!thisObj->repeat_)
-    {
-        thisObj->stop();
-    }
-    {
-        std::unique_lock<std::mutex> lk(thisObj->timerMutex_);
-        thisObj->fn_(*thisObj);
-    }
-}
-#endif // !defined(__APPLE__)
