@@ -124,6 +124,12 @@ if(NOT RADAE_PYTHON_EXECUTABLE AND NOT CMAKE_CROSSCOMPILING)
     endforeach()
 endif()
 
+# Runs with or without Python; with it, radae's loss.py also scores the
+# received speech.
+DefineUnitTest(MinimalTxRxThreadTest)
+target_link_libraries(MinimalTxRxThreadTest PRIVATE rade opus samplerate)
+target_compile_definitions(MinimalTxRxThreadTest PRIVATE SPEECH_WAV_PATH="${RADE_SPEECH_WAV}")
+
 if(RADAE_PYTHON_EXECUTABLE)
     message(STATUS "MinimalTxRxThreadTest: using Python at ${RADAE_PYTHON_EXECUTABLE}")
 
@@ -139,18 +145,16 @@ if(RADAE_PYTHON_EXECUTABLE)
 	INSTALL_COMMAND "")
     ExternalProject_Get_Property(rade_python SOURCE_DIR)
 
-    DefineUnitTest(MinimalTxRxThreadTest)
     add_dependencies(MinimalTxRxThreadTest rade_python) # the test runs loss.py from it
-    target_link_libraries(MinimalTxRxThreadTest PRIVATE rade opus samplerate)
     target_compile_definitions(MinimalTxRxThreadTest PRIVATE
 	    RADE_SRC_DIR="${SOURCE_DIR}"
         PYTHON_EXECUTABLE="${RADAE_PYTHON_EXECUTABLE}")
-
-    # Allow up to 1 hour: 6 rate combinations × ~10 min each (RADE NN inference
-    # on CPU can be significantly slower than real-time).
-    set_tests_properties(pipeline_MinimalTxRxThreadTest PROPERTIES TIMEOUT 3600)
 else()
-    message(STATUS "MinimalTxRxThreadTest: no suitable Python3 found – test will be skipped")
+    message(STATUS "MinimalTxRxThreadTest: no suitable Python3 found -- loss.py scoring will be skipped")
 endif()
+
+# Allow up to 1 hour: 42 rate combinations (RADE NN inference on CPU can be
+# significantly slower than real-time).
+set_tests_properties(pipeline_MinimalTxRxThreadTest PROPERTIES TIMEOUT 3600)
 
 endif(BUILD_BACKEND_UNITTESTS)
